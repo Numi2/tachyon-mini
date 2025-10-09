@@ -4,7 +4,6 @@
 //! Provides comprehensive benchmarking for MMR operations, PCD proofs, and network operations.
 
 use anyhow::{anyhow, Result};
-use net_iroh::Cid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -216,7 +215,7 @@ impl TachyonBenchmark {
         let mut max_time = Duration::ZERO;
         let mut success_count = 0;
 
-        for (i, hash) in test_hashes.iter().enumerate() {
+        for (i, _hash) in test_hashes.iter().enumerate() {
             let proof_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {
@@ -478,7 +477,7 @@ impl TachyonBenchmark {
         let mut max_time = Duration::ZERO;
         let mut success_count = 0;
 
-        for i in 0..self.config.iterations {
+        for _ in 0..self.config.iterations {
             let verify_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {
@@ -518,7 +517,6 @@ impl TachyonBenchmark {
     /// Benchmark blob store put operations
     pub async fn benchmark_blob_store_put(&mut self) -> Result<()> {
         use net_iroh::TachyonBlobStore;
-        use std::path::Path;
 
         let temp_dir = tempfile::tempdir()?;
         let blob_store = TachyonBlobStore::new(temp_dir.path()).await?;
@@ -578,7 +576,6 @@ impl TachyonBenchmark {
     /// Benchmark blob store get operations
     pub async fn benchmark_blob_store_get(&mut self) -> Result<()> {
         use net_iroh::TachyonBlobStore;
-        use std::path::Path;
 
         let temp_dir = tempfile::tempdir()?;
         let blob_store = TachyonBlobStore::new(temp_dir.path()).await?;
@@ -598,7 +595,7 @@ impl TachyonBenchmark {
         let mut max_time = Duration::ZERO;
         let mut success_count = 0;
 
-        for (i, hash) in hashes.iter().enumerate() {
+        for (i, _hash) in hashes.iter().enumerate() {
             let get_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {
@@ -641,7 +638,6 @@ impl TachyonBenchmark {
     /// Benchmark network publish operations
     pub async fn benchmark_network_publish(&mut self) -> Result<()> {
         use net_iroh::{BlobKind, TachyonNetwork};
-        use std::path::Path;
 
         let temp_dir = tempfile::tempdir()?;
         let network = TachyonNetwork::new(temp_dir.path()).await?;
@@ -707,7 +703,7 @@ impl TachyonBenchmark {
         let mut max_time = Duration::ZERO;
         let mut success_count = 0;
 
-        for i in 0..self.config.iterations {
+        for _ in 0..self.config.iterations {
             let kem_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {
@@ -758,7 +754,7 @@ impl TachyonBenchmark {
         let mut max_time = Duration::ZERO;
         let mut success_count = 0;
 
-        for i in 0..self.config.iterations {
+        for _ in 0..self.config.iterations {
             let aead_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {
@@ -799,14 +795,14 @@ impl TachyonBenchmark {
         use pq_crypto::{BlindedNullifier, EpochTag};
 
         let nullifier = [1u8; 32];
-        let epoch_tag = EpochTag::current();
+        let _epoch_tag = EpochTag::current();
 
         let start_time = Instant::now();
         let mut min_time = Duration::MAX;
         let mut max_time = Duration::ZERO;
         let mut success_count = 0;
 
-        for i in 0..self.config.iterations {
+        for _i in 0..self.config.iterations {
             let blinding_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {
@@ -845,7 +841,7 @@ impl TachyonBenchmark {
 
     /// Benchmark note encryption
     pub async fn benchmark_note_encryption(&mut self) -> Result<()> {
-        use pq_crypto::{generate_aes_key, SimpleAead};
+        use pq_crypto::generate_aes_key;
         use storage::EncryptedNote;
 
         let master_key = generate_aes_key();
@@ -952,7 +948,7 @@ impl TachyonBenchmark {
 
     /// Benchmark database operations
     pub async fn benchmark_db_operations(&mut self) -> Result<()> {
-        use std::path::Path;
+        
         use storage::WalletDatabase;
 
         let temp_dir = tempfile::tempdir()?;
@@ -964,7 +960,7 @@ impl TachyonBenchmark {
         let mut max_time = Duration::ZERO;
         let mut success_count = 0;
 
-        for i in 0..self.config.iterations {
+        for _ in 0..self.config.iterations {
             let db_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {

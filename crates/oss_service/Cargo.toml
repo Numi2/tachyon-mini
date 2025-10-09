@@ -16,3 +16,4 @@ blake3.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 pq_crypto.workspace = true
+tempfile.workspace = true

@@ -20,3 +20,6 @@ tracing-subscriber = "0.3"
 wallet = { path = "../wallet" }
 pq_crypto = { path = "../pq_crypto" }
 hex = "0.4"
+net_iroh = { path = "../net_iroh" }
+node_ext = { path = "../node_ext" }
+bytes = "1.6"

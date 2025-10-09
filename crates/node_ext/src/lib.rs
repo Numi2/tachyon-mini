@@ -6,9 +6,7 @@
 use accum_mmr::SerializableHash;
 use anyhow::{anyhow, Result};
 use blake3::Hash;
-use net_iroh::{BlobKind, BlobStore, Cid, TachyonNetwork};
-use pcd_core::{PcdState, PcdStateManager};
-use pq_crypto::{derive_nullifier, NullifierDerivationMode};
+use net_iroh::TachyonNetwork;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -16,11 +14,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::mpsc,
     task::JoinHandle,
     time::interval,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Configuration for the node extension
 #[derive(Debug, Clone)]
@@ -189,13 +187,13 @@ pub struct TachyonNode {
     /// Configuration
     config: NodeConfig,
     /// Network client
-    network: Arc<TachyonNetwork>,
+    _network: Arc<TachyonNetwork>,
     /// Node state
     state: Arc<RwLock<NodeState>>,
     /// PCD verifier
     pcd_verifier: Arc<dyn PcdVerifier>,
     /// Transaction pool for pending validation
-    pending_txs: Arc<RwLock<HashMap<TransactionHash, Transaction>>>,
+    _pending_txs: Arc<RwLock<HashMap<TransactionHash, Transaction>>>,
     /// Background validation task
     validation_task: Option<JoinHandle<()>>,
     /// Shutdown channel
@@ -252,10 +250,10 @@ impl TachyonNode {
 
         Ok(Self {
             config,
-            network,
+            _network: network,
             state,
             pcd_verifier,
-            pending_txs: Arc::new(RwLock::new(HashMap::new())),
+            _pending_txs: Arc::new(RwLock::new(HashMap::new())),
             validation_task: Some(validation_task),
             shutdown_tx: Some(shutdown_tx),
             pruning_task: Some(pruning_task),
@@ -389,8 +387,8 @@ impl TachyonNode {
 
     /// Process pending transactions in the background
     async fn process_pending_transactions(
-        state: &Arc<RwLock<NodeState>>,
-        network: &TachyonNetwork,
+        _state: &Arc<RwLock<NodeState>>,
+        _network: &TachyonNetwork,
     ) {
         // This would process transactions from the mempool
         // For now, just log that we're running
@@ -448,6 +446,11 @@ impl TachyonNode {
             last_pruned: guard.last_pruned,
             storage_size: guard.storage_size,
         }
+    }
+
+    /// Get the node's network ID as a string
+    pub fn node_id(&self) -> String {
+        self._network.node_id().to_string()
     }
 
     /// Shutdown the node
@@ -584,14 +587,14 @@ impl Block {
 /// Simple PCD verifier implementation
 pub struct SimplePcdVerifier {
     /// Verification cache to avoid recomputing
-    cache: Arc<RwLock<HashMap<[u8; 32], bool>>>,
+    _cache: Arc<RwLock<HashMap<[u8; 32], bool>>>,
 }
 
 impl SimplePcdVerifier {
     /// Create a new verifier
     pub fn new() -> Self {
         Self {
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            _cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

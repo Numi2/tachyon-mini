@@ -11,13 +11,13 @@ use pq_crypto::AccessToken;
 use pcd_core::{PcdDeltaBundle, PcdState, PcdTransition};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::Path,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::mpsc,
     task::JoinHandle,
     time::interval,
 };
@@ -51,7 +51,7 @@ pub struct ObliviousSyncService {
     /// Network client
     network: Arc<TachyonNetwork>,
     /// Blob store for published data
-    blob_store: Arc<dyn BlobStore>,
+    _blob_store: Arc<dyn BlobStore>,
     /// Current PCD state
     current_state: Arc<RwLock<Option<PcdState>>>,
     /// Registered wallet subscriptions
@@ -190,7 +190,7 @@ impl ObliviousSyncService {
         Ok(Self {
             config: config.clone(),
             network,
-            blob_store,
+            _blob_store: blob_store,
             current_state: Arc::new(RwLock::new(None)),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             rate_limiter: Arc::new(RwLock::new(RateLimiter::new(config.rate_limit.clone()))),
@@ -270,7 +270,7 @@ impl ObliviousSyncService {
     /// Perform a sync cycle: generate deltas and PCD transitions
     async fn perform_sync_cycle(
         current_state: &Arc<RwLock<Option<PcdState>>>,
-        subscriptions: &Arc<RwLock<HashMap<String, WalletSubscription>>>,
+        _subscriptions: &Arc<RwLock<HashMap<String, WalletSubscription>>>,
         network: &Arc<TachyonNetwork>,
         published: &Arc<RwLock<Vec<PublishedBlobInfo>>>,
     ) -> Result<()> {
@@ -570,7 +570,7 @@ impl BlobStore for TachyonBlobStore {
         let data = data.to_vec();
         Box::pin(async move {
             // Store blob locally first
-            network.blob_store.put_blob(&cid, data.clone().into()).await;
+            let _ = network.blob_store.put_blob(&cid, data.clone().into()).await;
 
             // Publish to network
             network
@@ -620,7 +620,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = oss.get_stats().await;
+        let stats = oss.get_stats();
         assert_eq!(stats.active_subscriptions, 0);
         assert_eq!(stats.total_rate_buckets, 0);
         assert_eq!(stats.current_anchor_height, None);
@@ -645,7 +645,7 @@ mod tests {
 
         oss.register_wallet("wallet_123".to_string()).await.unwrap();
 
-        let stats = oss.get_stats().await;
+        let stats = oss.get_stats();
         assert_eq!(stats.active_subscriptions, 1);
     }
 

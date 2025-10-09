@@ -5,19 +5,20 @@
 
 use anyhow::{anyhow, Result};
 use blake3::Hash;
-use net_iroh::{BlobKind, BlobStore, Cid, TachyonNetwork};
+use pq_crypto::{SuiteB, SuiteBPublicKey, SuiteBSignature, SUITE_B_DOMAIN_CHECKPOINT};
+use net_iroh::TachyonNetwork;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::mpsc,
     task::JoinHandle,
     time::interval,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Configuration for header sync
 #[derive(Debug, Clone)]
@@ -313,8 +314,10 @@ impl BlockHeader {
             nonce,
             difficulty,
         };
-
         header.hash = SerializableHash(header.compute_hash());
+        if !header.meets_difficulty() {
+            header.mine();
+        }
         header
     }
 
@@ -440,6 +443,36 @@ impl Checkpoint {
         // Verify proof
         self.proof.verify(&SecurityConfig::default())?;
 
+        // Prehash checkpoint data with BLAKE3 under Suite B domain
+        let digest = SuiteB::blake3_prehash_with_domain(
+            SUITE_B_DOMAIN_CHECKPOINT,
+            &[
+                &self.height.to_le_bytes(),
+                self.header_hash.as_bytes(),
+                self.mmr_root.as_bytes(),
+            ],
+        );
+
+        // Verify at least min_signatures signatures are valid
+        let mut valid = 0usize;
+        for sig in &self.signatures {
+            let pk = match SuiteBPublicKey::from_bytes(&sig.signer) {
+                Ok(pk) => pk,
+                Err(_) => continue,
+            };
+            let signature = match SuiteBSignature::from_bytes(&sig.signature) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if SuiteB::verify_prehash(&pk, &digest, &signature) {
+                valid += 1;
+            }
+        }
+
+        if valid < min_signatures {
+            return Ok(false);
+        }
+
         Ok(true)
     }
 }
@@ -458,7 +491,7 @@ pub struct HeaderSyncManager {
     /// Configuration
     config: HeaderSyncConfig,
     /// Network client
-    network: Arc<TachyonNetwork>,
+    _network: Arc<TachyonNetwork>,
     /// Header chain state
     chain: Arc<RwLock<HeaderChain>>,
     /// Sync state tracking
@@ -528,7 +561,7 @@ impl HeaderSyncManager {
 
         Ok(Self {
             config,
-            network,
+            _network: network,
             chain,
             sync_state,
             sync_task: Some(sync_task),
@@ -558,8 +591,8 @@ impl HeaderSyncManager {
     /// Request headers from a specific height
     pub async fn request_headers(
         &self,
-        start_height: u64,
-        count: usize,
+        _start_height: u64,
+        _count: usize,
     ) -> Result<Vec<BlockHeader>> {
         // In a real implementation, this would request headers from peers
         // For now, return empty result
@@ -791,7 +824,7 @@ mod tests {
 
         let header1 = BlockHeader::new(
             1,
-            chain.get_header(0).unwrap().hash,
+            chain.get_header(0).unwrap().hash.into(),
             Some(Hash::from([2u8; 32])),
             1234567891,
             0,

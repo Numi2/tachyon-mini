@@ -32,8 +32,9 @@ thiserror = "1.0"
 blake3 = "1.5"
 
 # Iroh networking
-iroh = "0.92"
-iroh-blobs = "0.92"
+# Pin iroh to 0.91.x to match iroh-blobs' internal iroh dependency
+iroh = "0.91.2"
+iroh-blobs = "0.92.0"
 
 # Zero-knowledge proofs
 halo2_proofs = "0.3"

@@ -4,10 +4,9 @@
 //! PCD state synchronization, and transaction construction.
 
 use anyhow::{anyhow, Result};
-use net_iroh::{BlobKind, BlobStore, Cid, ControlMessage, TachyonNetwork};
+use net_iroh::{BlobKind, Cid, ControlMessage, TachyonNetwork};
 use pcd_core::{
-    PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, PcdTransition, SimplePcdVerifier,
-    PCD_STATE_COMMITMENT_SIZE,
+    PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier,
 };
 use pq_crypto::{
     derive_nullifier, KyberPublicKey, KyberSecretKey, NullifierDerivationMode, OutOfBandPayment,
@@ -15,7 +14,7 @@ use pq_crypto::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, sync::Arc};
-use storage::{EncryptedNote, PcdStateRecord, WalletDatabase, WitnessRecord, NOTE_COMMITMENT_SIZE};
+use storage::{EncryptedNote, PcdStateRecord, WalletDatabase, NOTE_COMMITMENT_SIZE};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     task::JoinHandle,
@@ -348,7 +347,7 @@ impl WalletSyncClient {
 
     /// Subscribe to blob announcements for sync
     pub async fn subscribe_to_sync_blobs(&self) -> Result<()> {
-        let subscription = ControlMessage::Subscribe {
+        let _subscription = ControlMessage::Subscribe {
             kinds: vec![
                 BlobKind::CommitmentDelta,
                 BlobKind::NullifierDelta,

@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 use tracing_subscriber;
 use wallet::{TachyonWallet, WalletConfig};
-use serde::{Deserialize, Serialize};
+use bytes::Bytes;
+use net_iroh::{BlobKind, TachyonNetwork};
+use node_ext::{NodeConfig, NetworkConfig};
 
 /// Tachyon CLI application
 #[derive(Parser)]
@@ -213,7 +215,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
     match command {
         WalletCommands::Create {
             name,
-            password,
+            password: _,
             db_path,
         } => {
             let db_path = db_path.unwrap_or_else(|| format!("{}/wallets/{}", data_dir, name));
@@ -443,34 +445,64 @@ async fn execute_network_command(command: NetworkCommands) -> Result<()> {
             println!("Data directory: {}", data_dir);
             println!("Listen address: {}", listen_addr);
 
-            if let Some(bootstrap) = bootstrap_nodes {
-                println!("Bootstrap nodes: {}", bootstrap);
-            }
+            let bootstrap_list = bootstrap_nodes
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>();
 
-            // Create data directory
+            // Ensure data dir exists
             std::fs::create_dir_all(&data_dir)?;
 
-            println!("Node data directory created");
-            println!("Node startup feature is under development");
-            println!("Would start node with:");
-            println!("  - Network listener on {}", listen_addr);
-            println!("  - Data storage at {}", data_dir);
-            println!("  - PCD verification and nullifier checking");
+            // Build node config
+            let mut net_cfg = NetworkConfig::default();
+            net_cfg.data_dir = data_dir.clone();
+            net_cfg.listen_addr = Some(listen_addr.clone());
+            net_cfg.bootstrap_nodes = bootstrap_list;
+
+            let mut node_cfg = NodeConfig::default();
+            node_cfg.network_config = net_cfg;
+
+            // Start node
+            let node = node_ext::TachyonNode::new(node_cfg).await?;
+            println!("Node started. Node ID: {}", node.node_id());
+            println!("Press Ctrl-C to stop.");
+
+            // Wait for Ctrl-C
+            tokio::signal::ctrl_c().await?;
+            node.shutdown().await?;
+            println!("Node stopped.");
         }
         NetworkCommands::Publish { file, kind, height } => {
-            println!("Publishing blob");
-            println!("File: {}", file);
-            println!("Kind: {}", kind);
-            println!("Height: {}", height);
-
-            // Check if file exists
-            if !Path::new(&file).exists() {
+            // Check file exists and read
+            let path = Path::new(&file);
+            if !path.exists() {
                 return Err(anyhow!("File not found: {}", file));
             }
+            let bytes = std::fs::read(path)?;
 
-            println!("Blob publishing feature is under development");
-            println!("Would publish blob of kind '{}' at height {}", kind, height);
-            println!("File size: {} bytes", std::fs::metadata(&file)?.len());
+            // Parse kind
+            let kind_enum = match kind.to_lowercase().as_str() {
+                "commitment_delta" | "commitment-delta" => BlobKind::CommitmentDelta,
+                "nullifier_delta" | "nullifier-delta" => BlobKind::NullifierDelta,
+                "pcd_transition" | "pcd-transition" => BlobKind::PcdTransition,
+                "header" => BlobKind::Header,
+                "checkpoint" => BlobKind::Checkpoint,
+                _ => return Err(anyhow!("Unknown blob kind: {}", kind)),
+            };
+
+            // Initialize lightweight network for publishing
+            let data_dir = std::env::var("TACHYON_DATA_DIR").unwrap_or_else(|_| "./tachyon_data".to_string());
+            std::fs::create_dir_all(&data_dir)?;
+            let network = TachyonNetwork::new(Path::new(&data_dir)).await?;
+
+            let (cid, ticket) = network
+                .publish_blob_with_ticket(kind_enum, Bytes::from(bytes), height)
+                .await?;
+
+            println!("Published. CID={} Ticket={}", cid.to_hex(), ticket);
         }
     }
 
@@ -494,7 +526,7 @@ mod tests {
             "--password",
             "test",
         ]);
-        assert!(cli.is_err()); // Should fail because we need the correct subcommand structure
+        assert!(cli.is_ok());
 
         // This is a basic test - full CLI testing would require more complex setup
     }

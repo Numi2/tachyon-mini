@@ -15,3 +15,5 @@ blake3.workspace = true
 hex = "0.4"
 zeroize = "1"
 pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
+pqcrypto-dilithium = "0.5"

@@ -66,7 +66,7 @@ fn mmr_is_right_child(pos: u64) -> bool {
 fn mmr_sibling_pos(pos: u64) -> u64 {
     let h = mmr_height(pos);
     if mmr_is_right_child(pos) {
-        pos - (1u64 << h)
+        pos.saturating_sub(1u64 << h)
     } else {
         pos + (1u64 << h)
     }
@@ -397,7 +397,7 @@ impl MmrWitness {
     }
 
     /// Verify that an element is in the MMR using this witness
-    pub fn verify(&self, element_hash: &Hash, mmr_root: &Hash) -> bool {
+    pub fn verify(&self, _element_hash: &Hash, _mmr_root: &Hash) -> bool {
         // This would implement actual witness verification
         // For now, return true if the witness is non-empty
         !self.auth_path.is_empty()

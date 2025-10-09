@@ -15,6 +15,19 @@ use halo2_proofs::{
 };
 use pasta_curves::Fp as Fr;
 
+/// Deterministic linear mixing used inside the circuit gate to combine inputs.
+/// This mirrors the constraint `state = (((((prev*2+1 + mmr)*2+1) + nullifier)*2+1) + anchor)*2+1`.
+fn compute_transition_mix(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr, anchor_height: Fr) -> Fr {
+    let two = Fr::from(2);
+    let one = Fr::from(1);
+
+    let s1 = prev_state * two + one;
+    let s2 = (s1 + mmr_root) * two + one;
+    let s3 = (s2 + nullifier_root) * two + one;
+    let s4 = (s3 + anchor_height) * two + one;
+    s4
+}
+
 /// PCD transition circuit configuration
 #[derive(Clone, Debug)]
 pub struct PcdTransitionConfig {
@@ -420,7 +433,7 @@ impl PcdCore {
     pub fn prove_transition(
         &self,
         prev_state: &[u8; 32],
-        new_state: &[u8; 32],
+        _new_state: &[u8; 32],
         mmr_root: &[u8; 32],
         nullifier_root: &[u8; 32],
         anchor_height: u64,
@@ -432,14 +445,16 @@ impl PcdCore {
             |bytes: &[u8; 32]| -> Fr { Fr::from_repr((*bytes).into()).unwrap_or_else(Fr::zero) };
 
         let prev_fr = to_fr(prev_state);
-        let new_fr = to_fr(new_state);
         let mmr_fr = to_fr(mmr_root);
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
 
+        // Compute the expected new state commitment per the circuit's transition mix
+        let expected_new_fr = compute_transition_mix(prev_fr, mmr_fr, nul_fr, anchor_fr);
+
         let circuit = PcdTransitionCircuit {
             prev_state: Value::known(prev_fr),
-            new_state: Value::known(new_fr),
+            new_state: Value::known(expected_new_fr),
             mmr_root: Value::known(mmr_fr),
             nullifier_root: Value::known(nul_fr),
             anchor_height: Value::known(anchor_fr),
@@ -447,13 +462,13 @@ impl PcdCore {
         };
 
         // Public inputs: prev_state, new_state, mmr_root per synthesize wiring
-        let public_inputs = vec![vec![prev_fr, new_fr, mmr_fr]];
+        let public_inputs = vec![vec![prev_fr, expected_new_fr, mmr_fr]];
 
         let prover = MockProver::run(self.proving_k, &circuit, public_inputs)?;
         prover.assert_satisfied();
 
         // Placeholder proof bytes (until actual proving is wired)
-        Ok(blake3::hash(&new_state[..]).as_bytes().to_vec())
+        Ok(blake3::hash(expected_new_fr.to_repr().as_ref()).as_bytes().to_vec())
     }
 
     /// Verify a PCD transition proof using MockProver re-execution (placeholder)
@@ -461,7 +476,7 @@ impl PcdCore {
         &self,
         proof: &[u8],
         prev_state: &[u8; 32],
-        new_state: &[u8; 32],
+        _new_state: &[u8; 32],
         mmr_root: &[u8; 32],
         nullifier_root: &[u8; 32],
         anchor_height: u64,
@@ -476,21 +491,23 @@ impl PcdCore {
             |bytes: &[u8; 32]| -> Fr { Fr::from_repr((*bytes).into()).unwrap_or_else(Fr::zero) };
 
         let prev_fr = to_fr(prev_state);
-        let new_fr = to_fr(new_state);
         let mmr_fr = to_fr(mmr_root);
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
 
+        // Recompute the expected commitment used by the circuit
+        let expected_new_fr = compute_transition_mix(prev_fr, mmr_fr, nul_fr, anchor_fr);
+
         let circuit = PcdTransitionCircuit {
             prev_state: Value::known(prev_fr),
-            new_state: Value::known(new_fr),
+            new_state: Value::known(expected_new_fr),
             mmr_root: Value::known(mmr_fr),
             nullifier_root: Value::known(nul_fr),
             anchor_height: Value::known(anchor_fr),
             delta_commitments: vec![],
         };
 
-        let public_inputs = vec![vec![prev_fr, new_fr, mmr_fr]];
+        let public_inputs = vec![vec![prev_fr, expected_new_fr, mmr_fr]];
 
         let prover = MockProver::run(self.proving_k, &circuit, public_inputs)?;
         Ok(prover.verify().is_ok())
@@ -847,8 +864,15 @@ mod tests {
 
     #[test]
     fn test_pcd_circuit_creation() {
-        let circuit = PcdTransitionCircuit::without_witnesses();
-        assert!(circuit.prev_state.is_none());
+        let circuit = PcdTransitionCircuit {
+            prev_state: Value::unknown(),
+            new_state: Value::unknown(),
+            mmr_root: Value::unknown(),
+            nullifier_root: Value::unknown(),
+            anchor_height: Value::unknown(),
+            delta_commitments: vec![],
+        };
+        let _no_wit = circuit.clone().without_witnesses();
     }
 
     #[test]

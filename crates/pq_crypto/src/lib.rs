@@ -8,6 +8,10 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroize;
+// Bring Kyber KEM trait methods (as_bytes, from_bytes) into scope
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
+// Bring signature trait methods (as_bytes, from_bytes) into scope
+use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
 
 /// Size of Kyber768 public key in bytes
 pub const KYBER_PUBLIC_KEY_SIZE: usize = 1184;
@@ -493,14 +497,14 @@ impl SimpleKem {
         let pk_typed = kyber768::PublicKey::from_bytes(pk.as_bytes())
             .map_err(|_| anyhow!("Invalid Kyber public key bytes"))?;
 
-        let (ct, ss) = kyber768::encapsulate(&pk_typed);
+        let (ss, ct) = kyber768::encapsulate(&pk_typed);
         let ct_bytes = ct.as_bytes().to_vec();
         let mut shared_secret = [0u8; KYBER_SHARED_SECRET_SIZE];
         let ss_bytes = ss.as_bytes();
-        if ss_bytes.len() != KYBER_SHARED_SECRET_SIZE || ct_bytes.len() != KYBER_CIPHERTEXT_SIZE {
-            return Err(anyhow!("Unexpected Kyber sizes during encapsulate"));
+        if ss_bytes.len() < KYBER_SHARED_SECRET_SIZE {
+            return Err(anyhow!("Shared secret too short"));
         }
-        shared_secret.copy_from_slice(ss_bytes);
+        shared_secret.copy_from_slice(&ss_bytes[..KYBER_SHARED_SECRET_SIZE]);
         Ok((KyberCiphertext::new(ct_bytes), shared_secret))
     }
 
@@ -518,11 +522,11 @@ impl SimpleKem {
 
         let ss = kyber768::decapsulate(&ct_typed, &sk_typed);
         let ss_bytes = ss.as_bytes();
-        if ss_bytes.len() != KYBER_SHARED_SECRET_SIZE {
-            return Err(anyhow!("Unexpected Kyber shared secret size"));
+        if ss_bytes.len() < KYBER_SHARED_SECRET_SIZE {
+            return Err(anyhow!("Shared secret too short"));
         }
         let mut shared_secret = [0u8; KYBER_SHARED_SECRET_SIZE];
-        shared_secret.copy_from_slice(ss_bytes);
+        shared_secret.copy_from_slice(&ss_bytes[..KYBER_SHARED_SECRET_SIZE]);
         Ok(shared_secret)
     }
 }
@@ -672,6 +676,122 @@ pub fn generate_aes_key() -> [u8; AES_KEY_SIZE] {
     key
 }
 
+// =============================
+// Suite B (Dilithium3 + BLAKE3)
+// =============================
+
+/// Domain separator for Suite B checkpoint signing
+pub const SUITE_B_DOMAIN_CHECKPOINT: &[u8] = b"tachyon:suiteb:checkpoint:v1";
+
+/// Dilithium3 public key wrapper
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuiteBPublicKey {
+    /// Raw public key bytes
+    pub bytes: Vec<u8>,
+}
+
+impl SuiteBPublicKey {
+    /// Create a new public key from bytes
+    pub fn new(bytes: Vec<u8>) -> Self { Self { bytes } }
+
+    /// Access bytes
+    pub fn as_bytes(&self) -> &[u8] { &self.bytes }
+
+    /// Construct from bytes (validated on first use)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> { Ok(Self::new(bytes.to_vec())) }
+}
+
+impl fmt::Display for SuiteBPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SuiteBPublicKey({})", hex::encode(&self.bytes[..std::cmp::min(8, self.bytes.len())]))
+    }
+}
+
+/// Dilithium3 secret key wrapper
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuiteBSecretKey {
+    /// Raw secret key bytes
+    pub bytes: Vec<u8>,
+}
+
+impl SuiteBSecretKey {
+    /// Create a new secret key from bytes
+    pub fn new(bytes: Vec<u8>) -> Self { Self { bytes } }
+
+    /// Access bytes
+    pub fn as_bytes(&self) -> &[u8] { &self.bytes }
+
+    /// Construct from bytes (validated on first use)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> { Ok(Self::new(bytes.to_vec())) }
+}
+
+impl Drop for SuiteBSecretKey {
+    fn drop(&mut self) { self.bytes.zeroize(); }
+}
+
+/// Dilithium3 detached signature wrapper
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuiteBSignature {
+    /// Raw signature bytes
+    pub bytes: Vec<u8>,
+}
+
+impl SuiteBSignature {
+    /// Create a new signature from bytes
+    pub fn new(bytes: Vec<u8>) -> Self { Self { bytes } }
+
+    /// Access bytes
+    pub fn as_bytes(&self) -> &[u8] { &self.bytes }
+
+    /// Construct from bytes (validated on first use)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> { Ok(Self::new(bytes.to_vec())) }
+}
+
+/// Suite B signing API (Dilithium3 + BLAKE3 prehash)
+pub struct SuiteB;
+
+impl SuiteB {
+    /// Generate a Dilithium3 keypair
+    pub fn generate_keypair() -> Result<(SuiteBPublicKey, SuiteBSecretKey)> {
+        use pqcrypto_dilithium::dilithium3;
+        let (pk, sk) = dilithium3::keypair();
+        Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())))
+    }
+
+    /// Sign a prehashed 32-byte digest
+    pub fn sign_prehash(secret_key: &SuiteBSecretKey, digest32: &[u8; 32]) -> Result<SuiteBSignature> {
+        use pqcrypto_dilithium::dilithium3;
+        let sk = dilithium3::SecretKey::from_bytes(secret_key.as_bytes())
+            .map_err(|_| anyhow!("Invalid Suite B secret key bytes"))?;
+        let sig = dilithium3::detached_sign(digest32, &sk);
+        Ok(SuiteBSignature::new(sig.as_bytes().to_vec()))
+    }
+
+    /// Verify a signature over a prehashed 32-byte digest
+    pub fn verify_prehash(public_key: &SuiteBPublicKey, digest32: &[u8; 32], signature: &SuiteBSignature) -> bool {
+        use pqcrypto_dilithium::dilithium3;
+        let pk = match dilithium3::PublicKey::from_bytes(public_key.as_bytes()) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        };
+        let sig = match dilithium3::DetachedSignature::from_bytes(signature.as_bytes()) {
+            Ok(sig) => sig,
+            Err(_) => return false,
+        };
+        dilithium3::verify_detached_signature(&sig, digest32, &pk).is_ok()
+    }
+
+    /// Compute a BLAKE3 digest from parts with a domain tag
+    pub fn blake3_prehash_with_domain(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(domain);
+        for p in parts { hasher.update(p); }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hasher.finalize().as_bytes());
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +840,18 @@ mod tests {
 
         let decrypted_metadata = payment.decrypt(&recipient_sk).unwrap();
         assert_eq!(note_metadata.to_vec(), decrypted_metadata);
+    }
+
+    #[test]
+    fn test_suite_b_sign_verify() {
+        let (pk, sk) = SuiteB::generate_keypair().unwrap();
+        let digest = SuiteB::blake3_prehash_with_domain(b"test_suiteb", &[b"hello", b"world"]);
+        let sig = SuiteB::sign_prehash(&sk, &digest).unwrap();
+        assert!(SuiteB::verify_prehash(&pk, &digest, &sig));
+
+        // Negative test
+        let mut digest_bad = digest;
+        digest_bad[0] ^= 0x01;
+        assert!(!SuiteB::verify_prehash(&pk, &digest_bad, &sig));
     }
 }

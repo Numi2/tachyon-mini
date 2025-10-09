@@ -6,15 +6,23 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{protocol::{AcceptError, ProtocolHandler, Router}, Endpoint, NodeId};
+use iroh::{protocol::{AcceptError, ProtocolHandler, Router}, Endpoint, NodeId, Watcher};
 use iroh_blobs::{store::fs::FsStore, Hash};
+use iroh_blobs::{
+    ticket::BlobTicket,
+    BlobFormat,
+};
+use iroh_blobs::protocol::ChunkRangesExt;
+use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
-use tokio::io::AsyncReadExt;
+use futures::{Stream, StreamExt};
+use std::pin::Pin;
+// use tokio::io::AsyncReadExt; // not needed; RecvStream provides read_exact
 use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
@@ -161,7 +169,7 @@ pub struct TachyonNetwork {
     /// Optional convenience local blob store (legacy, used in benches)
     pub blob_store: TachyonBlobStore,
     /// Control protocol handler
-    control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
+    _control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
     /// Blob announcements
     announcements: broadcast::Sender<(BlobKind, Cid, u64, usize, String)>,
     /// Active control connections per peer
@@ -216,8 +224,15 @@ impl BlobStore for TachyonBlobStore {
 impl TachyonNetwork {
     /// Create a new TachyonNetwork instance
     pub async fn new(data_dir: &std::path::Path) -> Result<Self> {
-        // Create iroh endpoint with discovery enabled
-        let endpoint = Endpoint::builder().bind().await?;
+        // Create iroh endpoint; optionally enable discovery via env `TACHYON_ENABLE_DISCOVERY`
+        let mut builder = Endpoint::builder();
+        let enable_discovery = std::env::var("TACHYON_ENABLE_DISCOVERY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if enable_discovery {
+            builder = builder.discovery_n0();
+        }
+        let endpoint = builder.bind().await?;
 
         // Create convenience local blob store for legacy callers/benches
         let blob_store = TachyonBlobStore::new(data_dir).await?;
@@ -234,9 +249,17 @@ impl TachyonNetwork {
             control_tx: control_tx.clone(),
         };
 
-        let router = Router::builder(endpoint.clone())
-            .accept(CONTROL_ALPN, control_proto.clone())
-            .spawn();
+        // Register control protocol and iroh-blobs provider for remote blob serving
+        let mut router_builder = Router::builder(endpoint.clone())
+            .accept(CONTROL_ALPN, control_proto.clone());
+
+        // If we have an FsStore, wire up the blobs protocol handler so peers can fetch our blobs
+        if let Some(fs) = blob_store.fs_store.as_ref() {
+            let blobs = iroh_blobs::BlobsProtocol::new(fs, endpoint.clone(), None);
+            router_builder = router_builder.accept(iroh_blobs::protocol::ALPN, blobs);
+        }
+
+        let router = router_builder.spawn();
 
         // Handle incoming control messages
         let endpoint_clone = endpoint.clone();
@@ -257,7 +280,7 @@ impl TachyonNetwork {
         Ok(TachyonNetwork {
             endpoint,
             blob_store,
-            control_tx,
+            _control_tx: control_tx,
             announcements,
             peers,
             _tasks: vec![control_task],
@@ -287,7 +310,13 @@ impl TachyonNetwork {
         let hash = blake3::hash(&data);
         let cid = Cid::from(hash);
         self.blob_store.put(cid, data.clone()).await?;
-        let ticket = format!("local:{}", cid.to_hex());
+        // Prefer a network ticket so remote clients can fetch via iroh-blobs
+        // Fall back to local ticket format if node address is not initialized
+        let ticket = {
+            let node_addr = self.endpoint.node_addr().initialized().await;
+            let blob_ticket = BlobTicket::new(node_addr, cid, BlobFormat::Raw);
+            blob_ticket.to_string()
+        };
 
         // Announce publication to control-plane peers
         let message = ControlMessage::Announce {
@@ -328,6 +357,32 @@ impl TachyonNetwork {
             let cid = Hash::from_bytes(arr);
             return self.blob_store.get(&cid).await;
         }
+        // Remote blob ticket via iroh-blobs
+        if let Ok(blob_ticket) = BlobTicket::from_str(ticket) {
+            let node_addr = blob_ticket.node_addr().clone();
+            let conn = self
+                .endpoint
+                .connect(node_addr, iroh_blobs::protocol::ALPN)
+                .await?;
+
+            // Use our local FsStore downloader to fetch and store the blob
+            let fs = self
+                .blob_store
+                .fs_store
+                .as_ref()
+                .ok_or_else(|| anyhow!("FsStore not initialized"))?;
+            let remote = fs.remote();
+            // Fetch entire content according to ticket format
+            let content = blob_ticket.hash_and_format();
+            remote
+                .fetch(conn, content)
+                .complete()
+                .await
+                .map_err(|e| anyhow!(e))?;
+            // Return bytes from local store
+            let data = fs.get_bytes(blob_ticket.hash()).await?;
+            return Ok(Bytes::from(data));
+        }
         Err(anyhow!("Unsupported ticket format"))
     }
 
@@ -337,8 +392,168 @@ impl TachyonNetwork {
         ticket: &str,
         range: std::ops::Range<u64>,
     ) -> Result<Bytes> {
-        let _ = (ticket, range);
-        Err(anyhow!("Range fetching not yet implemented"))
+        // Local ticket format: "local:<hex_cid>"
+        if let Some(hex_str) = ticket.strip_prefix("local:") {
+            let bytes = hex::decode(hex_str).map_err(|e| anyhow!(e))?;
+            if bytes.len() != 32 {
+                return Err(anyhow!("invalid CID length in ticket"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let cid = Hash::from_bytes(arr);
+            // Serve from local FsStore using export_ranges
+            let fs = self
+                .blob_store
+                .fs_store
+                .as_ref()
+                .ok_or_else(|| anyhow!("FsStore not initialized"))?;
+            let data = fs
+                .blobs()
+                .export_ranges(cid, range.clone())
+                .concatenate()
+                .await
+                .map_err(|e| anyhow!(e))?;
+            return Ok(Bytes::from(data));
+        }
+
+        // Remote blob ticket via iroh-blobs
+        if let Ok(blob_ticket) = BlobTicket::from_str(ticket) {
+            // Guard: range fetch only supports Raw blobs
+            if blob_ticket.format() != BlobFormat::Raw {
+                return Err(anyhow!(
+                    "range fetch only supported for Raw blobs (got {:?})",
+                    blob_ticket.format()
+                ));
+            }
+            let node_addr = blob_ticket.node_addr().clone();
+            let conn = self
+                .endpoint
+                .connect(node_addr, iroh_blobs::protocol::ALPN)
+                .await?;
+
+            // Convert byte range to chunk ranges for verified streaming
+            let chunk_ranges = ChunkRangesExt::bytes(range.clone());
+            let request = iroh_blobs::protocol::GetRequest::blob_ranges(
+                blob_ticket.hash(),
+                chunk_ranges,
+            );
+
+            // Use our local FsStore to execute the remote get and store data
+            let fs = self
+                .blob_store
+                .fs_store
+                .as_ref()
+                .ok_or_else(|| anyhow!("FsStore not initialized"))?;
+            let remote = fs.remote();
+            remote
+                .execute_get(conn, request)
+                .complete()
+                .await
+                .map_err(|e| anyhow!(e))?;
+
+            // Read precisely the requested byte range from local store
+            let out = fs
+                .blobs()
+                .export_ranges(blob_ticket.hash(), range.clone())
+                .concatenate()
+                .await
+                .map_err(|e| anyhow!(e))?;
+            return Ok(Bytes::from(out));
+        }
+
+        Err(anyhow!("Unsupported ticket format"))
+    }
+
+    /// Fetch a byte range via ticket as a streaming sequence of chunks.
+    /// For remote tickets, this starts a background download task and streams
+    /// verified bytes from the local store as they arrive, avoiding large allocations.
+    pub async fn fetch_range_stream_from_ticket(
+        &self,
+        ticket: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>> {
+        // Local ticket format: "local:<hex_cid>"
+        if let Some(hex_str) = ticket.strip_prefix("local:") {
+            let bytes = hex::decode(hex_str).map_err(|e| anyhow!(e))?;
+            if bytes.len() != 32 {
+                return Err(anyhow!("invalid CID length in ticket"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let cid = Hash::from_bytes(arr);
+            // Serve from local FsStore using export_ranges as a byte stream
+            let fs = self
+                .blob_store
+                .fs_store
+                .as_ref()
+                .ok_or_else(|| anyhow!("FsStore not initialized"))?;
+            let stream = fs
+                .blobs()
+                .export_ranges(cid, range.clone())
+                .stream()
+                .filter_map(|item| async move {
+                    match item {
+                        iroh_blobs::api::proto::ExportRangesItem::Data(leaf) => Some(Ok(leaf.data)),
+                        iroh_blobs::api::proto::ExportRangesItem::Error(e) => Some(Err(anyhow!(e))),
+                        _ => None,
+                    }
+                });
+            return Ok(Box::pin(stream));
+        }
+
+        // Remote blob ticket via iroh-blobs
+        if let Ok(blob_ticket) = BlobTicket::from_str(ticket) {
+            // Guard: range fetch only supports Raw blobs for now
+            if blob_ticket.format() != BlobFormat::Raw {
+                return Err(anyhow!(
+                    "range fetch only supported for Raw blobs (got {:?})",
+                    blob_ticket.format()
+                ));
+            }
+
+            let node_addr = blob_ticket.node_addr().clone();
+            let conn = self
+                .endpoint
+                .connect(node_addr, iroh_blobs::protocol::ALPN)
+                .await?;
+
+            // Convert byte range to chunk ranges for verified streaming
+            let chunk_ranges = ChunkRangesExt::bytes(range.clone());
+            let request = iroh_blobs::protocol::GetRequest::blob_ranges(
+                blob_ticket.hash(),
+                chunk_ranges,
+            );
+
+            // Use our local FsStore to execute the remote get in background,
+            // while streaming from the local store as chunks arrive.
+            let fs = self
+                .blob_store
+                .fs_store
+                .as_ref()
+                .ok_or_else(|| anyhow!("FsStore not initialized"))?;
+            let remote = fs.remote();
+            let progress = remote.execute_get(conn, request);
+            // Start the fetch now; we won't wait for completion here.
+            tokio::spawn(async move {
+                let _ = progress.complete().await;
+            });
+
+            // Stream precisely the requested byte range from local store
+            let stream = fs
+                .blobs()
+                .export_ranges(blob_ticket.hash(), range.clone())
+                .stream()
+                .filter_map(|item| async move {
+                    match item {
+                        iroh_blobs::api::proto::ExportRangesItem::Data(leaf) => Some(Ok(leaf.data)),
+                        iroh_blobs::api::proto::ExportRangesItem::Error(e) => Some(Err(anyhow!(e))),
+                        _ => None,
+                    }
+                });
+            return Ok(Box::pin(stream));
+        }
+
+        Err(anyhow!("Unsupported ticket format"))
     }
 
     /// Connect to a peer
@@ -363,8 +578,8 @@ impl TachyonNetwork {
                 Ok((mut send, _recv)) => {
                     write_framed(&mut send, &encoded).await?;
                 }
-                Err(err) => {
-                    debug!("failed to open control stream to {}: {:?}", peer_id, err);
+                Err(_err) => {
+                    debug!("failed to open control stream to {}", peer_id);
                 }
             }
         }
@@ -373,11 +588,11 @@ impl TachyonNetwork {
 
     /// Handle incoming control messages
     async fn handle_control_message(
-        node_id: NodeId,
+        _node_id: NodeId,
         message: ControlMessage,
-        endpoint: &Endpoint,
+        _endpoint: &Endpoint,
         announcements: &broadcast::Sender<(BlobKind, Cid, u64, usize, String)>,
-        peers: &Arc<RwLock<HashMap<NodeId, Connection>>>,
+        _peers: &Arc<RwLock<HashMap<NodeId, Connection>>>,
     ) {
         match message {
             ControlMessage::Announce {
@@ -451,7 +666,7 @@ impl ProtocolHandler for ControlProtocol {
             // handle incoming streams
             loop {
                 match conn.accept_bi().await {
-                    Ok((mut send, recv)) => {
+                    Ok((_send, recv)) => {
                         let res = read_framed(recv).await;
                         match res.and_then(|buf| {
                             bincode::deserialize::<ControlMessage>(&buf).map_err(|e| anyhow!(e))
@@ -459,7 +674,7 @@ impl ProtocolHandler for ControlProtocol {
                             Ok(msg) => {
                                 let _ = tx.send((node_id, msg));
                             }
-                            Err(err) => {
+                            Err(_err) => {
                                 // Failed to decode control message; drop the stream
                                 break;
                             }
