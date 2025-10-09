@@ -1,0 +1,19 @@
+[package]
+name = "node_ext"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+net_iroh = { path = "../net_iroh" }
+pcd_core = { path = "../pcd_core" }
+accum_mmr = { path = "../accum_mmr" }
+accum_set = { path = "../accum_set" }
+pq_crypto = { path = "../pq_crypto" }

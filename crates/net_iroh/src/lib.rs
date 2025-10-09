@@ -1,0 +1,475 @@
+//! # net_iroh
+//!
+//! A wrapper over iroh + iroh-blobs for Tachyon network communication.
+//! Provides high-level APIs for blob publishing, fetching, and control protocol handling.
+
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::{protocol::{AcceptError, ProtocolHandler, Router}, Endpoint, NodeId};
+use iroh_blobs::{store::fs::FsStore, Hash};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock},
+};
+use tokio::io::AsyncReadExt;
+use tokio::{
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+};
+use tracing::{debug, info};
+
+// Integrity verification is provided by iroh-blobs via BLAKE3-verified streams.
+
+/// Protocol identifiers for ALPN
+pub const CONTROL_ALPN: &[u8] = b"tachyon/ctrl";
+
+/// Blob content identifier (BLAKE3 hash)
+pub type Cid = Hash;
+
+/// Blob kind for announcements
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BlobKind {
+    /// Commitment delta blob
+    CommitmentDelta,
+    /// Nullifier delta blob
+    NullifierDelta,
+    /// PCD transition blob
+    PcdTransition,
+    /// Header blob
+    Header,
+    /// Checkpoint blob
+    Checkpoint,
+}
+
+/// Control message types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ControlMessage {
+    /// Announce a new blob
+    Announce {
+        kind: BlobKind,
+        cid: Cid,
+        height: u64,
+        size: usize,
+        ticket: String,
+    },
+    /// Request a blob
+    Request { cid: Cid },
+    /// Response to a request
+    Response {
+        cid: Cid,
+        data: Result<Bytes, String>,
+    },
+    /// Subscription request
+    Subscribe { kinds: Vec<BlobKind> },
+    /// Unsubscribe request
+    Unsubscribe { kinds: Vec<BlobKind> },
+}
+
+/// Tachyon blob store wrapper around iroh-blobs
+#[derive(Clone)]
+pub struct TachyonBlobStore {
+    /// File system store for persistent storage
+    fs_store: Option<FsStore>,
+    /// In-memory cache for frequently accessed blobs
+    cache: Arc<RwLock<HashMap<Hash, Bytes>>>,
+    /// Data directory path
+    data_dir: PathBuf,
+}
+
+impl TachyonBlobStore {
+    /// Create a new blob store
+    pub async fn new(data_dir: &Path) -> Result<Self> {
+        let mut store = Self {
+            fs_store: None,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            data_dir: data_dir.to_path_buf(),
+        };
+
+        // Initialize the file system store
+        store.initialize_fs_store().await?;
+
+        Ok(store)
+    }
+
+    /// Initialize the underlying file system store
+    async fn initialize_fs_store(&mut self) -> Result<()> {
+        let store_path = self.data_dir.join("blobs");
+        std::fs::create_dir_all(&store_path)?;
+
+        // Use iroh-blobs FsStore for persistence
+        let fs = FsStore::load(&store_path).await?;
+        self.fs_store = Some(fs);
+
+        Ok(())
+    }
+
+    /// Store a blob with the given content identifier
+    pub async fn put(&self, hash: Hash, data: Bytes) -> Result<()> {
+        // Persist to disk (via FsStore) and cache
+        if let Some(fs) = &self.fs_store {
+            // Store bytes, verify computed hash matches provided
+            let tag_info = fs.add_bytes(data.clone()).await?;
+            if tag_info.hash != hash {
+                return Err(anyhow!(
+                    "hash mismatch: provided {} computed {}",
+                    hash.to_hex(),
+                    tag_info.hash.to_hex()
+                ));
+            }
+        }
+        self.cache.write().unwrap().insert(hash, data);
+        Ok(())
+    }
+
+    /// Retrieve a blob by its content identifier
+    pub async fn get(&self, hash: &Hash) -> Result<Bytes> {
+        // Check cache first
+        if let Some(data) = self.cache.read().unwrap().get(hash) {
+            return Ok(data.clone());
+        }
+
+        // Read from FsStore if available
+        if let Some(fs) = &self.fs_store {
+            let bytes = fs.get_bytes(*hash).await?;
+            let data = Bytes::from(bytes);
+            self.cache.write().unwrap().insert(*hash, data.clone());
+            return Ok(data);
+        }
+
+        Err(anyhow!("Blob not found"))
+    }
+
+    /// Check if a blob exists
+    pub async fn contains(&self, hash: &Hash) -> bool {
+        if self.cache.read().unwrap().contains_key(hash) {
+            return true;
+        }
+        if let Some(fs) = &self.fs_store {
+            return fs.has(*hash).await.unwrap_or(false);
+        }
+        false
+    }
+}
+
+/// High-level network interface
+pub struct TachyonNetwork {
+    /// Iroh endpoint
+    endpoint: Endpoint,
+    /// Optional convenience local blob store (legacy, used in benches)
+    pub blob_store: TachyonBlobStore,
+    /// Control protocol handler
+    control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
+    /// Blob announcements
+    announcements: broadcast::Sender<(BlobKind, Cid, u64, usize, String)>,
+    /// Active control connections per peer
+    peers: Arc<RwLock<HashMap<NodeId, Connection>>>,
+    /// Background task handles
+    _tasks: Vec<JoinHandle<()>>,
+    /// Router handle for graceful shutdown
+    router: Router,
+}
+
+/// Blob store trait for dependency injection
+pub trait BlobStore: Send + Sync + 'static {
+    fn put_blob<'a>(
+        &'a self,
+        cid: &Cid,
+        data: Bytes,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+    fn fetch_blob<'a>(
+        &'a self,
+        cid: &'a Cid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send + 'a>>;
+    fn has_blob<'a>(
+        &'a self,
+        cid: &'a Cid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
+impl BlobStore for TachyonBlobStore {
+    fn put_blob<'a>(
+        &'a self,
+        cid: &Cid,
+        data: Bytes,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.put(*cid, data))
+    }
+
+    fn fetch_blob<'a>(
+        &'a self,
+        cid: &'a Cid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send + 'a>> {
+        Box::pin(self.get(cid))
+    }
+
+    fn has_blob<'a>(
+        &'a self,
+        cid: &'a Cid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(self.contains(cid))
+    }
+}
+
+impl TachyonNetwork {
+    /// Create a new TachyonNetwork instance
+    pub async fn new(data_dir: &std::path::Path) -> Result<Self> {
+        // Create iroh endpoint with discovery enabled
+        let endpoint = Endpoint::builder().bind().await?;
+
+        // Create convenience local blob store for legacy callers/benches
+        let blob_store = TachyonBlobStore::new(data_dir).await?;
+
+        // Create channels for communication
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (announcements, _) = broadcast::channel(1000);
+        let announcements_tx = announcements.clone();
+        let peers: Arc<RwLock<HashMap<NodeId, Connection>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        // Control protocol handler registered with router
+        let control_proto = ControlProtocol {
+            peers: peers.clone(),
+            control_tx: control_tx.clone(),
+        };
+
+        let router = Router::builder(endpoint.clone())
+            .accept(CONTROL_ALPN, control_proto.clone())
+            .spawn();
+
+        // Handle incoming control messages
+        let endpoint_clone = endpoint.clone();
+        let peers_clone = peers.clone();
+        let control_task = tokio::spawn(async move {
+            while let Some((node_id, message)) = control_rx.recv().await {
+                Self::handle_control_message(
+                    node_id,
+                    message,
+                    &endpoint_clone,
+                    &announcements_tx,
+                    &peers_clone,
+                )
+                .await;
+            }
+        });
+
+        Ok(TachyonNetwork {
+            endpoint,
+            blob_store,
+            control_tx,
+            announcements,
+            peers,
+            _tasks: vec![control_task],
+            router,
+        })
+    }
+
+    /// Get our node ID
+    pub fn node_id(&self) -> NodeId {
+        self.endpoint.node_id()
+    }
+
+    /// Publish a blob to the network
+    pub async fn publish_blob(&self, kind: BlobKind, data: Bytes, height: u64) -> Result<Cid> {
+        let (cid, _ticket) = self.publish_blob_with_ticket(kind, data, height).await?;
+        Ok(cid)
+    }
+
+    /// Publish a blob and return both CID and a retrieval ticket string
+    pub async fn publish_blob_with_ticket(
+        &self,
+        kind: BlobKind,
+        data: Bytes,
+        height: u64,
+    ) -> Result<(Cid, String)> {
+        // Add content to local blob store and generate a local ticket
+        let hash = blake3::hash(&data);
+        let cid = Cid::from(hash);
+        self.blob_store.put(cid, data.clone()).await?;
+        let ticket = format!("local:{}", cid.to_hex());
+
+        // Announce publication to control-plane peers
+        let message = ControlMessage::Announce {
+            kind: kind.clone(),
+            cid,
+            height,
+            size: data.len(),
+            ticket: ticket.clone(),
+        };
+        self.broadcast_control_message(message).await?;
+
+        // Notify local subscribers
+        let _ = self
+            .announcements
+            .send((kind, cid, height, data.len(), ticket.clone()));
+
+        info!("Published blob with ticket, CID {}", cid);
+        Ok((cid, ticket))
+    }
+
+    /// Subscribe to blob announcements
+    pub fn subscribe_announcements(
+        &self,
+    ) -> broadcast::Receiver<(BlobKind, Cid, u64, usize, String)> {
+        self.announcements.subscribe()
+    }
+
+    /// Fetch a blob by CID
+    pub async fn fetch_blob_from_ticket(&self, ticket: &str) -> Result<Bytes> {
+        // Local ticket format: "local:<hex_cid>"
+        if let Some(hex_str) = ticket.strip_prefix("local:") {
+            let bytes = hex::decode(hex_str).map_err(|e| anyhow!(e))?;
+            if bytes.len() != 32 {
+                return Err(anyhow!("invalid CID length in ticket"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let cid = Hash::from_bytes(arr);
+            return self.blob_store.get(&cid).await;
+        }
+        Err(anyhow!("Unsupported ticket format"))
+    }
+
+    /// Fetch a byte range via ticket
+    pub async fn fetch_range_from_ticket(
+        &self,
+        ticket: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes> {
+        let _ = (ticket, range);
+        Err(anyhow!("Range fetching not yet implemented"))
+    }
+
+    /// Connect to a peer
+    pub async fn connect(&self, peer_id: NodeId, peer_addr: Option<&iroh::RelayUrl>) -> Result<()> {
+        let node_addr = if let Some(addr) = peer_addr {
+            iroh::NodeAddr::new(peer_id).with_relay_url(addr.clone())
+        } else {
+            iroh::NodeAddr::new(peer_id)
+        };
+
+        let conn = self.endpoint.connect(node_addr, CONTROL_ALPN).await?;
+        self.peers.write().unwrap().insert(peer_id, conn);
+        Ok(())
+    }
+
+    /// Broadcast a control message to all connected peers
+    async fn broadcast_control_message(&self, message: ControlMessage) -> Result<()> {
+        let encoded = bincode::serialize(&message).map_err(|e| anyhow!(e))?;
+        let peers = self.peers.read().unwrap().clone();
+        for (peer_id, conn) in peers.into_iter() {
+            match conn.open_bi().await {
+                Ok((mut send, _recv)) => {
+                    write_framed(&mut send, &encoded).await?;
+                }
+                Err(err) => {
+                    debug!("failed to open control stream to {}: {:?}", peer_id, err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle incoming control messages
+    async fn handle_control_message(
+        node_id: NodeId,
+        message: ControlMessage,
+        endpoint: &Endpoint,
+        announcements: &broadcast::Sender<(BlobKind, Cid, u64, usize, String)>,
+        peers: &Arc<RwLock<HashMap<NodeId, Connection>>>,
+    ) {
+        match message {
+            ControlMessage::Announce {
+                kind,
+                cid,
+                height,
+                size,
+                ticket,
+            } => {
+                info!(
+                    "Received announcement: {:?} CID {} at height {}",
+                    kind, cid, height
+                );
+                let _ = announcements.send((kind, cid, height, size, ticket));
+            }
+            ControlMessage::Request { cid } => {
+                debug!("Received blob request for CID {}", cid);
+                // In local mode we don't serve remote requests yet
+            }
+            _ => {
+                debug!("Received other control message: {:?}", message);
+            }
+        }
+    }
+
+    /// Gracefully shutdown the router and background tasks
+    pub async fn shutdown(&self) -> Result<()> {
+        self.router.shutdown().await?;
+        Ok(())
+    }
+}
+
+// Simple length-prefixed framing helpers for control messages
+async fn write_framed(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
+    let len = bytes.len() as u32;
+    send.write_all(&len.to_le_bytes()).await?;
+    send.write_all(bytes).await?;
+    send.finish()?;
+    Ok(())
+}
+
+async fn read_framed(mut recv: RecvStream) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+// Control protocol that accepts control ALPN connections and forwards messages
+#[derive(Clone, Debug)]
+struct ControlProtocol {
+    peers: Arc<RwLock<HashMap<NodeId, Connection>>>,
+    control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
+}
+
+impl ProtocolHandler for ControlProtocol {
+    fn accept(
+        &self,
+        conn: Connection,
+    ) -> impl std::future::Future<Output = std::result::Result<(), AcceptError>> + Send {
+        let peers = self.peers.clone();
+        let tx = self.control_tx.clone();
+        Box::pin(async move {
+            let node_id = match conn.remote_node_id() {
+                Ok(id) => id,
+                Err(_) => return Ok(()),
+            };
+            peers.write().unwrap().insert(node_id, conn.clone());
+            // handle incoming streams
+            loop {
+                match conn.accept_bi().await {
+                    Ok((mut send, recv)) => {
+                        let res = read_framed(recv).await;
+                        match res.and_then(|buf| {
+                            bincode::deserialize::<ControlMessage>(&buf).map_err(|e| anyhow!(e))
+                        }) {
+                            Ok(msg) => {
+                                let _ = tx.send((node_id, msg));
+                            }
+                            Err(err) => {
+                                // Failed to decode control message; drop the stream
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            peers.write().unwrap().remove(&node_id);
+            Ok(())
+        })
+    }
+}

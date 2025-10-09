@@ -1,0 +1,17 @@
+[package]
+name = "pq_crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+aes-gcm = "0.10"
+blake3.workspace = true
+hex = "0.4"
+zeroize = "1"
+pqcrypto-kyber = "0.8"

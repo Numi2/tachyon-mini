@@ -1,0 +1,15 @@
+[package]
+name = "header_sync"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+tracing.workspace = true
+net_iroh = { path = "../net_iroh" }
+bincode.workspace = true

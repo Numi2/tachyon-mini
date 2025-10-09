@@ -1,0 +1,18 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+pq_crypto = { path = "../pq_crypto" }
+bincode.workspace = true
+blake3.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"

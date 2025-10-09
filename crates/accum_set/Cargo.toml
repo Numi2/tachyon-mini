@@ -1,0 +1,13 @@
+[package]
+name = "accum_set"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+blake3.workspace = true
+
+

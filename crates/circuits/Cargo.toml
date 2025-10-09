@@ -1,0 +1,18 @@
+[package]
+name = "circuits"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+halo2_proofs.workspace = true
+halo2_gadgets.workspace = true
+blake3.workspace = true
+ff = "0.13"
+rand.workspace = true
+halo2curves = "0.6"
+pasta_curves.workspace = true

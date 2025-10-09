@@ -1,0 +1,13 @@
+[package]
+name = "accum_mmr"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+hex = "0.4"
