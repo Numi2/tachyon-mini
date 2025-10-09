@@ -366,6 +366,104 @@ impl MmrAccumulator {
     }
 }
 
+/// Tachygram accumulator: a thin wrapper over the MMR providing
+/// batch insertions and membership proofs for 32-byte elements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TachygramAccumulator {
+    /// Underlying MMR accumulator
+    mmr: MmrAccumulator,
+    /// Map from element bytes to MMR positions for membership proving
+    index: HashMap<[u8; 32], Vec<u64>>, // an element may appear multiple times
+}
+
+impl TachygramAccumulator {
+    /// Create a new empty Tachygram accumulator
+    pub fn new() -> Self {
+        Self {
+            mmr: MmrAccumulator::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Current size (MMR positions, including inner nodes)
+    pub fn size(&self) -> u64 {
+        self.mmr.size()
+    }
+
+    /// Compute leaf hash for an element under tachygram domain separation
+    fn leaf_hash(element: &[u8; 32]) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tachygram:leaf:v1");
+        hasher.update(element);
+        hasher.finalize()
+    }
+
+    /// Insert a single element and return its leaf position in the MMR
+    pub fn insert(&mut self, element: [u8; 32]) -> Result<u64> {
+        let h = Self::leaf_hash(&element);
+        let pos = self.mmr.append(h)?;
+        self.index.entry(element).or_default().push(pos);
+        Ok(pos)
+    }
+
+    /// Batch-insert elements
+    pub fn batch_insert(&mut self, elements: &[[u8; 32]]) -> Result<()> {
+        for e in elements {
+            let _ = self.insert(*e)?;
+        }
+        Ok(())
+    }
+
+    /// Get current root of the accumulator (None if empty)
+    pub fn root(&self) -> Option<[u8; 32]> {
+        self.mmr.root().map(|h| *h.as_bytes())
+    }
+
+    /// Produce a membership proof for the given element, if present.
+    pub fn prove(&self, element: &[u8; 32]) -> Result<TachygramMembershipProof> {
+        let Some(positions) = self.index.get(element) else {
+            return Err(anyhow!("Element not found"));
+        };
+        let &pos = positions
+            .first()
+            .ok_or_else(|| anyhow!("Element positions missing"))?;
+        let proof = self.mmr.prove(pos)?;
+        Ok(TachygramMembershipProof {
+            element: *element,
+            proof,
+        })
+    }
+}
+
+/// Membership proof carrying the original element and the underlying MMR proof
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TachygramMembershipProof {
+    /// Original 32-byte element
+    pub element: [u8; 32],
+    /// Underlying MMR proof
+    pub proof: MmrProof,
+}
+
+impl TachygramMembershipProof {
+    /// Verify this membership proof against an expected root.
+    /// Ensures the leaf hash corresponds to the element, and the path validates to the root.
+    pub fn verify(&self, expected_root: &[u8; 32]) -> bool {
+        let leaf = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"tachygram:leaf:v1");
+            hasher.update(&self.element);
+            hasher.finalize()
+        };
+
+        if self.proof.element.hash.0 != leaf {
+            return false;
+        }
+
+        let root = Hash::from(*expected_root);
+        self.proof.verify(&root)
+    }
+}
+
 /// Delta operations for efficient MMR updates
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MmrDelta {
@@ -618,5 +716,16 @@ mod tests {
         assert_eq!(loaded.size(), mmr.size());
         assert_eq!(loaded.peaks(), mmr.peaks());
         assert_eq!(loaded.root().unwrap(), root_before);
+    }
+
+    #[test]
+    fn test_tachygram_insert_and_prove() {
+        let mut tg = TachygramAccumulator::new();
+        let e1 = [1u8; 32];
+        let e2 = [2u8; 32];
+        tg.batch_insert(&[e1, e2]).unwrap();
+        let root = tg.root().unwrap();
+        let proof = tg.prove(&e1).unwrap();
+        assert!(proof.verify(&root));
     }
 }

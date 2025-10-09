@@ -17,3 +17,5 @@ tracing.workspace = true
 bytes.workspace = true
 pq_crypto.workspace = true
 tempfile.workspace = true
+accum_mmr.workspace = true
+accum_set.workspace = true

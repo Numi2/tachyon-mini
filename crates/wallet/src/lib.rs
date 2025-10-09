@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use net_iroh::{BlobKind, Cid, ControlMessage, TachyonNetwork};
 use pcd_core::{
-    PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier,
+    PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier, PcdTransition,
 };
 use pq_crypto::{
     derive_nullifier, KyberPublicKey, KyberSecretKey, NullifierDerivationMode, OutOfBandPayment,
@@ -528,6 +528,8 @@ impl TachyonWallet {
         let sync_manager = self.sync_manager.clone();
         let network = self.network.clone();
         let sync_interval = self.config.sync_config.sync_interval_secs;
+        let pcd_manager = self.pcd_manager.clone();
+        let database = self.database.clone();
 
         let sync_task = tokio::spawn(async move {
             // Subscribe to blob announcements
@@ -552,7 +554,39 @@ impl TachyonWallet {
                         match fetched {
                             Ok(Some((kind, bytes))) => {
                                 tracing::info!("Fetched announced blob {:?} ({} bytes)", kind, bytes.len());
-                                // TODO: route bytes to appropriate handler (MMR delta / transition)
+                                match kind {
+                                    BlobKind::PcdTransition => {
+                                        // Apply transition to local PCD state and persist
+                                        match bincode::deserialize::<PcdTransition>(&bytes) {
+                                            Ok(transition) => {
+                                                let mut mgr = pcd_manager.write().await;
+                                                if let Err(e) = mgr.apply_transition(transition) {
+                                                    tracing::warn!("PCD transition apply failed: {}", e);
+                                                } else {
+                                                    // Persist current state
+                                                    if let Some(state) = mgr.current_state().cloned() {
+                                                        // Create a record and save
+                                                        if let Ok(rec) = storage::PcdStateRecord::new(
+                                                            state.anchor_height,
+                                                            state.state_commitment,
+                                                            &state.state_data,
+                                                            state.proof.clone(),
+                                                            &database.master_key,
+                                                        ) {
+                                                            if let Err(e) = database.set_pcd_state(rec).await {
+                                                                tracing::warn!("Failed to persist PCD state: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => tracing::warn!("Failed to decode PCD transition: {}", e),
+                                        }
+                                    }
+                                    _ => {
+                                        // Other blob kinds can be handled here (MMR/Nullifier deltas)
+                                    }
+                                }
                             }
                             Ok(None) => {}
                             Err(e) => tracing::warn!("Announcement fetch error: {}", e),

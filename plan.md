@@ -21,7 +21,7 @@ end-to-end architecture for a Tachyon-style Zcash system in Rust.
 	5.	Header sync
 – Lets new participants join quickly without replaying all history.
 
-⸻So the deliverable is e a prototype Tachyon network:
+ prototype Tachyon network:
 	•	Wallet software (with PCD logic).
 	•	Node software (with validator + pruning).
 	•	OSS (sync servers for wallets).

@@ -9,6 +9,8 @@ use net_iroh::{BlobKind, BlobStore, Cid, ControlMessage, TachyonNetwork};
 use pq_crypto::{derive_nullifier, NullifierDerivationMode};
 use pq_crypto::AccessToken;
 use pcd_core::{PcdDeltaBundle, PcdState, PcdTransition};
+use accum_mmr::{MmrDelta, SerializableHash};
+use accum_set::SetDelta;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -283,8 +285,7 @@ impl ObliviousSyncService {
         // Generate delta bundle for this cycle
         let delta_bundle = Self::generate_delta_bundle(current_state)?;
 
-        // Serialize delta bundle for publishing via iroh-blobs
-        let delta_data = bincode::serialize(&delta_bundle)?;
+        // Note: we will publish MMR and Nullifier deltas separately (not the whole bundle)
 
         // Generate PCD transition proof
         let transition = Self::generate_pcd_transition(current_state, &delta_bundle)?;
@@ -294,12 +295,15 @@ impl ObliviousSyncService {
 
         // Publish via iroh-blobs and capture tickets for clients
         let height_next = current_state.anchor_height + 1;
-        let (_delta_cid, delta_ticket) = network
-            .publish_blob_with_ticket(
-                BlobKind::CommitmentDelta,
-                delta_data.clone().into(),
-                height_next,
-            )
+        // Publish serialized Vec<MmrDelta>
+        let mmr_bytes = delta_bundle.mmr_deltas.concat();
+        let (_mmr_cid, mmr_ticket) = network
+            .publish_blob_with_ticket(BlobKind::CommitmentDelta, mmr_bytes.clone().into(), height_next)
+            .await?;
+        // Publish serialized SetDelta
+        let nf_bytes = delta_bundle.nullifier_deltas.concat();
+        let (_nf_cid, nf_ticket) = network
+            .publish_blob_with_ticket(BlobKind::NullifierDelta, nf_bytes.clone().into(), height_next)
             .await?;
         let (_tr_cid, transition_ticket) = network
             .publish_blob_with_ticket(BlobKind::PcdTransition, transition_data.clone().into(), height_next)
@@ -311,9 +315,16 @@ impl ObliviousSyncService {
             list.push(PublishedBlobInfo {
                 kind: BlobKind::CommitmentDelta,
                 height: height_next,
-                size: delta_data.len(),
-                cid: net_iroh::Cid::from(blake3::hash(&delta_data)),
-                ticket: delta_ticket,
+                size: mmr_bytes.len(),
+                cid: net_iroh::Cid::from(blake3::hash(&mmr_bytes)),
+                ticket: mmr_ticket,
+            });
+            list.push(PublishedBlobInfo {
+                kind: BlobKind::NullifierDelta,
+                height: height_next,
+                size: nf_bytes.len(),
+                cid: net_iroh::Cid::from(blake3::hash(&nf_bytes)),
+                ticket: nf_ticket,
             });
             list.push(PublishedBlobInfo {
                 kind: BlobKind::PcdTransition,
@@ -334,10 +345,17 @@ impl ObliviousSyncService {
 
     /// Generate a delta bundle for the current state
     fn generate_delta_bundle(current_state: &PcdState) -> Result<PcdDeltaBundle> {
-        // Deterministic MMR delta bound to current anchor (placeholder bytes)
-        let mut mmr_delta = Vec::new();
-        mmr_delta.extend_from_slice(b"mmr:");
-        mmr_delta.extend_from_slice(&current_state.anchor_height.to_le_bytes());
+        // Deterministic MMR batch append deltas bound to current anchor (placeholder)
+        let mut mmr_hashes = Vec::new();
+        for i in 0..2u32 {
+            let mut h = blake3::Hasher::new();
+            h.update(b"mmr_leaf");
+            h.update(&current_state.anchor_height.to_le_bytes());
+            h.update(&i.to_le_bytes());
+            mmr_hashes.push(SerializableHash(h.finalize()));
+        }
+        let mmr_deltas = vec![MmrDelta::BatchAppend { hashes: mmr_hashes }];
+        let mmr_delta = bincode::serialize(&mmr_deltas)?;
 
         // Generate a small batch of blinded nullifiers deterministically from the anchor
         let mut blinded_nullifiers: Vec<[u8; 32]> = Vec::new();
@@ -360,8 +378,8 @@ impl ObliviousSyncService {
             blinded_nullifiers.push(nf);
         }
 
-        // Serialize nullifier batch as the delta payload
-        let nf_delta = bincode::serialize(&blinded_nullifiers)?;
+        // Serialize nullifier batch as a SetDelta::BatchInsert payload
+        let nf_delta = bincode::serialize(&SetDelta::BatchInsert { elements: blinded_nullifiers })?;
 
         Ok(PcdDeltaBundle::new(
             vec![mmr_delta],

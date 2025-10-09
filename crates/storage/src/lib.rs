@@ -3,13 +3,13 @@
 //! Encrypted storage layer for Tachyon wallet.
 //! Provides secure note database with encryption at rest and in-memory caching.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use fs2::FileExt;
 use pq_crypto::{
     KyberPublicKey, KyberSecretKey, SimpleAead, SimpleKem, AES_KEY_SIZE, AES_NONCE_SIZE,
 };
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -69,6 +69,12 @@ impl EncryptedNote {
     /// Decrypt the note data
     pub fn decrypt(&self, master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<Vec<u8>> {
         let associated_data = b"note_encryption";
+        if self.encrypted_data.len() < AES_NONCE_SIZE {
+            return Err(anyhow!("Ciphertext too short"));
+        }
+        if &self.encrypted_data[..AES_NONCE_SIZE] != &self.nonce {
+            return Err(anyhow!("Nonce mismatch for EncryptedNote"));
+        }
         SimpleAead::decrypt(master_key, &self.encrypted_data, associated_data)
     }
 
@@ -130,6 +136,12 @@ impl PcdStateRecord {
     /// Decrypt the PCD state data
     pub fn decrypt_state(&self, master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<Vec<u8>> {
         let associated_data = b"pcd_state_encryption";
+        if self.encrypted_state.len() < AES_NONCE_SIZE {
+            return Err(anyhow!("Ciphertext too short"));
+        }
+        if &self.encrypted_state[..AES_NONCE_SIZE] != &self.nonce {
+            return Err(anyhow!("Nonce mismatch for PcdStateRecord"));
+        }
         SimpleAead::decrypt(master_key, &self.encrypted_state, associated_data)
     }
 
@@ -192,6 +204,12 @@ impl WitnessRecord {
     /// Decrypt the witness data
     pub fn decrypt_witness(&self, master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<Vec<u8>> {
         let associated_data = b"witness_encryption";
+        if self.encrypted_witness.len() < AES_NONCE_SIZE {
+            return Err(anyhow!("Ciphertext too short"));
+        }
+        if &self.encrypted_witness[..AES_NONCE_SIZE] != &self.nonce {
+            return Err(anyhow!("Nonce mismatch for WitnessRecord"));
+        }
         SimpleAead::decrypt(master_key, &self.encrypted_witness, associated_data)
     }
 
@@ -214,12 +232,13 @@ impl WitnessRecord {
 }
 
 /// Main wallet database structure
-#[derive(Clone)]
 pub struct WalletDatabase {
     /// Database path
     db_path: PathBuf,
     /// Master encryption key (derived from user password)
     pub master_key: [u8; DB_MASTER_KEY_SIZE],
+    /// File handle for process-wide DB lock (kept open to hold lock)
+    lock_file: File,
     /// In-memory note cache for performance
     note_cache: Arc<RwLock<HashMap<[u8; NOTE_COMMITMENT_SIZE], EncryptedNote>>>,
     /// In-memory PCD state cache
@@ -251,6 +270,7 @@ impl WalletDatabase {
         let mut db = Self {
             db_path: db_path.to_path_buf(),
             master_key,
+            lock_file,
             note_cache: Arc::new(RwLock::new(HashMap::new())),
             pcd_state_cache: Arc::new(RwLock::new(None)),
             witness_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -314,40 +334,61 @@ impl WalletDatabase {
 
     /// Save database to disk
     async fn save_to_disk(&self) -> Result<()> {
+        // Ensure database directory exists (in case it was removed during runtime)
+        fs::create_dir_all(&self.db_path).await?;
         // Save notes atomically
         let notes_path = self.db_path.join("notes.bin");
         let notes_tmp = self.db_path.join("notes.bin.tmp");
-        let notes = self.note_cache.read().unwrap();
-        let notes_data = bincode::serialize(&*notes)?;
+        let notes_data = {
+            let notes = self.note_cache.read().unwrap();
+            bincode::serialize(&*notes)?
+        };
         fs::write(&notes_tmp, &notes_data).await?;
-        tokio::fs::rename(&notes_tmp, &notes_path).await?;
+        fs::rename(&notes_tmp, &notes_path).await?;
 
         // Save PCD state atomically
         let pcd_path = self.db_path.join("pcd_state.bin");
-        if let Some(pcd_state) = self.pcd_state_cache.read().unwrap().as_ref() {
+        let pcd_state_opt = { self.pcd_state_cache.read().unwrap().clone() };
+        if let Some(pcd_state) = pcd_state_opt {
             let pcd_tmp = self.db_path.join("pcd_state.bin.tmp");
-            let pcd_data = bincode::serialize(pcd_state)?;
+            let pcd_data = bincode::serialize(&pcd_state)?;
             fs::write(&pcd_tmp, &pcd_data).await?;
-            tokio::fs::rename(&pcd_tmp, &pcd_path).await?;
+            fs::rename(&pcd_tmp, &pcd_path).await?;
         }
 
         // Save witnesses atomically
         let witnesses_path = self.db_path.join("witnesses.bin");
         let witnesses_tmp = self.db_path.join("witnesses.bin.tmp");
-        let witnesses = self.witness_cache.read().unwrap();
-        let witnesses_data = bincode::serialize(&*witnesses)?;
+        let witnesses_data = {
+            let witnesses = self.witness_cache.read().unwrap();
+            bincode::serialize(&*witnesses)?
+        };
         fs::write(&witnesses_tmp, &witnesses_data).await?;
-        tokio::fs::rename(&witnesses_tmp, &witnesses_path).await?;
+        fs::rename(&witnesses_tmp, &witnesses_path).await?;
 
         // Save OOB keys if present atomically
         let keys_path = self.db_path.join("oob_keys.bin");
-        if let Some(keys) = self.oob_keys_cache.read().unwrap().as_ref() {
+        let keys_opt = { self.oob_keys_cache.read().unwrap().clone() };
+        if let Some(keys) = keys_opt {
             let keys_tmp = self.db_path.join("oob_keys.bin.tmp");
-            let keys_data = bincode::serialize(keys)?;
+            let keys_data = bincode::serialize(&keys)?;
             fs::write(&keys_tmp, &keys_data).await?;
-            tokio::fs::rename(&keys_tmp, &keys_path).await?;
+            fs::rename(&keys_tmp, &keys_path).await?;
         }
 
+        Ok(())
+    }
+
+    /// Flush in-memory state to disk
+    pub async fn flush(&self) -> Result<()> {
+        self.save_to_disk().await
+    }
+
+    /// Gracefully release the exclusive database lock.
+    ///
+    /// Note: Only call this when you are certain no other operations will run.
+    pub fn release_lock(&self) -> Result<()> {
+        fs2::FileExt::unlock(&self.lock_file)?;
         Ok(())
     }
 
@@ -546,8 +587,21 @@ impl OobKeysRecord {
     }
 
     pub fn decrypt_secret(&self, master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<Vec<u8>> {
+        if self.encrypted_secret.len() < AES_NONCE_SIZE {
+            return Err(anyhow!("Ciphertext too short"));
+        }
+        if &self.encrypted_secret[..AES_NONCE_SIZE] != &self.nonce {
+            return Err(anyhow!("Nonce mismatch for OobKeysRecord"));
+        }
         let sk = SimpleAead::decrypt(master_key, &self.encrypted_secret, b"oob_keys")?;
         Ok(sk)
+    }
+}
+
+impl Drop for WalletDatabase {
+    fn drop(&mut self) {
+        // Best-effort unlock; dropping the file will also release the lock
+        let _ = fs2::FileExt::unlock(&self.lock_file);
     }
 }
 

@@ -2841,6 +2841,8 @@ checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 name = "oss_service"
 version = "0.1.0"
 dependencies = [
+ "accum_mmr",
+ "accum_set",
  "anyhow",
  "bincode",
  "blake3",
@@ -4857,6 +4859,7 @@ name = "wallet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "blake3",
  "net_iroh",
  "pcd_core",

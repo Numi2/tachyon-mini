@@ -15,6 +15,7 @@ pq_crypto = { path = "../pq_crypto" }
 storage = { path = "../storage" }
 blake3.workspace = true
 tracing.workspace = true
+bincode.workspace = true
 
 [dev-dependencies]
 tempfile = "3.0"

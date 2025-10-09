@@ -1,5 +1,5 @@
 //! # node_ext
-//!
+//! Numan Thabit
 //! Validator / Node extension implementation for Tachyon.
 //! Verifies PCD proofs, nullifier checks, and maintains minimal state for validation.
 
@@ -7,6 +7,7 @@ use accum_mmr::SerializableHash;
 use anyhow::{anyhow, Result};
 use blake3::Hash;
 use net_iroh::TachyonNetwork;
+use pcd_core::aggregation::aggregate_action_proofs;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -260,16 +261,11 @@ impl TachyonNode {
         })
     }
 
-    /// Aggregate PCD proofs from a block into a single proof blob (placeholder)
+    /// Aggregate PCD proofs from a block into a single proof blob using recursive-style folding
     pub fn aggregate_block_proofs(&self, block: &Block) -> Result<Vec<u8>> {
-        // Concatenate proofs with a domain separator; in production use recursive SNARK
-        let mut acc = blake3::Hasher::new();
-        acc.update(b"pcd:block:aggregate:v1");
-        acc.update(&block.height.to_le_bytes());
-        for tx in &block.transactions {
-            acc.update(&tx.pcd_proof);
-        }
-        Ok(acc.finalize().as_bytes().to_vec())
+        let proofs: Vec<Vec<u8>> = block.transactions.iter().map(|t| t.pcd_proof.clone()).collect();
+        let aggregated = aggregate_action_proofs(&proofs)?;
+        Ok(aggregated)
     }
 
     /// Validate a transaction
@@ -664,5 +660,43 @@ mod tests {
         };
 
         assert!(tx.validate_format().is_ok());
+    }
+
+    #[test]
+    fn test_block_aggregation() {
+        let block = Block {
+            height: 1,
+            previous_hash: TransactionHash(Hash::from([0u8; 32])),
+            transactions: vec![
+                Transaction {
+                    hash: TransactionHash(Hash::from([1u8; 32])),
+                    nullifiers: vec![[1u8; 32]],
+                    commitments: vec![[2u8; 32]],
+                    pcd_proof: vec![1, 2, 3],
+                    pcd_state_commitment: [3u8; 32],
+                    anchor_height: 100,
+                    spend_proof: vec![4, 5, 6],
+                },
+                Transaction {
+                    hash: TransactionHash(Hash::from([2u8; 32])),
+                    nullifiers: vec![[3u8; 32]],
+                    commitments: vec![[4u8; 32]],
+                    pcd_proof: vec![7, 8, 9],
+                    pcd_state_commitment: [5u8; 32],
+                    anchor_height: 100,
+                    spend_proof: vec![7, 8, 9],
+                },
+            ],
+            timestamp: 0,
+        };
+
+        // Directly aggregate without constructing a node/runtime (faster and avoids IO)
+        let proofs: Vec<Vec<u8>> = block
+            .transactions
+            .iter()
+            .map(|t| t.pcd_proof.clone())
+            .collect();
+        let agg = pcd_core::aggregation::aggregate_action_proofs(&proofs).unwrap();
+        assert_eq!(agg.len(), 32);
     }
 }
