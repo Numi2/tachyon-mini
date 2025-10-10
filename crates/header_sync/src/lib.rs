@@ -7,6 +7,8 @@ use anyhow::{anyhow, Result};
 use blake3::Hash;
 use pq_crypto::{SuiteB, SuiteBPublicKey, SuiteBSignature, SUITE_B_DOMAIN_CHECKPOINT};
 use net_iroh::{BlobKind, TachyonNetwork};
+use net_iroh::Cid as NetCid;
+use iroh::NodeId as PeerId;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -30,6 +32,8 @@ pub struct HeaderSyncConfig {
     pub sync_config: SyncConfig,
     /// Security parameters
     pub security_config: SecurityConfig,
+    /// Proof-of-Work and header validation configuration
+    pub pow_config: PowConfig,
 }
 
 impl Default for HeaderSyncConfig {
@@ -38,6 +42,7 @@ impl Default for HeaderSyncConfig {
             network_config: NetworkConfig::default(),
             sync_config: SyncConfig::default(),
             security_config: SecurityConfig::default(),
+            pow_config: PowConfig::default(),
         }
     }
 }
@@ -127,6 +132,8 @@ pub struct HeaderChain {
     pub mmr_roots: HashMap<u64, SerializableHash>,
     /// Checkpoint data for fast sync
     pub checkpoints: Vec<Checkpoint>,
+    /// PoW configuration governing header validation
+    pub pow: PowConfig,
 }
 
 impl HeaderChain {
@@ -141,7 +148,15 @@ impl HeaderChain {
             tip: Some(0),
             mmr_roots: HashMap::new(),
             checkpoints: Vec::new(),
+            pow: PowConfig::default(),
         }
+    }
+
+    /// Create a new header chain with a specific PoW configuration
+    pub fn with_pow_config(genesis: BlockHeader, pow: PowConfig) -> Self {
+        let mut s = Self::new(genesis);
+        s.pow = pow;
+        s
     }
 
     /// Add a new header to the chain
@@ -186,26 +201,21 @@ impl HeaderChain {
         self.tip.and_then(|height| self.headers.get(&height))
     }
 
-    /// Verify proof of work (simplified implementation)
+    /// Verify proof of work (Zcash-tuned: compact target comparison; placeholder for Equihash)
     fn verify_pow(&self, header: &BlockHeader) -> bool {
-        // In a real implementation, this would verify actual PoW
-        // For now, just check that hash meets difficulty requirement
-        let hash_bytes = header.hash.as_bytes();
-        let difficulty_target = 0x1fff_ffff_ffff_ffff_u64;
-
-        // Simple check: first 8 bytes should be less than difficulty
-        let hash_prefix = u64::from_le_bytes([
-            hash_bytes[0],
-            hash_bytes[1],
-            hash_bytes[2],
-            hash_bytes[3],
-            hash_bytes[4],
-            hash_bytes[5],
-            hash_bytes[6],
-            hash_bytes[7],
-        ]);
-
-        hash_prefix < difficulty_target
+        if self.pow.disable_pow_validation {
+            return true;
+        }
+        // Validate hash <= target from compact bits
+        let target = compact_to_target(header.bits);
+        if !cmp256_be(header.hash.as_bytes(), &target) { return false; }
+        // Optionally validate Equihash solution parameters (n,k)
+        if self.pow.validate_equihash_solution {
+            if !verify_equihash_solution(header, self.pow.equihash_n, self.pow.equihash_k) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Generate NiPoPoW proof for a range of headers
@@ -283,6 +293,38 @@ impl SerializableHash {
     }
 }
 
+/// Convert compact bits to a 256-bit big-endian target
+fn compact_to_target(bits: u32) -> [u8; 32] {
+    // bits = exponent (8 bits) | mantissa (24 bits)
+    let exponent = (bits >> 24) as u8;
+    let mantissa = bits & 0x007fffff;
+    let mut target = [0u8; 32];
+    if exponent <= 3 {
+        let shift = 3 - exponent;
+        let val = (mantissa >> (8 * shift)) as u32;
+        let be = val.to_be_bytes();
+        target[28..32].copy_from_slice(&be);
+    } else {
+        let byte_index = (exponent as usize) - 3;
+        if byte_index < 32 {
+            let be = (mantissa as u32).to_be_bytes();
+            let start = 32 - byte_index - 4;
+            if start < 32 { target[start..start + 4].copy_from_slice(&be); }
+        }
+    }
+    target
+}
+
+/// Compare 256-bit big-endian values: returns true if hash <= target
+fn cmp256_be(hash_be: &[u8], target_be: &[u8; 32]) -> bool {
+    debug_assert_eq!(hash_be.len(), 32);
+    for (h, t) in hash_be.iter().zip(target_be.iter()) {
+        if h < t { return true; }
+        if h > t { return false; }
+    }
+    true
+}
+
 /// Block header representation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockHeader {
@@ -296,10 +338,12 @@ pub struct BlockHeader {
     pub mmr_root: Option<SerializableHash>,
     /// Timestamp
     pub timestamp: u64,
-    /// Nonce for proof of work
+    /// Nonce (Zcash: 32-bit little-endian in legacy header; here 64-bit for simplicity)
     pub nonce: u64,
-    /// Difficulty target
-    pub difficulty: u64,
+    /// Compact difficulty target (Bitcoin/Zcash-style nBits)
+    pub bits: u32,
+    /// Equihash solution bytes (Zcash PoW). Optional for chains not using Equihash
+    pub solution: Vec<u8>,
 }
 
 impl BlockHeader {
@@ -310,7 +354,7 @@ impl BlockHeader {
         mmr_root: Option<Hash>,
         timestamp: u64,
         nonce: u64,
-        difficulty: u64,
+        bits: u32,
     ) -> Self {
         let mut header = Self {
             height,
@@ -319,26 +363,28 @@ impl BlockHeader {
             mmr_root: mmr_root.map(|h| h.into()),
             timestamp,
             nonce,
-            difficulty,
+            bits,
+            solution: Vec::new(),
         };
         header.hash = SerializableHash(header.compute_hash());
-        if !header.meets_difficulty() {
-            header.mine();
-        }
+        if !header.meets_difficulty() { header.mine(); }
         header
     }
 
     /// Compute header hash
     pub fn compute_hash(&self) -> Hash {
+        // Zcash uses a different header hashing and Equihash solution; for this implementation
+        // we domain-separate and include typical header fields so the nBits comparison is meaningful.
         let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tachyon:zcash:header:v1");
         hasher.update(&self.height.to_le_bytes());
         hasher.update(self.previous_hash.0.as_bytes());
-        if let Some(mmr_root) = self.mmr_root {
-            hasher.update(mmr_root.0.as_bytes());
-        }
+        if let Some(mmr_root) = self.mmr_root { hasher.update(mmr_root.0.as_bytes()); }
         hasher.update(&self.timestamp.to_le_bytes());
         hasher.update(&self.nonce.to_le_bytes());
-        hasher.update(&self.difficulty.to_le_bytes());
+        hasher.update(&self.bits.to_le_bytes());
+        // Include solution bytes if present to bind PoW
+        hasher.update(&self.solution);
         hasher.finalize()
     }
 
@@ -352,19 +398,11 @@ impl BlockHeader {
 
     /// Check if hash meets difficulty requirement
     pub fn meets_difficulty(&self) -> bool {
-        let hash_bytes = self.hash.0.as_bytes();
-        let hash_prefix = u64::from_le_bytes([
-            hash_bytes[0],
-            hash_bytes[1],
-            hash_bytes[2],
-            hash_bytes[3],
-            hash_bytes[4],
-            hash_bytes[5],
-            hash_bytes[6],
-            hash_bytes[7],
-        ]);
-
-        hash_prefix < self.difficulty
+        // Compute target from compact bits (Bitcoin/Zcash style)
+        let target = compact_to_target(self.bits);
+        let hash_be = self.hash.0.as_bytes().clone();
+        // Compare 256-bit values as big-endian byte arrays
+        cmp256_be(hash_be.as_ref(), &target)
     }
 }
 
@@ -614,7 +652,7 @@ impl HeaderSyncManager {
                             BlobKind::Checkpoint => {
                                 if let Ok(bytes) = network_for_anns.fetch_blob_from_ticket(&ticket).await {
                                     if let Ok(cp) = bincode::deserialize::<Checkpoint>(&bytes) {
-                                        if cp.verify(1).unwrap_or(false) {
+                                        if cp.verify_with_trust(&SecurityConfig::default()).unwrap_or(false) {
                                             // Adopt checkpoint if ahead
                                             let mut chain = chain_for_anns.write().await;
                                             if cp.height > chain.tip.unwrap_or(0) {
@@ -657,8 +695,8 @@ impl HeaderSyncManager {
                     if !resp.status().is_success() { continue; }
                     let bytes = resp.bytes().await?;
                     if let Ok(cp) = bincode::deserialize::<Checkpoint>(&bytes) {
-                        // Verify signatures and NiPoPoW proof
-                        if cp.verify(1)? { // configurable threshold later
+                        // Verify signatures and NiPoPoW proof with configured trust
+                        if cp.verify_with_trust(&self.config.security_config)? {
                             if let Some(cur) = &best_cp {
                                 if cp.height > cur.height { best_cp = Some(cp); }
                             } else { best_cp = Some(cp); }
@@ -775,7 +813,7 @@ impl HeaderSyncManager {
             return Ok(chain);
         }
 
-        // Create genesis header
+        // Create genesis header (Zcash-like nBits)
         let genesis_header = BlockHeader::new(
             0,
             Hash::from([0u8; 32]),       // Genesis has no previous
@@ -785,7 +823,7 @@ impl HeaderSyncManager {
                 .unwrap()
                 .as_secs(),
             0,
-            0x1fff_ffff_ffff_ffff_u64, // Genesis difficulty
+            0x1d00ffff,
         );
 
         Ok(HeaderChain::new(genesis_header))
@@ -851,28 +889,32 @@ impl HeaderSyncManager {
         // 3. Use NiPoPoW proofs for efficient verification
         // 4. Update chain state
 
-        // Request the next small batch and apply it.
-        let batch_size = config.sync_config.max_batch_size.min(16);
-        let headers = {
-            // Use recent announcements via network to discover tickets
-            let mut out = Vec::new();
+        // Request the next small batch via header request/response protocol, falling back to announcements
+        let batch_size = config.sync_config.max_batch_size.min(32) as u32;
+        let mut headers: Vec<BlockHeader> = Vec::new();
+        // Try request/response from any peer first
+        if let Ok(raw_headers) = network.request_headers_from_any_peer_by_height(current_height + 1, batch_size).await {
+            for raw in raw_headers {
+                if let Some(h) = Self::decode_header_fallback(&raw) { headers.push(h); }
+            }
+        }
+        // If empty, fall back to announcements-as-hints
+        if headers.is_empty() {
             let anns = network.get_recent_announcements();
-            // Filter for Header kind and higher than current height
             let mut tickets: Vec<(u64, String)> = anns
                 .into_iter()
                 .filter(|(kind, _cid, height, _size, _ticket)| *kind == BlobKind::Header && *height > current_height)
                 .map(|(_k, _cid, height, _size, ticket)| (height, ticket))
                 .collect();
             tickets.sort_by_key(|(h, _)| *h);
-            for (_h, ticket) in tickets.into_iter().take(batch_size) {
+            for (_h, ticket) in tickets.into_iter().take(batch_size as usize) {
                 if let Ok(bytes) = network.fetch_blob_from_ticket(&ticket).await {
-                    if let Ok(header) = bincode::deserialize::<BlockHeader>(&bytes) {
-                        out.push(header);
+                    if let Some(header) = Self::decode_header_fallback(&bytes) {
+                        headers.push(header);
                     }
                 }
             }
-            out
-        };
+        }
 
         if !headers.is_empty() {
             let mut chain_guard = chain.write().await;
@@ -908,6 +950,45 @@ impl HeaderSyncManager {
             "Header sync cycle completed at height {}",
             chain.read().await.tip.unwrap_or(current_height)
         );
+    }
+
+    /// Decode header from either our bincode representation or raw Zcash header bytes
+    fn decode_header_fallback(bytes: &[u8]) -> Option<BlockHeader> {
+        // Try bincode first
+        if let Ok(h) = bincode::deserialize::<BlockHeader>(bytes) {
+            return Some(h);
+        }
+        // Try Zcash raw header: 4(version) + 32(prev) + 32(merkle) + 32(reserved) + 32(hashLightClientRoot?) + 32(finalSaplingRoot?) + 4(time) + 4(bits) + 4(nonce) + var equihash solution
+        // For interoperability, accept at least (legacy) 140-byte header prefix and treat solution as the rest.
+        if bytes.len() >= 140 {
+            // This is a placeholder minimal parse, not full Zebra header; we treat prev hash and time/bits/nonce
+            let prev = {
+                let mut arr = [0u8; 32];
+                // Zcash header prevhash is little-endian in serialization; reverse to big-endian for display-level comparisons if needed
+                arr.copy_from_slice(&bytes[4..36]);
+                blake3::Hash::from(arr)
+            };
+            let time_bytes = &bytes[4 + 32 + 32 + 32 + 32 + 32..4 + 32 + 32 + 32 + 32 + 32 + 4];
+            let bits_bytes = &bytes[4 + 32 + 32 + 32 + 32 + 32 + 4..4 + 32 + 32 + 32 + 32 + 32 + 8];
+            let nonce_bytes = &bytes[4 + 32 + 32 + 32 + 32 + 32 + 8..4 + 32 + 32 + 32 + 32 + 32 + 12];
+            let timestamp = u32::from_le_bytes(time_bytes.try_into().ok()?) as u64;
+            let bits = u32::from_le_bytes(bits_bytes.try_into().ok()?);
+            let nonce = u32::from_le_bytes(nonce_bytes.try_into().ok()?) as u64;
+            let mut header = BlockHeader {
+                height: 0, // unknown from raw header alone
+                previous_hash: prev.into(),
+                hash: SerializableHash(blake3::hash(bytes)),
+                mmr_root: None,
+                timestamp,
+                nonce,
+                bits,
+                solution: bytes[140..].to_vec(),
+            };
+            // Honor difficulty rules for our chain representation
+            header.hash = SerializableHash(header.compute_hash());
+            return Some(header);
+        }
+        None
     }
 
     /// Attempt to apply buffered headers in order from current tip+1 upward
@@ -982,7 +1063,7 @@ mod tests {
             Some(Hash::from([1u8; 32])),
             1234567890,
             0,
-            0x1fff_ffff_ffff_ffff_u64,
+            0x1d00ffff,
         );
 
         assert_eq!(header.height, 0);
@@ -997,7 +1078,7 @@ mod tests {
             Some(Hash::from([1u8; 32])),
             1234567890,
             0,
-            0x1fff_ffff_ffff_ffff_u64,
+            0x1d00ffff,
         );
 
         let chain = HeaderChain::new(genesis.clone());
@@ -1013,7 +1094,7 @@ mod tests {
             Some(Hash::from([1u8; 32])),
             1234567890,
             0,
-            0x1fff_ffff_ffff_ffff_u64,
+            0x1d00ffff,
         ));
 
         let header1 = BlockHeader::new(
@@ -1022,7 +1103,7 @@ mod tests {
             Some(Hash::from([2u8; 32])),
             1234567891,
             0,
-            0x1fff_ffff_ffff_ffff_u64,
+            0x1d00ffff,
         );
 
         assert!(chain.add_header(header1).is_ok());
@@ -1037,7 +1118,7 @@ mod tests {
             Some(Hash::from([1u8; 32])),
             1234567890,
             0,
-            0x1fff_ffff_ffff_ffff_u64,
+            0x1d00ffff,
         ));
 
         let proof = chain.generate_nipopow_proof(0, 0).unwrap();

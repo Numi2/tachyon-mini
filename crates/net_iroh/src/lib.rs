@@ -85,6 +85,10 @@ pub enum ControlMessage {
     Subscribe { kinds: Vec<BlobKind> },
     /// Unsubscribe request
     Unsubscribe { kinds: Vec<BlobKind> },
+    /// Request headers by consecutive height range
+    GetHeadersByHeight { start: u64, count: u32 },
+    /// Response with headers for a requested height range
+    HeadersByHeight { start: u64, headers: Vec<Vec<u8>> },
 }
 
 /// Tachyon blob store wrapper around iroh-blobs
@@ -259,10 +263,14 @@ impl TachyonNetwork {
         let peers: Arc<RwLock<HashMap<NodeId, Connection>>> = Arc::new(RwLock::new(HashMap::new()));
         let recent_announcements: Arc<RwLock<Vec<(BlobKind, Cid, u64, usize, String)>>> = Arc::new(RwLock::new(Vec::new()));
 
+        // Published blobs store for answering header requests
+        let published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>> = Arc::new(RwLock::new(Vec::new()));
+
         // Control protocol handler registered with router
         let control_proto = ControlProtocol {
             peers: peers.clone(),
             control_tx: control_tx.clone(),
+            published: published.clone(),
         };
 
         // Register control protocol and iroh-blobs provider for remote blob serving
@@ -320,7 +328,7 @@ impl TachyonNetwork {
             peers,
             _tasks: vec![control_task, addr_task],
             router,
-            published: Arc::new(RwLock::new(Vec::new())),
+            published,
             recent_announcements,
         })
     }
@@ -389,6 +397,59 @@ impl TachyonNetwork {
 
         info!("Published blob with ticket, CID {}", cid);
         Ok((cid, ticket))
+    }
+
+    /// Return the currently connected peer IDs
+    pub fn peers_connected(&self) -> Vec<NodeId> {
+        self.peers.read().unwrap().keys().cloned().collect()
+    }
+
+    /// Request headers by height range from a specific peer and wait for the response
+    pub async fn request_headers_from_peer_by_height(
+        &self,
+        peer_id: NodeId,
+        start: u64,
+        count: u32,
+    ) -> Result<Vec<Vec<u8>>> {
+        let peers = self.peers.read().unwrap();
+        let conn = peers
+            .get(&peer_id)
+            .ok_or_else(|| anyhow!("not connected to requested peer"))?
+            .clone();
+        drop(peers);
+
+        let (mut send, recv) = conn.open_bi().await?;
+        let req = ControlMessage::GetHeadersByHeight { start, count };
+        let encoded = bincode::serialize(&req).map_err(|e| anyhow!(e))?;
+        write_framed(&mut send, &encoded).await?;
+        // Wait for a single response on this bi-stream
+        let buf = read_framed(recv).await?;
+        let resp: ControlMessage = bincode::deserialize(&buf).map_err(|e| anyhow!(e))?;
+        match resp {
+            ControlMessage::HeadersByHeight { start: _s, headers } => Ok(headers),
+            other => Err(anyhow!(format!("unexpected response: {:?}", other))),
+        }
+    }
+
+    /// Request headers by height range from any connected peer
+    pub async fn request_headers_from_any_peer_by_height(
+        &self,
+        start: u64,
+        count: u32,
+    ) -> Result<Vec<Vec<u8>>> {
+        let peers: Vec<NodeId> = self.peers_connected();
+        if peers.is_empty() {
+            return Err(anyhow!("no connected peers"));
+        }
+        // Try peers in order until one responds successfully
+        for pid in peers {
+            if let Ok(headers) = self.request_headers_from_peer_by_height(pid, start, count).await {
+                if !headers.is_empty() {
+                    return Ok(headers);
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// Subscribe to blob announcements
@@ -712,6 +773,7 @@ async fn read_framed(mut recv: RecvStream) -> Result<Vec<u8>> {
 struct ControlProtocol {
     peers: Arc<RwLock<HashMap<NodeId, Connection>>>,
     control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
+    published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>>,
 }
 
 impl ProtocolHandler for ControlProtocol {
@@ -721,6 +783,7 @@ impl ProtocolHandler for ControlProtocol {
     ) -> impl std::future::Future<Output = std::result::Result<(), AcceptError>> + Send {
         let peers = self.peers.clone();
         let tx = self.control_tx.clone();
+        let published = self.published.clone();
         Box::pin(async move {
             let node_id = match conn.remote_node_id() {
                 Ok(id) => id,
@@ -730,13 +793,38 @@ impl ProtocolHandler for ControlProtocol {
             // handle incoming streams
             loop {
                 match conn.accept_bi().await {
-                    Ok((_send, recv)) => {
+                    Ok((mut send, recv)) => {
                         let res = read_framed(recv).await;
                         match res.and_then(|buf| {
                             bincode::deserialize::<ControlMessage>(&buf).map_err(|e| anyhow!(e))
                         }) {
                             Ok(msg) => {
-                                let _ = tx.send((node_id, msg));
+                                match msg {
+                                    ControlMessage::GetHeadersByHeight { start, count } => {
+                                        // Gather locally published Header blobs by height
+                                        let mut headers: Vec<(u64, Vec<u8>)> = published
+                                            .read()
+                                            .unwrap()
+                                            .iter()
+                                            .filter(|(kind, _bytes, h)| *kind == BlobKind::Header && *h >= start)
+                                            .map(|(_k, bytes, h)| (*h, bytes.clone()))
+                                            .collect();
+                                        headers.sort_by_key(|(h, _)| *h);
+                                        let headers_bytes: Vec<Vec<u8>> = headers
+                                            .into_iter()
+                                            .take(count as usize)
+                                            .map(|(_h, b)| b)
+                                            .collect();
+                                        let resp = ControlMessage::HeadersByHeight { start, headers: headers_bytes };
+                                        if let Ok(encoded) = bincode::serialize(&resp) {
+                                            let _ = write_framed(&mut send, &encoded).await;
+                                        }
+                                    }
+                                    other => {
+                                        // Forward other control messages to the control task
+                                        let _ = tx.send((node_id, other));
+                                    }
+                                }
                             }
                             Err(_err) => {
                                 // Failed to decode control message; drop the stream

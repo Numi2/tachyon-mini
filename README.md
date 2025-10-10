@@ -49,6 +49,79 @@ Flows
 - **Validation**: node verifies PCD, checks nullifiers against a recent window, prunes historical state.
 - **OOB payment**: Kyber encapsulation → AEAD encrypt note meta → recipient decapsulates → wallet ingests note.
 
+Crypto:
+Searching the codebase for signature schemes and crypto libraries.
+
+
+[3 tools called]
+
+Checking `crates/pq_crypto/src/lib.rs` for signature schemes.
+
+
+[2 tools called]
+
+Checking for other signature schemes in networking and dependencies.
+
+
+[2 tools called]
+
+Checking Cargo.lock for signature-related dependencies.
+
+
+[1 tool called]
+
+## Signature Schemes Used in Tachyon Mini
+
+### 1. **Dilithium3 (Post-Quantum Digital Signatures)**
+- **Library**: `pqcrypto-dilithium = "0.5"`
+- **Location**: `crates/pq_crypto/src/lib.rs`
+- **Usage**: Suite B signing API for checkpoint verification
+- **Features**:
+  - Dilithium3 key generation (`SuiteB::generate_keypair()`)
+  - Prehashed signing with BLAKE3 (`SuiteB::sign_prehash()`)
+  - Signature verification (`SuiteB::verify_prehash()`)
+  - Domain-separated hashing for checkpoint signing
+
+### 2. **Ed25519 (via ed25519-dalek)**
+- **Library**: `ed25519-dalek` (transitive dependency)
+- **Usage**: Networking layer (likely via iroh/libp2p)
+- **Features**: Ed25519 signatures for peer identity and authentication
+
+### 3. **Ring-based Cryptography**
+- **Library**: `ring = "0.17.14"` (transitive dependency)
+- **Usage**: TLS/SSL via rustls
+- **Features**: ECDSA signatures for TLS certificates
+
+### 4. **Pairing-based Cryptography**
+- **Library**: `pairing = "0.23.0"` (transitive dependency)
+- **Usage**: Zero-knowledge proofs (halo2)
+- **Features**: BLS signatures and pairing operations
+
+## Additional Cryptographic Components
+
+### **Kyber768 (Post-Quantum KEM)**
+- **Library**: `pqcrypto-kyber = "0.8"`
+- **Usage**: Key encapsulation for out-of-band payments
+- **Features**: Kyber768 key generation, encapsulation, and decapsulation
+
+### **AES-256-GCM**
+- **Library**: `aes-gcm = "0.10"`
+- **Usage**: Symmetric encryption for out-of-band payments
+- **Features**: Authenticated encryption with associated data
+
+### **BLAKE3**
+- **Library**: `blake3 = "1.5"`
+- **Usage**: Hashing, nullifier derivation, and signature prehashing
+- **Features**: Fast cryptographic hashing
+
+## Summary
+
+The project uses:
+1. **Primary signature scheme**: Dilithium3 (post-quantum)
+2. **Networking signatures**: Ed25519 (via iroh/libp2p)
+3. **TLS signatures**: ECDSA (via rustls/ring)
+4. **ZK proof signatures**: BLS/pairing-based (via halo2)
+
 
 CLI
 ---

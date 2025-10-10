@@ -10,6 +10,7 @@ use wallet::{TachyonWallet, WalletConfig};
 use bytes::Bytes;
 use net_iroh::{BlobKind, TachyonNetwork};
 use node_ext::{NodeConfig, NetworkConfig};
+use header_sync::{HeaderSyncConfig as HsConfig, HeaderSyncManager};
 
 /// Tachyon CLI application
 #[derive(Parser)]
@@ -41,6 +42,11 @@ pub enum Commands {
     Network {
         #[command(subcommand)]
         network_command: NetworkCommands,
+    },
+    /// Header sync operations
+    HeaderSync {
+        #[command(subcommand)]
+        hs_command: HeaderSyncCommands,
     },
 }
 
@@ -186,6 +192,35 @@ pub enum NetworkCommands {
     },
 }
 
+/// Header sync commands
+#[derive(Subcommand)]
+pub enum HeaderSyncCommands {
+    /// Bootstrap from trusted checkpoints (Zcash-tuned)
+    Bootstrap {
+        /// Data directory for header sync
+        #[arg(short, long, default_value = "./header_data")]
+        data_dir: String,
+        /// Comma-separated HTTPS checkpoint servers
+        #[arg(short, long)]
+        checkpoint_servers: Option<String>,
+        /// Minimum checkpoint signatures required
+        #[arg(long, default_value_t = 2)]
+        min_sigs: usize,
+        /// Trusted checkpoint public keys (hex, comma-separated)
+        #[arg(long)]
+        trusted_pks: Option<String>,
+    },
+    /// Sync headers to latest announcements
+    SyncOnce {
+        /// Data directory for header sync
+        #[arg(short, long, default_value = "./header_data")]
+        data_dir: String,
+        /// Max batch size
+        #[arg(long, default_value_t = 16)]
+        max_batch_size: usize,
+    },
+}
+
 /// Run the CLI application
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -207,6 +242,7 @@ pub async fn run() -> Result<()> {
             execute_wallet_command(wallet_command, &cli.data_dir).await
         }
         Commands::Network { network_command } => execute_network_command(network_command).await,
+        Commands::HeaderSync { hs_command } => execute_header_sync_command(hs_command).await,
     }
 }
 
@@ -529,6 +565,43 @@ async fn execute_network_command(command: NetworkCommands) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Execute header sync commands
+async fn execute_header_sync_command(command: HeaderSyncCommands) -> Result<()> {
+    match command {
+        HeaderSyncCommands::Bootstrap { data_dir, checkpoint_servers, min_sigs, trusted_pks } => {
+            let mut cfg = HsConfig::default();
+            cfg.network_config.data_dir = data_dir.clone();
+            if let Some(list) = checkpoint_servers.as_deref() {
+                cfg.network_config.checkpoint_servers = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
+            cfg.security_config.min_checkpoint_signatures = min_sigs;
+            if let Some(pks) = trusted_pks.as_deref() {
+                let keys = pks.split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .filter_map(|hex_str| hex::decode(hex_str.trim_start_matches("0x")).ok())
+                    .collect();
+                cfg.security_config.trusted_checkpoint_keys = keys;
+            }
+            let mgr = HeaderSyncManager::new(cfg).await?;
+            mgr.bootstrap_from_checkpoints().await?;
+            let status = mgr.get_sync_status().await;
+            println!("Bootstrapped to height {}", status.current_height);
+        }
+        HeaderSyncCommands::SyncOnce { data_dir, max_batch_size } => {
+            let mut cfg = HsConfig::default();
+            cfg.network_config.data_dir = data_dir.clone();
+            cfg.sync_config.max_batch_size = max_batch_size;
+            let mgr = HeaderSyncManager::new(cfg).await?;
+            // Use observed latest height from announcements
+            let latest = mgr.get_sync_status().await.tip_height;
+            mgr.sync_to_height(latest).await?;
+            let status = mgr.get_sync_status().await;
+            println!("Synced to height {} (target {:?})", status.current_height, status.target_height);
+        }
+    }
     Ok(())
 }
 

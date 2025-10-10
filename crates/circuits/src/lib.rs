@@ -41,13 +41,35 @@ fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr,
         .hash([d1, d2, Fr::zero()])
 }
 
+/// Compute the transition Poseidon digest and return canonical 32-byte encoding
+pub fn compute_transition_digest_bytes(
+    prev_state: &[u8; 32],
+    mmr_root: &[u8; 32],
+    nullifier_root: &[u8; 32],
+    anchor_height: u64,
+) -> [u8; 32] {
+    let to_fr = |bytes: &[u8; 32]| -> Fr {
+        // Accept any 32 bytes by reducing mod p to avoid panics with non-canonical inputs
+        // This must match encoding used elsewhere when interpreting 32-byte digests as field elements
+        Fr::from_le_bytes_mod_order(bytes)
+    };
+    let prev_fr = to_fr(prev_state);
+    let mmr_fr = to_fr(mmr_root);
+    let nul_fr = to_fr(nullifier_root);
+    let anchor_fr = Fr::from(anchor_height);
+    let digest = compute_transition_poseidon(prev_fr, mmr_fr, nul_fr, anchor_fr);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.to_repr().as_ref());
+    out
+}
+
 /// PCD transition circuit configuration
 #[derive(Clone, Debug)]
 pub struct PcdTransitionConfig {
     /// Advice columns for witness data
     pub advice: [Column<Advice>; 6],
-    /// Instance columns for public inputs/outputs
-    pub instance: [Column<Instance>; 3],
+    /// Instance columns for public inputs/outputs (prev, new, mmr, nul, anchor)
+    pub instance: [Column<Instance>; 5],
     /// Fixed columns for constants
     pub fixed: [Column<Fixed>; 2],
     /// Selector for the transition logic
@@ -121,6 +143,8 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             meta.instance_column(),
             meta.instance_column(),
             meta.instance_column(),
+            meta.instance_column(),
+            meta.instance_column(),
         ];
 
         let fixed = [meta.fixed_column(), meta.fixed_column()];
@@ -148,19 +172,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             rc_b,
         );
 
-        // MMR root verification constraints (public exposure wiring)
-        meta.create_gate("mmr_root_verification", |meta| {
-            let s = meta.query_selector(selector);
-
-            // MMR root from instance column
-            let mmr_root_instance = meta.query_instance(instance[2], Rotation::cur());
-
-            // MMR root from advice column (computed)
-            let mmr_root_advice = meta.query_advice(advice[2], Rotation::cur());
-
-            // Ensure they match
-            vec![s * (mmr_root_instance - mmr_root_advice)]
-        });
+        // No extra gates required for public inputs beyond instance exposure.
 
         PcdTransitionConfig {
             advice,
@@ -179,6 +191,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         // Assign all witness values in one region where the selector applies
         let (
             prev_state_cell,
+            new_state_cell,
             mmr_root_cell,
             _nullifier_root_cell,
             _anchor_height_cell,
@@ -192,6 +205,13 @@ impl Circuit<Fr> for PcdTransitionCircuit {
                     config.advice[0],
                     0,
                     || self.prev_state,
+                )?;
+
+                let newc = region.assign_advice(
+                    || "new state commitment (witness)",
+                    config.advice[1],
+                    0,
+                    || self.new_state,
                 )?;
 
                 let mmr =
@@ -211,7 +231,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
                     || self.anchor_height,
                 )?;
 
-                Ok((prev, mmr, nul, anch))
+                Ok((prev, newc, mmr, nul, anch))
             },
         )?;
 
@@ -251,10 +271,15 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             [d1, d2, zero],
         )?;
 
-        // Expose public inputs (prev_state, new_state, mmr_root)
+        // Enforce new_state witness equals computed digest
+        layouter.constrain_equal(digest.cell(), new_state_cell.cell())?;
+
+        // Expose public inputs (prev_state, new_state, mmr_root, nullifier_root, anchor_height)
         layouter.constrain_instance(prev_state_cell.cell(), config.instance[0], 0)?;
-        layouter.constrain_instance(digest.cell(), config.instance[1], 0)?;
+        layouter.constrain_instance(new_state_cell.cell(), config.instance[1], 0)?;
         layouter.constrain_instance(mmr_root_cell.cell(), config.instance[2], 0)?;
+        layouter.constrain_instance(_nullifier_root_cell.cell(), config.instance[3], 0)?;
+        layouter.constrain_instance(_anchor_height_cell.cell(), config.instance[4], 0)?;
 
         Ok(())
     }
@@ -479,36 +504,43 @@ impl PcdCore {
     pub fn prove_transition(
         &self,
         prev_state: &[u8; 32],
-        _new_state: &[u8; 32],
+        new_state: &[u8; 32],
         mmr_root: &[u8; 32],
         nullifier_root: &[u8; 32],
         anchor_height: u64,
     ) -> Result<Vec<u8>> {
-        // Convert inputs into field elements
-        let to_fr =
-            |bytes: &[u8; 32]| -> Fr { Fr::from_repr((*bytes).into()).unwrap_or_else(Fr::zero) };
+        // Convert inputs into field elements (mod-order mapping for 32-byte digests)
+        let to_fr = |bytes: &[u8; 32]| -> Fr { Fr::from_le_bytes_mod_order(bytes) };
 
         let prev_fr = to_fr(prev_state);
         let mmr_fr = to_fr(mmr_root);
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
+        let provided_new_fr = to_fr(new_state);
 
-        // Compute the expected Poseidon digest that the circuit will expose as `new_state`
-        let new_fr = compute_transition_poseidon(prev_fr, mmr_fr, nul_fr, anchor_fr);
+        // Compute the expected Poseidon digest that the circuit must expose as `new_state`
+        let expected_new_fr = compute_transition_poseidon(prev_fr, mmr_fr, nul_fr, anchor_fr);
+
+        // Optional consistency check: provided new_state must match expected
+        if provided_new_fr != expected_new_fr {
+            return Err(anyhow::anyhow!("new_state does not match Poseidon transition digest"));
+        }
 
         let circuit = PcdTransitionCircuit {
             prev_state: Value::known(prev_fr),
-            new_state: Value::known(new_fr),
+            new_state: Value::known(provided_new_fr),
             mmr_root: Value::known(mmr_fr),
             nullifier_root: Value::known(nul_fr),
             anchor_height: Value::known(anchor_fr),
             delta_commitments: vec![],
         };
 
-        // Prepare instance columns: prev_state, new_state, mmr_root (row 0 only)
+        // Prepare instance columns (prev, new, mmr, nul, anchor)
         let inst_prev = vec![prev_fr];
-        let inst_new = vec![new_fr];
+        let inst_new = vec![provided_new_fr];
         let inst_mmr = vec![mmr_fr];
+        let inst_nul = vec![nul_fr];
+        let inst_anchor = vec![anchor_fr];
 
         // Build proof
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
@@ -516,7 +548,7 @@ impl PcdCore {
             &self.params,
             &self.pk,
             &[circuit],
-            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..]]],
+            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..], &inst_nul[..], &inst_anchor[..]]],
             OsRng,
             &mut transcript,
         )?;
@@ -528,7 +560,7 @@ impl PcdCore {
         &self,
         proof: &[u8],
         prev_state: &[u8; 32],
-        _new_state: &[u8; 32],
+        new_state: &[u8; 32],
         mmr_root: &[u8; 32],
         nullifier_root: &[u8; 32],
         anchor_height: u64,
@@ -537,20 +569,20 @@ impl PcdCore {
             return Ok(false);
         }
 
-        let to_fr =
-            |bytes: &[u8; 32]| -> Fr { Fr::from_repr((*bytes).into()).unwrap_or_else(Fr::zero) };
+        let to_fr = |bytes: &[u8; 32]| -> Fr { Fr::from_le_bytes_mod_order(bytes) };
 
         let prev_fr = to_fr(prev_state);
+        let new_fr = to_fr(new_state);
         let mmr_fr = to_fr(mmr_root);
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
 
-        // Prepare instance columns: prev_state, new_state, mmr_root (row 0 only)
-        // Compute the expected Poseidon digest for `new_state` deterministically
-        let new_fr = compute_transition_poseidon(prev_fr, mmr_fr, nul_fr, anchor_fr);
+        // Prepare instance columns: prev_state, new_state, mmr_root, nullifier_root, anchor (row 0 only)
         let inst_prev = vec![prev_fr];
         let inst_new = vec![new_fr];
         let inst_mmr = vec![mmr_fr];
+        let inst_nul = vec![nul_fr];
+        let inst_anchor = vec![anchor_fr];
 
         let mut transcript =
             Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
@@ -560,7 +592,7 @@ impl PcdCore {
             &self.params,
             &self.vk,
             strategy,
-            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..]]],
+            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..], &inst_nul[..], &inst_anchor[..]]],
             &mut transcript,
         )
         .is_ok();
