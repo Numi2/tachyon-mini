@@ -386,9 +386,8 @@ impl TachyonNode {
         _state: &Arc<RwLock<NodeState>>,
         _network: &TachyonNetwork,
     ) {
-        // This would process transactions from the mempool
-        // For now, just log that we're running
-        debug!("Processing pending transactions");
+        // TODO: fetch from mempool/network; basic heartbeat for now
+        debug!("Processing pending transactions (heartbeat)");
     }
 
     /// Run pruning to maintain minimal state
@@ -413,11 +412,22 @@ impl TachyonNode {
         info!("Node pruning completed");
     }
 
-    /// Verify spend proof (placeholder for Orchard-like verification)
-    async fn verify_spend_proof(&self, _tx: &Transaction) -> Result<bool> {
-        // In a real implementation, this would verify the spend proof
-        // For now, just return true
-        Ok(true)
+    /// Verify spend proof (basic binding + length checks)
+    async fn verify_spend_proof(&self, tx: &Transaction) -> Result<bool> {
+        // Require minimum proof length
+        if tx.spend_proof.len() < 16 { return Ok(false); }
+
+        // Bind spend proof to anchor, nullifiers and commitments deterministically
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"spend_proof_binding:v1");
+        hasher.update(&tx.anchor_height.to_le_bytes());
+        for n in &tx.nullifiers { hasher.update(n); }
+        for c in &tx.commitments { hasher.update(c); }
+        let expected = hasher.finalize();
+
+        // Proof must equal binding preimage (not just hash equality);
+        // we encode the binding digest directly as the proof in this demo.
+        Ok(tx.spend_proof.as_slice() == expected.as_bytes())
     }
 
     /// Compute block hash

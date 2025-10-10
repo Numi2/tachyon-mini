@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
+// Hardcoded configuration for simplicity and consistency
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 // use tokio::io::AsyncReadExt; // not needed; RecvStream provides read_exact
@@ -28,11 +29,21 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{debug, info};
+use iroh::SecretKey;
 
 // Integrity verification is provided by iroh-blobs via BLAKE3-verified streams.
 
 /// Protocol identifiers for ALPN
 pub const CONTROL_ALPN: &[u8] = b"tachyon/ctrl";
+/// Hardcoded relay URL used in tickets and dialing
+const DEFAULT_RELAY_URL: &str = "relay://localhost:4400";
+/// Hardcoded 32-byte secret key for stable NodeId (example only; replace in production)
+const SECRET_KEY_BYTES: [u8; 32] = [
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10,
+    0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98,
+    0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f, 0x01,
+];
 
 /// Blob content identifier (BLAKE3 hash)
 pub type Cid = Hash;
@@ -162,6 +173,10 @@ impl TachyonBlobStore {
     }
 }
 
+fn default_relay_url() -> iroh::RelayUrl {
+    DEFAULT_RELAY_URL.parse::<iroh::RelayUrl>().expect("invalid DEFAULT_RELAY_URL")
+}
+
 /// High-level network interface
 pub struct TachyonNetwork {
     /// Iroh endpoint
@@ -178,6 +193,10 @@ pub struct TachyonNetwork {
     _tasks: Vec<JoinHandle<()>>,
     /// Router handle for graceful shutdown
     router: Router,
+    /// Recently published blobs (kind, bytes, height) for local consumers
+    published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>>,
+    /// Recent announcements (kind, cid, height, size, ticket) from peers and self
+    recent_announcements: Arc<RwLock<Vec<(BlobKind, Cid, u64, usize, String)>>>,
 }
 
 /// Blob store trait for dependency injection
@@ -224,14 +243,10 @@ impl BlobStore for TachyonBlobStore {
 impl TachyonNetwork {
     /// Create a new TachyonNetwork instance
     pub async fn new(data_dir: &std::path::Path) -> Result<Self> {
-        // Create iroh endpoint; optionally enable discovery via env `TACHYON_ENABLE_DISCOVERY`
+        // Create iroh endpoint with hardcoded identity and always-on discovery
         let mut builder = Endpoint::builder();
-        let enable_discovery = std::env::var("TACHYON_ENABLE_DISCOVERY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if enable_discovery {
-            builder = builder.discovery_n0();
-        }
+        let secret_key = SecretKey::from_bytes(&SECRET_KEY_BYTES);
+        builder = builder.secret_key(secret_key).discovery_n0();
         let endpoint = builder.bind().await?;
 
         // Create convenience local blob store for legacy callers/benches
@@ -242,6 +257,7 @@ impl TachyonNetwork {
         let (announcements, _) = broadcast::channel(1000);
         let announcements_tx = announcements.clone();
         let peers: Arc<RwLock<HashMap<NodeId, Connection>>> = Arc::new(RwLock::new(HashMap::new()));
+        let recent_announcements: Arc<RwLock<Vec<(BlobKind, Cid, u64, usize, String)>>> = Arc::new(RwLock::new(Vec::new()));
 
         // Control protocol handler registered with router
         let control_proto = ControlProtocol {
@@ -261,11 +277,30 @@ impl TachyonNetwork {
 
         let router = router_builder.spawn();
 
+        // Watch node address updates for observability
+        let addr_task = {
+            let ep = endpoint.clone();
+            tokio::spawn(async move {
+                let addr = ep.node_addr().initialized().await;
+                info!("iroh node address initialized: {:?}", addr);
+            })
+        };
+
         // Handle incoming control messages
         let endpoint_clone = endpoint.clone();
         let peers_clone = peers.clone();
+        let recent_announcements_clone = recent_announcements.clone();
         let control_task = tokio::spawn(async move {
             while let Some((node_id, message)) = control_rx.recv().await {
+                // Record announce messages for later consumers
+                if let ControlMessage::Announce { kind, cid, height, size, ticket } = &message {
+                    let mut guard = recent_announcements_clone.write().unwrap();
+                    guard.push((kind.clone(), *cid, *height, *size, ticket.clone()));
+                    if guard.len() > 1000 {
+                        let drain_len = guard.len() - 1000;
+                        guard.drain(0..drain_len);
+                    }
+                }
                 Self::handle_control_message(
                     node_id,
                     message,
@@ -283,8 +318,10 @@ impl TachyonNetwork {
             _control_tx: control_tx,
             announcements,
             peers,
-            _tasks: vec![control_task],
+            _tasks: vec![control_task, addr_task],
             router,
+            published: Arc::new(RwLock::new(Vec::new())),
+            recent_announcements,
         })
     }
 
@@ -313,7 +350,8 @@ impl TachyonNetwork {
         // Prefer a network ticket so remote clients can fetch via iroh-blobs
         // Fall back to local ticket format if node address is not initialized
         let ticket = {
-            let node_addr = self.endpoint.node_addr().initialized().await;
+            let mut node_addr = self.endpoint.node_addr().initialized().await;
+            node_addr = node_addr.with_relay_url(default_relay_url());
             let blob_ticket = BlobTicket::new(node_addr, cid, BlobFormat::Raw);
             blob_ticket.to_string()
         };
@@ -331,7 +369,23 @@ impl TachyonNetwork {
         // Notify local subscribers
         let _ = self
             .announcements
-            .send((kind, cid, height, data.len(), ticket.clone()));
+            .send((kind.clone(), cid, height, data.len(), ticket.clone()));
+
+        // Record locally for components that prefer direct access
+        self.published
+            .write()
+            .unwrap()
+            .push((kind.clone(), data.to_vec(), height));
+
+        // Record in recent announcements as well
+        {
+            let mut guard = self.recent_announcements.write().unwrap();
+            guard.push((kind.clone(), cid, height, data.len(), ticket.clone()));
+            if guard.len() > 1000 {
+                let drain_len = guard.len() - 1000;
+                guard.drain(0..drain_len);
+            }
+        }
 
         info!("Published blob with ticket, CID {}", cid);
         Ok((cid, ticket))
@@ -342,6 +396,16 @@ impl TachyonNetwork {
         &self,
     ) -> broadcast::Receiver<(BlobKind, Cid, u64, usize, String)> {
         self.announcements.subscribe()
+    }
+
+    /// Return a snapshot of recently published blobs (kind, bytes, height)
+    pub async fn get_published(&self) -> Vec<(BlobKind, Vec<u8>, u64)> {
+        self.published.read().unwrap().clone()
+    }
+
+    /// Get a snapshot of recent announcements (kind, cid, height, size, ticket)
+    pub fn get_recent_announcements(&self) -> Vec<(BlobKind, Cid, u64, usize, String)> {
+        self.recent_announcements.read().unwrap().clone()
     }
 
     /// Fetch a blob by CID
@@ -561,7 +625,7 @@ impl TachyonNetwork {
         let node_addr = if let Some(addr) = peer_addr {
             iroh::NodeAddr::new(peer_id).with_relay_url(addr.clone())
         } else {
-            iroh::NodeAddr::new(peer_id)
+            iroh::NodeAddr::new(peer_id).with_relay_url(default_relay_url())
         };
 
         let conn = self.endpoint.connect(node_addr, CONTROL_ALPN).await?;

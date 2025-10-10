@@ -39,7 +39,7 @@ cli      ── front-end for wallet + network ops
 - Exposes an `MmrAccumulator` used by both the wallet’s `pcd_core` state machine and the `oss_service` when constructing commitment updates.
 
 ### `accum_set`
-- Provides a sparse set accumulator backed by `BTreeSet<[u8; 32]>` with batchable deltas (`SetDelta`) and placeholder membership witnesses.
+- Provides a sparse set accumulator backed by `BTreeSet<[u8; 32]>` with batchable deltas (`SetDelta`) and Merkle-style membership witnesses over sorted elements. Witnesses expose an authentication path and verify against the accumulator root.
 - Used anywhere nullifier membership/non-membership needs to be tracked; `pcd_core` consumes deltas during state transitions, and `oss_service` produces blinded nullifier batches.
 
 ### `bench`
@@ -48,7 +48,7 @@ cli      ── front-end for wallet + network ops
 
 ### `circuits`
 - Halo2-based circuit for PCD transitions and recursion (`PcdTransitionCircuit`, `PcdRecursionCircuit`), plus helper logic for deterministic mixing/hash simulation.
-- `PcdCore` (in `pcd_core`) leans on this crate to produce mock proofs and to verify placeholder proofs in tests and during transitions.
+- Currently uses a MockProver-backed proving path; wiring to a real Halo2 prover is planned next.
 
 ### `cli`
 - User-facing command-line front end wrapping wallet actions (`tachyon wallet …`) and network node tasks (`tachyon network …`).

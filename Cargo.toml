@@ -62,8 +62,11 @@ tempfile = "3.0"
 # Async traits
 async-trait = "0.1"
 
-# PQ cryptography (placeholder)
+# PQ cryptography
 aes-gcm = "0.10"
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
+pqcrypto-dilithium = "0.5"
 fs2 = "0.4"
 
 # JSON serialization for reports

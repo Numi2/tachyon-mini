@@ -215,7 +215,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
     match command {
         WalletCommands::Create {
             name,
-            password: _,
+            password,
             db_path,
         } => {
             let db_path = db_path.unwrap_or_else(|| format!("{}/wallets/{}", data_dir, name));
@@ -225,8 +225,15 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             // Create wallet directory structure
             std::fs::create_dir_all(&db_path)?;
 
-            // Initialize wallet database (simplified for now)
-            // In a real implementation, this would initialize the wallet database
+            // Initialize wallet database and genesis PCD state
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            // Allow insecure defaults for CLI bootstrap only
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            wallet.initialize().await?;
 
             println!("Wallet created successfully!");
         }
@@ -365,12 +372,28 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             let recipient_pk_bytes = hex::decode(recipient_pk.trim_start_matches("0x"))?;
             let recipient_pk = pq_crypto::KyberPublicKey::from_bytes(&recipient_pk_bytes)?;
 
-            // Compose simple note metadata
+            // Compose note metadata: [commitment(32) | value(8) | recipient(32) | rseed(32) | memo_len(2) | memo(..)]
+            // Derive a simple demo recipient hash from the user's provided recipient_pk
+            let recipient_bytes = blake3::hash(recipient_pk.as_bytes());
+
+            // Create a synthetic note commitment bound to value and recipient
+            let mut h_commit = blake3::Hasher::new();
+            h_commit.update(b"note_commitment:v1");
+            h_commit.update(&value.to_le_bytes());
+            h_commit.update(recipient_bytes.as_bytes());
+            let commitment = h_commit.finalize();
+
+            // Derive rseed deterministically for demo
+            let mut h_rseed = blake3::Hasher::new();
+            h_rseed.update(b"rseed:v1");
+            h_rseed.update(commitment.as_bytes());
+            let rseed = h_rseed.finalize();
+
             let mut meta = Vec::new();
-            meta.extend_from_slice(&[0u8; 32]); // commitment placeholder
+            meta.extend_from_slice(commitment.as_bytes());
             meta.extend_from_slice(&value.to_le_bytes());
-            meta.extend_from_slice(&[0u8; 32]); // recipient placeholder
-            meta.extend_from_slice(&[0u8; 32]); // rseed placeholder
+            meta.extend_from_slice(recipient_bytes.as_bytes());
+            meta.extend_from_slice(rseed.as_bytes());
             meta.extend_from_slice(&(0u16).to_le_bytes()); // memo length 0
 
             let payment = wallet

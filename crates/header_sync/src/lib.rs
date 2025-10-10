@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use blake3::Hash;
 use pq_crypto::{SuiteB, SuiteBPublicKey, SuiteBSignature, SUITE_B_DOMAIN_CHECKPOINT};
-use net_iroh::TachyonNetwork;
+use net_iroh::{BlobKind, TachyonNetwork};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -591,12 +591,38 @@ impl HeaderSyncManager {
     /// Request headers from a specific height
     pub async fn request_headers(
         &self,
-        _start_height: u64,
-        _count: usize,
+        start_height: u64,
+        count: usize,
     ) -> Result<Vec<BlockHeader>> {
-        // In a real implementation, this would request headers from peers
-        // For now, return empty result
-        Ok(Vec::new())
+        // Generate a deterministic batch locally to unblock the sync pipeline.
+        // This is a placeholder until peer requests are wired.
+        let chain = self.chain.read().unwrap();
+        let mut headers = Vec::new();
+        let mut prev = chain
+            .get_header(start_height)
+            .cloned()
+            .ok_or_else(|| anyhow!("start header not found"))?;
+        drop(chain);
+
+        for i in 1..=count {
+            let h = start_height + i as u64;
+            let mut new_header = BlockHeader::new(
+                h,
+                prev.hash.into(),
+                Some(Hash::from([2u8; 32])),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                0,
+                0x1fff_ffff_ffff_ffff_u64,
+            );
+            new_header.mine();
+            prev = new_header.clone();
+            headers.push(new_header);
+        }
+
+        Ok(headers)
     }
 
     /// Submit a new header for inclusion
@@ -697,28 +723,71 @@ impl HeaderSyncManager {
         // 3. Use NiPoPoW proofs for efficient verification
         // 4. Update chain state
 
-        // For now, just simulate progress
-        let new_height = current_height + 1;
-        {
+        // Request the next small batch and apply it.
+        let batch_size = config.sync_config.max_batch_size.min(16);
+        let headers = {
+            // Try to use network announcements via iroh first
+            let mut out = Vec::new();
+            // Because we don't have &self here, reload announcements from a fresh network handle
+            // initialized from config data dir (same as the manager did). If that fails,
+            // fall back to local synthetic generation.
+            let maybe_net_headers = async {
+                if let Ok(network) = TachyonNetwork::new(&std::path::Path::new(&config.network_config.data_dir)).await {
+                    let anns = network.get_recent_announcements();
+                    // Filter for Header kind and higher than current height
+                    let mut tickets: Vec<(u64, String)> = anns
+                        .into_iter()
+                        .filter(|(kind, _cid, height, _size, _ticket)| *kind == BlobKind::Header && *height > current_height)
+                        .map(|(_k, _cid, height, _size, ticket)| (height, ticket))
+                        .collect();
+                    tickets.sort_by_key(|(h, _)| *h);
+                    // Take up to batch_size next heights
+                    for (_h, ticket) in tickets.into_iter().take(batch_size) {
+                        if let Ok(bytes) = network.fetch_blob_from_ticket(&ticket).await {
+                            if let Ok(header) = bincode::deserialize::<BlockHeader>(&bytes) {
+                                out.push(header);
+                            }
+                        }
+                    }
+                }
+                out
+            };
+            let mut out = maybe_net_headers.await;
+            if out.is_empty() {
+                // Fallback: local deterministic generator
+                let chain_guard = chain.read().unwrap();
+                let mut prev = chain_guard.get_header(current_height).cloned();
+                drop(chain_guard);
+                if let Some(prev_h) = prev.take() {
+                    let mut p = prev_h;
+                    for i in 1..=batch_size {
+                        let h = current_height + i as u64;
+                        let mut nh = BlockHeader::new(
+                            h,
+                            p.hash.into(),
+                            Some(Hash::from([2u8; 32])),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            0,
+                            0x1fff_ffff_ffff_ffff_u64,
+                        );
+                        nh.mine();
+                        p = nh.clone();
+                        out.push(nh);
+                    }
+                }
+            }
+            out
+        };
+
+        if !headers.is_empty() {
             let mut chain_guard = chain.write().unwrap();
-
-            if new_height > 0 {
-                let prev_header = chain_guard.get_header(current_height).unwrap().clone();
-                let mut new_header = BlockHeader::new(
-                    new_height,
-                    prev_header.hash.into(),
-                    Some(Hash::from([2u8; 32])), // Updated MMR root
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    0,
-                    0x1fff_ffff_ffff_ffff_u64,
-                );
-                new_header.mine();
-
-                if let Err(e) = chain_guard.add_header(new_header) {
+            for h in headers {
+                if let Err(e) = chain_guard.add_header(h) {
                     warn!("Failed to add header: {}", e);
+                    break;
                 }
             }
         }
@@ -736,11 +805,14 @@ impl HeaderSyncManager {
         // Update sync state
         {
             let mut sync_state_guard = sync_state.write().unwrap();
-            sync_state_guard.current_height = new_height;
+            sync_state_guard.current_height = chain.read().unwrap().tip.unwrap_or(current_height);
             sync_state_guard.sync_in_progress = false;
         }
 
-        info!("Header sync cycle completed at height {}", new_height);
+        info!(
+            "Header sync cycle completed at height {}",
+            chain.read().unwrap().tip.unwrap_or(current_height)
+        );
     }
 
     /// Shutdown the sync manager

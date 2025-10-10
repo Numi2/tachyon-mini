@@ -84,17 +84,23 @@ pub fn verify_pcd_transition(
     anchor_height: Fr,
     delta_commitments: &[Fr],
 ) -> bool {
-    // Delta commitments are not part of the in-circuit transition mix yet.
-    // Keep parameter for API compatibility; mark as intentionally unused.
-    let _ = delta_commitments;
-
-    // Mirror the circuit gate's transition mixing exactly
-    let computed_new_state = compute_transition_mix(
+    // Mirror the circuit gate's transition mixing and additionally bind the
+    // delta commitments in a deterministic linear fold outside the circuit.
+    // This preserves circuit compatibility while allowing helper-side binding.
+    let base_mix = compute_transition_mix(
         prev_state_commitment,
         mmr_root,
         nullifier_root,
         anchor_height,
     );
+    // Deterministic fold of deltas: d_fold = (((d0*2+1)+d1)*2+1+...)
+    let two = Fr::from(2);
+    let one = Fr::from(1);
+    let mut delta_fold = Fr::from(0);
+    for d in delta_commitments {
+        delta_fold = (delta_fold * two + one) + *d;
+    }
+    let computed_new_state = (base_mix + delta_fold) * two + one;
     computed_new_state == new_state_commitment
 }
 

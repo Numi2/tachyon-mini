@@ -477,18 +477,31 @@ impl PcdProofVerifier for SimplePcdVerifier {
         if transition.transition_proof.is_empty() {
             return Ok(false);
         }
-        // For verification we need prev/new commitments and post-delta roots; roots are validated during apply
-        // Here we only ensure the circuit accepts public inputs (prev/new/mmr) with proof bytes.
-        // We can't recover roots from deltas here; rely on state machine to check consistency after apply.
-        let dummy_mmr = [0u8; 32];
-        let dummy_nullifier = [0u8; 32];
+        // First, ensure the binding proof over commitments and deltas matches
+        // our deterministic construction. This prevents mismatched (prev,new,delta) tuples.
+        let expected_binding = compute_transition_proof(
+            &transition.prev_state_commitment,
+            &transition.new_state_commitment,
+            &transition.mmr_delta,
+            &transition.nullifier_delta,
+            transition.block_height_range,
+        );
+        if transition.transition_proof.as_slice() != expected_binding {
+            return Ok(false);
+        }
+
+        // Next, provide delta-bound commitments to the circuit helper. We compress
+        // deltas into fixed 32-byte commitments so the helper can bind to them.
+        let mmr_commitment = blake3::hash(&transition.mmr_delta);
+        let nullifier_commitment = blake3::hash(&transition.nullifier_delta);
+
         let halo2 = Halo2PcdCore::new()?;
         halo2.verify_transition_proof(
             &transition.transition_proof,
             &transition.prev_state_commitment,
             &transition.new_state_commitment,
-            &dummy_mmr,
-            &dummy_nullifier,
+            mmr_commitment.as_bytes(),
+            nullifier_commitment.as_bytes(),
             transition.block_height_range.1,
         )
     }

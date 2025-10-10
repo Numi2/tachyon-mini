@@ -177,13 +177,25 @@ impl TachyonBenchmark {
         }
 
         let total_time = start_time.elapsed();
+        // Compute per-iteration stats by replaying append on a separate MMR measuring each op
+        let mut min_time = Duration::MAX;
+        let mut max_time = Duration::ZERO;
+        let mut mmr_for_stats = MmrAccumulator::new();
+        for hash in &test_data {
+            let iter_start = Instant::now();
+            mmr_for_stats.append(*hash)?;
+            let t = iter_start.elapsed();
+            min_time = min_time.min(t);
+            max_time = max_time.max(t);
+        }
+
         let result = BenchmarkResult::new(
             "mmr_append".to_string(),
             test_data.len(),
             total_time,
-            Duration::from_nanos(1), // Placeholder min time
-            Duration::from_nanos(1), // Placeholder max time
-            test_data.len(),         // All operations should succeed
+            min_time,
+            max_time,
+            test_data.len(), // All operations should succeed
         );
 
         self.results.insert("mmr_append".to_string(), result);

@@ -23,3 +23,4 @@ hex = "0.4"
 net_iroh = { path = "../net_iroh" }
 node_ext = { path = "../node_ext" }
 bytes = "1.6"
+blake3 = "1.5"

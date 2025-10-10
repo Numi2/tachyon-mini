@@ -29,19 +29,33 @@ pub enum SetDelta {
     BatchRemove { elements: Vec<[u8; 32]> },
 }
 
-/// Compact membership witness (placeholder)
+/// Merkle membership witness over sorted set elements
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipWitness {
     /// Element proved
     pub element: [u8; 32],
-    /// Accumulator root at time of witness creation
-    pub root: [u8; 32],
+    /// Blake3 hash of the element (leaf)
+    pub leaf_hash: [u8; 32],
+    /// Index of the leaf in the sorted set (by element bytes)
+    pub leaf_index: usize,
+    /// Authentication path of sibling hashes bottom-up
+    pub auth_path: Vec<[u8; 32]>,
 }
 
 impl MembershipWitness {
-    /// Verify witness against a root (placeholder)
+    /// Verify witness against a Merkle root computed with duplicating lone nodes
     pub fn verify(&self, expected_root: &[u8; 32]) -> bool {
-        &self.root == expected_root
+        let mut idx = self.leaf_index;
+        let mut acc = self.leaf_hash;
+        for sib in &self.auth_path {
+            acc = if idx % 2 == 0 {
+                hash_nodes(&acc, sib)
+            } else {
+                hash_nodes(sib, &acc)
+            };
+            idx /= 2;
+        }
+        &acc == expected_root
     }
 }
 
@@ -118,27 +132,124 @@ impl SetAccumulator {
         Ok(())
     }
 
-    /// Create a membership witness (placeholder)
+    /// Create a membership witness for an element
     pub fn create_membership_witness(&self, element: &[u8; 32]) -> Result<MembershipWitness> {
         if !self.contains(element) {
             return Err(anyhow!("Element not in set"));
         }
+
+        // Build sorted leaf list and locate index
+        let elements_vec: Vec<[u8; 32]> = self.elements.iter().cloned().collect();
+        let leaf_index = elements_vec
+            .iter()
+            .position(|e| e == element)
+            .ok_or_else(|| anyhow!("Element not in set (inconsistent)"))?;
+
+        let leaves: Vec<[u8; 32]> = elements_vec
+            .iter()
+            .map(|e| {
+                let h = hash_element(e);
+                let mut out = [0u8; 32];
+                out.copy_from_slice(h.as_bytes());
+                out
+            })
+            .collect();
+
+        let auth_path = build_merkle_path(&leaves, leaf_index);
+
+        let leaf_hash = {
+            let h = hash_element(element);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(h.as_bytes());
+            out
+        };
+
         Ok(MembershipWitness {
             element: *element,
-            root: self.root,
+            leaf_hash,
+            leaf_index,
+            auth_path,
         })
     }
 
     fn recompute_root(&mut self) {
-        // Compute root by hashing concatenated element hashes in sorted order (placeholder)
-        let mut acc = blake3::Hasher::new();
-        acc.update(b"accum_set:root:v1");
-        for e in &self.elements {
-            let h = hash_element(e);
-            acc.update(h.as_bytes());
-        }
-        self.root.copy_from_slice(acc.finalize().as_bytes());
+        // Compute Merkle root over hashed leaves in sorted order
+        let leaves: Vec<[u8; 32]> = self
+            .elements
+            .iter()
+            .map(|e| {
+                let h = hash_element(e);
+                let mut out = [0u8; 32];
+                out.copy_from_slice(h.as_bytes());
+                out
+            })
+            .collect();
+        self.root = compute_merkle_root(&leaves);
     }
+}
+
+/// Hash two 32-byte nodes into a parent using domain separation
+fn hash_nodes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"accum_set:node:v1");
+    h.update(left);
+    h.update(right);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// Compute a Merkle root over the provided leaves. If odd, duplicate last.
+fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut i = 0;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() { level[i + 1] } else { left };
+            next.push(hash_nodes(&left, &right));
+            i += 2;
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Build a Merkle authentication path for the leaf at index
+fn build_merkle_path(leaves: &[[u8; 32]], mut index: usize) -> Vec<[u8; 32]> {
+    let mut path = Vec::new();
+    if leaves.is_empty() {
+        return path;
+    }
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        let is_right = index % 2 == 1;
+        let sibling_index = if is_right { index - 1 } else { index + 1 };
+        let sibling = if sibling_index < level.len() {
+            level[sibling_index]
+        } else {
+            // Duplicate if no sibling
+            level[index]
+        };
+        path.push(sibling);
+
+        // Build next level
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut i = 0;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() { level[i + 1] } else { left };
+            next.push(hash_nodes(&left, &right));
+            i += 2;
+        }
+        level = next;
+        index /= 2;
+    }
+    path
 }
 
 #[cfg(test)]

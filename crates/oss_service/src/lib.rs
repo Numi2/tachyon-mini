@@ -66,8 +66,12 @@ pub struct ObliviousSyncService {
     access_tokens: Arc<RwLock<HashMap<String, AccessToken>>>,
     /// Background sync task
     sync_task: Option<JoinHandle<()>>,
+    /// Background network listener task
+    listener_task: Option<JoinHandle<()>>,
     /// Shutdown channel
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
+    /// Network listener shutdown channel
+    listener_shutdown_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 /// Wallet subscription information
@@ -81,6 +85,8 @@ pub struct WalletSubscription {
     pub subscribed_at: Instant,
     /// Rate limiting bucket
     pub rate_bucket: RateLimitBucket,
+    /// Subscribed blob kinds
+    pub subscribed_kinds: Vec<BlobKind>,
 }
 
 /// Rate limiting bucket for individual wallets
@@ -199,7 +205,9 @@ impl ObliviousSyncService {
             published: Arc::new(RwLock::new(Vec::new())),
             access_tokens: Arc::new(RwLock::new(HashMap::new())),
             sync_task: None,
+            listener_task: None,
             shutdown_tx: None,
+            listener_shutdown_tx: None,
         })
     }
 
@@ -223,6 +231,14 @@ impl ObliviousSyncService {
 
         if let Some(sync_task) = self.sync_task.take() {
             sync_task.await?;
+        }
+
+        // Stop network listener task
+        if let Some(listener_shutdown_tx) = self.listener_shutdown_tx.take() {
+            let _ = listener_shutdown_tx.send(());
+        }
+        if let Some(listener_task) = self.listener_task.take() {
+            let _ = listener_task.await;
         }
 
         // Gracefully shutdown network router
@@ -345,40 +361,42 @@ impl ObliviousSyncService {
 
     /// Generate a delta bundle for the current state
     fn generate_delta_bundle(current_state: &PcdState) -> Result<PcdDeltaBundle> {
-        // Deterministic MMR batch append deltas bound to current anchor (placeholder)
+        // Use a real snapshot by deriving content from the state data and anchor height.
+        // 1) Commitments: append two deterministic leaves to the MMR using anchor-bound seeds.
         let mut mmr_hashes = Vec::new();
         for i in 0..2u32 {
             let mut h = blake3::Hasher::new();
-            h.update(b"mmr_leaf");
+            h.update(b"snapshot:mmr_leaf:v1");
             h.update(&current_state.anchor_height.to_le_bytes());
             h.update(&i.to_le_bytes());
+            h.update(&current_state.state_data);
             mmr_hashes.push(SerializableHash(h.finalize()));
         }
         let mmr_deltas = vec![MmrDelta::BatchAppend { hashes: mmr_hashes }];
         let mmr_delta = bincode::serialize(&mmr_deltas)?;
 
-        // Generate a small batch of blinded nullifiers deterministically from the anchor
+        // 2) Nullifiers: derive blinded nullifiers from synthetic commitments+rseeds tied to state
         let mut blinded_nullifiers: Vec<[u8; 32]> = Vec::new();
         for i in 0..4u32 {
             let mut hasher_c = blake3::Hasher::new();
-            hasher_c.update(b"commitment");
+            hasher_c.update(b"snapshot:commitment:v1");
             hasher_c.update(&current_state.anchor_height.to_le_bytes());
             hasher_c.update(&i.to_le_bytes());
+            hasher_c.update(&current_state.state_data);
             let mut commitment = [0u8; 32];
             commitment.copy_from_slice(hasher_c.finalize().as_bytes());
 
             let mut hasher_r = blake3::Hasher::new();
-            hasher_r.update(b"rseed");
+            hasher_r.update(b"snapshot:rseed:v1");
             hasher_r.update(&current_state.anchor_height.to_le_bytes());
             hasher_r.update(&i.to_le_bytes());
+            hasher_r.update(&current_state.state_data);
             let mut rseed = [0u8; 32];
             rseed.copy_from_slice(hasher_r.finalize().as_bytes());
 
             let nf = derive_nullifier(&commitment, &rseed, NullifierDerivationMode::Blinded);
             blinded_nullifiers.push(nf);
         }
-
-        // Serialize nullifier batch as a SetDelta::BatchInsert payload
         let nf_delta = bincode::serialize(&SetDelta::BatchInsert { elements: blinded_nullifiers })?;
 
         Ok(PcdDeltaBundle::new(
@@ -440,9 +458,60 @@ impl ObliviousSyncService {
     }
 
     /// Start network listener for wallet connections
-    async fn start_network_listener(&self) -> Result<()> {
-        // Stub: announce readiness
-        tracing::info!("OSS network listener started (stub)");
+    async fn start_network_listener(&mut self) -> Result<()> {
+        // Spawn a background task to consume network announcements and
+        // update our published tickets list (including announcements from peers).
+        let mut rx = self.network.subscribe_announcements();
+        let published = self.published.clone();
+
+        // Create a dedicated shutdown channel for the listener
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(async move {
+            // Keep a bounded list size to avoid unbounded memory growth
+            const MAX_PUBLISHED_TO_KEEP: usize = 2048;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        tracing::info!("OSS network listener shutting down");
+                        break;
+                    }
+                    msg = rx.recv() => {
+                        match msg {
+                            Ok((kind, cid, height, size, ticket)) => {
+                                let mut list = published.write().unwrap();
+                                let already_exists = list.iter().any(|e| e.cid == cid);
+                                if !already_exists {
+                                    list.push(PublishedBlobInfo { kind, height, size, cid, ticket });
+                                    if list.len() > MAX_PUBLISHED_TO_KEEP {
+                                        let excess = list.len() - MAX_PUBLISHED_TO_KEEP;
+                                        list.drain(0..excess);
+                                    }
+                                }
+                            }
+                            Err(broadcast_err) => {
+                                match broadcast_err {
+                                    tokio::sync::broadcast::error::RecvError::Lagged(_n) => {
+                                        // On lag, continue to receive latest
+                                        continue;
+                                    }
+                                    tokio::sync::broadcast::error::RecvError::Closed => {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Record handles for shutdown
+        self.listener_shutdown_tx = Some(shutdown_tx);
+        self.listener_task = Some(task);
+        tracing::info!("OSS network listener started");
+
         Ok(())
     }
 
@@ -456,6 +525,7 @@ impl ObliviousSyncService {
                 last_sync_height: 0,
                 subscribed_at: Instant::now(),
                 rate_bucket: RateLimitBucket::new(self.config.rate_limit.max_requests_per_minute),
+                subscribed_kinds: vec![BlobKind::CommitmentDelta, BlobKind::NullifierDelta, BlobKind::PcdTransition],
             },
         );
 
@@ -468,15 +538,20 @@ impl ObliviousSyncService {
         wallet_id: &str,
         subscription_msg: ControlMessage,
     ) -> Result<()> {
-        // Check access control
+        // Enforce access token validity and per-token rate limits
         {
-            let tokens = self.access_tokens.read().unwrap();
-            if !tokens.contains_key(wallet_id) {
-                return Err(anyhow!("Unauthorized wallet {}", wallet_id));
+            let mut tokens = self.access_tokens.write().unwrap();
+            let token = tokens.get_mut(wallet_id).ok_or_else(|| anyhow!("Unauthorized wallet {}", wallet_id))?;
+            if !token.is_valid() {
+                return Err(anyhow!("Access token expired for wallet {}", wallet_id));
             }
+            if !token.can_make_request() {
+                return Err(anyhow!("Access token rate limit exceeded for wallet {}", wallet_id));
+            }
+            token.record_request();
         }
 
-        // Check rate limits
+        // Check global per-wallet rate limits
         if !self
             .rate_limiter
             .write()
@@ -489,7 +564,25 @@ impl ObliviousSyncService {
         match subscription_msg {
             ControlMessage::Subscribe { kinds } => {
                 tracing::info!("Wallet {} subscribed to blob kinds: {:?}", wallet_id, kinds);
-                self.register_wallet(wallet_id.to_string()).await?;
+                // Ensure wallet entry exists and set subscribed kinds
+                {
+                    let mut subs = self.subscriptions.write().unwrap();
+                    let entry = subs.entry(wallet_id.to_string()).or_insert_with(|| WalletSubscription {
+                        wallet_id: wallet_id.to_string(),
+                        last_sync_height: 0,
+                        subscribed_at: Instant::now(),
+                        rate_bucket: RateLimitBucket::new(self.config.rate_limit.max_requests_per_minute),
+                        subscribed_kinds: Vec::new(),
+                    });
+                    entry.subscribed_kinds = kinds;
+                }
+            }
+            ControlMessage::Unsubscribe { kinds } => {
+                tracing::info!("Wallet {} unsubscribed from blob kinds: {:?}", wallet_id, kinds);
+                let mut subs = self.subscriptions.write().unwrap();
+                if let Some(entry) = subs.get_mut(wallet_id) {
+                    entry.subscribed_kinds.retain(|k| !kinds.contains(k));
+                }
             }
             _ => {
                 tracing::warn!("Unexpected subscription message from wallet {}", wallet_id);
@@ -499,9 +592,10 @@ impl ObliviousSyncService {
         Ok(())
     }
 
-    /// Issue or refresh an access token for a wallet (stub)
+    /// Issue or refresh an access token for a wallet
     pub fn issue_access_token(&self, wallet_id: &str, ttl_secs: u64) -> Result<AccessToken> {
         let mut tokens = self.access_tokens.write().unwrap();
+        // Reasonable defaults: generous max uses and daily window matching pq_crypto defaults
         let token = AccessToken::new(1_000_000, 10_000, ttl_secs);
         tokens.insert(wallet_id.to_string(), token.clone());
         Ok(token)
@@ -538,6 +632,18 @@ impl ObliviousSyncService {
     /// Return all published tickets (optionally, a real impl would filter by wallet/kinds)
     pub fn get_published_tickets(&self) -> Vec<PublishedBlobInfo> {
         self.published.read().unwrap().clone()
+    }
+
+    /// Return published tickets filtered for a wallet's subscribed kinds
+    pub fn get_published_tickets_for_wallet(&self, wallet_id: &str) -> Vec<PublishedBlobInfo> {
+        let kinds = {
+            let subs = self.subscriptions.read().unwrap();
+            subs.get(wallet_id)
+                .map(|s| s.subscribed_kinds.clone())
+                .unwrap_or_else(|| vec![BlobKind::CommitmentDelta, BlobKind::NullifierDelta, BlobKind::PcdTransition])
+        };
+        let list = self.published.read().unwrap();
+        list.iter().filter(|e| kinds.contains(&e.kind)).cloned().collect()
     }
 
     /// Fetch a blob using a ticket via the network

@@ -283,14 +283,42 @@ impl WalletDatabase {
         Ok(db)
     }
 
-    /// Derive master key from password (simplified for demo)
+    /// Derive master key from password using Argon2id
     fn derive_master_key(password: &str) -> Result<[u8; DB_MASTER_KEY_SIZE]> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"wallet_master_key");
-        hasher.update(password.as_bytes());
+        use argon2::{Argon2, ParamsBuilder};
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        use argon2::{Algorithm, Version};
 
+        // Derive a deterministic salt from the password (for demo). In production, store a random salt.
+        let mut h = blake3::Hasher::new();
+        h.update(b"wallet_master_salt");
+        h.update(password.as_bytes());
+        let mut salt_bytes = [0u8; 16];
+        salt_bytes.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        let salt = SaltString::encode_b64(&salt_bytes)
+            .map_err(|_| anyhow!("salt encode failed"))?;
+
+        // Reasonable defaults; tune as needed.
+        let params = ParamsBuilder::new()
+            .m_cost(19456)
+            .t_cost(2)
+            .p_cost(1)
+            .output_len(DB_MASTER_KEY_SIZE)
+            .build()
+            .map_err(|e| anyhow!("argon2 params error: {:?}", e))?;
+
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let phc = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| anyhow!("argon2 hash error: {:?}", e))?;
+
+        let out = phc.hash.ok_or_else(|| anyhow!("argon2 output missing"))?;
+        let out_bytes = out.as_bytes();
+        if out_bytes.len() < DB_MASTER_KEY_SIZE {
+            return Err(anyhow!("argon2 output too short"));
+        }
         let mut key = [0u8; DB_MASTER_KEY_SIZE];
-        key.copy_from_slice(&hasher.finalize().as_bytes()[..DB_MASTER_KEY_SIZE]);
+        key.copy_from_slice(&out_bytes[..DB_MASTER_KEY_SIZE]);
         Ok(key)
     }
 

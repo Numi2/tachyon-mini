@@ -491,14 +491,42 @@ impl MmrWitness {
             .iter()
             .map(|(pos, hash)| (*pos, SerializableHash(*hash)))
             .collect();
-        // In a full implementation, we'd also update the auth_path
     }
 
     /// Verify that an element is in the MMR using this witness
-    pub fn verify(&self, _element_hash: &Hash, _mmr_root: &Hash) -> bool {
-        // This would implement actual witness verification
-        // For now, return true if the witness is non-empty
-        !self.auth_path.is_empty()
+    pub fn verify(&self, element_hash: &Hash, mmr_root: &Hash) -> bool {
+        // Recompute the mountain peak by walking the authentication path bottom-up.
+        let mut current_hash = *element_hash;
+        let mut current_pos = self.position;
+
+        for (sib_pos, sib_hash) in &self.auth_path {
+            let (left, right) = if *sib_pos < current_pos {
+                (sib_hash.0, current_hash)
+            } else {
+                (current_hash, sib_hash.0)
+            };
+            current_hash = mmr_hash_parent(&left, &right);
+            current_pos = mmr_parent_pos(current_pos);
+        }
+
+        // Bag peaks from right to left, substituting the computed mountain peak
+        let mut acc: Option<Hash> = None;
+        for (peak_pos, peak_hash) in self.peaks.iter().rev() {
+            let peak_h = if *peak_pos == current_pos {
+                current_hash
+            } else {
+                peak_hash.0
+            };
+            acc = Some(match acc {
+                None => peak_h,
+                Some(r) => mmr_hash_parent(&peak_h, &r),
+            });
+        }
+
+        match acc {
+            Some(root) => root == *mmr_root,
+            None => Hash::from([0u8; 32]) == *mmr_root,
+        }
     }
 }
 
@@ -699,6 +727,47 @@ mod tests {
         let proof1 = mmr.prove(p1).unwrap();
         assert!(proof1.verify(&root));
         assert_eq!(proof1.calculate_root(), root);
+    }
+
+    #[test]
+    fn test_mmr_witness_verify_matches_proof() {
+        // Build a small MMR and produce a proof for a leaf
+        let mut mmr = MmrAccumulator::new();
+        let h1 = Hash::from([1u8; 32]);
+        let h2 = Hash::from([2u8; 32]);
+        let h3 = Hash::from([3u8; 32]);
+        let p1 = mmr.append(h1).unwrap();
+        let _p2 = mmr.append(h2).unwrap();
+        let _p3 = mmr.append(h3).unwrap();
+        let root = mmr.root().unwrap();
+
+        let proof = mmr.prove(p1).unwrap();
+
+        // Convert MmrProof into a MmrWitness view
+        let mut witness = MmrWitness {
+            position: proof.element.position,
+            auth_path: proof
+                .siblings
+                .iter()
+                .map(|s| (s.position, s.hash))
+                .collect(),
+            peaks: proof
+                .peaks
+                .iter()
+                .map(|p| (p.position, p.hash))
+                .collect(),
+        };
+
+        // Update peaks no-op (ensures method compiles and preserves data)
+        let new_peaks: Vec<(u64, Hash)> = witness
+            .peaks
+            .iter()
+            .map(|(pos, h)| (*pos, h.0))
+            .collect();
+        witness.update(&new_peaks);
+
+        assert!(witness.verify(&h1, &root));
+        assert!(!witness.verify(&h2, &root));
     }
 
     #[test]

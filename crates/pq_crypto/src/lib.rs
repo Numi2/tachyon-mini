@@ -468,65 +468,48 @@ impl fmt::Display for KyberCiphertext {
     }
 }
 
-/// Simple KEM implementation (placeholder for Kyber)
+/// Kyber768 KEM wrapper providing keygen/encap/decap using pqcrypto-kyber
 pub struct SimpleKem;
 
 impl SimpleKem {
-    /// Generate a keypair
+    /// Generate a keypair using Kyber768
     pub fn generate_keypair() -> Result<(KyberPublicKey, KyberSecretKey)> {
         use pqcrypto_kyber::kyber768;
-
         let (pk, sk) = kyber768::keypair();
         let pk_bytes = pk.as_bytes().to_vec();
         let sk_bytes = sk.as_bytes().to_vec();
-
         if pk_bytes.len() != KYBER_PUBLIC_KEY_SIZE || sk_bytes.len() != KYBER_SECRET_KEY_SIZE {
             return Err(anyhow!("Unexpected Kyber key sizes"));
         }
-
         Ok((KyberPublicKey::new(pk_bytes), KyberSecretKey::new(sk_bytes)))
     }
 
-    /// Encapsulate
+    /// Encapsulate to a Kyber768 public key
     pub fn encapsulate(
         pk: &KyberPublicKey,
     ) -> Result<(KyberCiphertext, [u8; KYBER_SHARED_SECRET_SIZE])> {
         use pqcrypto_kyber::kyber768;
-
-        // Recreate typed Kyber public key from bytes
         let pk_typed = kyber768::PublicKey::from_bytes(pk.as_bytes())
             .map_err(|_| anyhow!("Invalid Kyber public key bytes"))?;
-
         let (ss, ct) = kyber768::encapsulate(&pk_typed);
-        let ct_bytes = ct.as_bytes().to_vec();
         let mut shared_secret = [0u8; KYBER_SHARED_SECRET_SIZE];
-        let ss_bytes = ss.as_bytes();
-        if ss_bytes.len() < KYBER_SHARED_SECRET_SIZE {
-            return Err(anyhow!("Shared secret too short"));
-        }
-        shared_secret.copy_from_slice(&ss_bytes[..KYBER_SHARED_SECRET_SIZE]);
-        Ok((KyberCiphertext::new(ct_bytes), shared_secret))
+        shared_secret.copy_from_slice(&ss.as_bytes()[..KYBER_SHARED_SECRET_SIZE]);
+        Ok((KyberCiphertext::new(ct.as_bytes().to_vec()), shared_secret))
     }
 
-    /// Decapsulate
+    /// Decapsulate using Kyber768 secret key
     pub fn decapsulate(
         sk: &KyberSecretKey,
         ct: &KyberCiphertext,
     ) -> Result<[u8; KYBER_SHARED_SECRET_SIZE]> {
         use pqcrypto_kyber::kyber768;
-
         let sk_typed = kyber768::SecretKey::from_bytes(sk.as_bytes())
             .map_err(|_| anyhow!("Invalid Kyber secret key bytes"))?;
         let ct_typed = kyber768::Ciphertext::from_bytes(ct.as_bytes())
             .map_err(|_| anyhow!("Invalid Kyber ciphertext bytes"))?;
-
         let ss = kyber768::decapsulate(&ct_typed, &sk_typed);
-        let ss_bytes = ss.as_bytes();
-        if ss_bytes.len() < KYBER_SHARED_SECRET_SIZE {
-            return Err(anyhow!("Shared secret too short"));
-        }
         let mut shared_secret = [0u8; KYBER_SHARED_SECRET_SIZE];
-        shared_secret.copy_from_slice(&ss_bytes[..KYBER_SHARED_SECRET_SIZE]);
+        shared_secret.copy_from_slice(&ss.as_bytes()[..KYBER_SHARED_SECRET_SIZE]);
         Ok(shared_secret)
     }
 }
