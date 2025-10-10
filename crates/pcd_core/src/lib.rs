@@ -320,6 +320,7 @@ impl PcdStateMachine {
             if let Some(root) = mmr.root() {
                 new_state.mmr_root = (*root.as_bytes()).try_into().unwrap();
             }
+            // Persist full MMR state into the PCD state for downstream witness updates
             new_state.mmr_bytes = bincode::serialize(&mmr).unwrap_or_default();
         }
 
@@ -348,6 +349,7 @@ impl PcdStateMachine {
             }
 
             new_state.nullifier_root = nullset.root();
+            // Persist full nullifier set state for consistency/auditing
             new_state.nullifier_bytes = bincode::serialize(&nullset).unwrap_or_default();
         }
 

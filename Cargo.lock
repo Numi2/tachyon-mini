@@ -3048,6 +3048,7 @@ dependencies = [
  "accum_set",
  "anyhow",
  "async-trait",
+ "bincode",
  "blake3",
  "circuits",
  "net_iroh",
@@ -4663,6 +4664,7 @@ dependencies = [
  "blake3",
  "fs2",
  "pq_crypto",
+ "rand 0.8.5",
  "serde",
  "tempfile",
  "tokio",
@@ -5355,12 +5357,15 @@ dependencies = [
 name = "wallet"
 version = "0.1.0"
 dependencies = [
+ "accum_mmr",
  "anyhow",
  "bincode",
  "blake3",
+ "hex",
  "net_iroh",
  "pcd_core",
  "pq_crypto",
+ "reqwest",
  "serde",
  "serde_json",
  "storage",

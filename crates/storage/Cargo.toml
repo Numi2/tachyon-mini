@@ -13,6 +13,7 @@ pq_crypto = { path = "../pq_crypto" }
 bincode.workspace = true
 blake3.workspace = true
 fs2.workspace = true
+rand.workspace = true
 argon2 = { version = "0.5", default-features = false, features = ["std", "password-hash"] }
 
 [dev-dependencies]

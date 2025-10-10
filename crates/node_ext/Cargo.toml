@@ -18,3 +18,4 @@ accum_mmr = { path = "../accum_mmr" }
 accum_set = { path = "../accum_set" }
 pq_crypto = { path = "../pq_crypto" }
 circuits = { path = "../circuits" }
+bincode.workspace = true

@@ -3,7 +3,8 @@
 //! Validator / Node extension implementation for Tachyon.
 //! Verifies PCD proofs, nullifier checks, and maintains minimal state for validation.
 
-use accum_mmr::SerializableHash;
+use accum_mmr::{MmrAccumulator, SerializableHash};
+use accum_set::SetAccumulator;
 use anyhow::{anyhow, Result};
 use blake3::Hash;
 use net_iroh::TachyonNetwork;
@@ -11,7 +12,7 @@ use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
 use pcd_core::aggregation::aggregate_action_proofs;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -21,6 +22,9 @@ use tokio::{
     time::interval,
 };
 use tracing::{debug, info};
+use std::path::Path;
+use tokio::fs as async_fs;
+use bincode;
 
 /// Configuration for the node extension
 #[derive(Debug, Clone)]
@@ -111,10 +115,16 @@ impl Default for PruningConfig {
 pub struct NodeState {
     /// Current block height
     pub current_height: u64,
-    /// Recent nullifier window
-    pub nullifier_window: HashSet<[u8; 32]>,
-    /// MMR peaks for validation
+    /// Canonical nullifier set accumulator (full-history)
+    pub nullifier_set: SetAccumulator,
+    /// MMR accumulator for note commitments
+    pub commitment_mmr: MmrAccumulator,
+    /// Current MMR peaks for validation (derived from `commitment_mmr`)
     pub mmr_peaks: Vec<(u64, SerializableHash)>,
+    /// Current MMR root
+    pub mmr_root: [u8; 32],
+    /// Current nullifier set root
+    pub nullifier_root: [u8; 32],
     /// Last pruning timestamp
     pub last_pruned: Instant,
     /// Storage usage tracking
@@ -126,35 +136,120 @@ impl NodeState {
     pub fn new() -> Self {
         Self {
             current_height: 0,
-            nullifier_window: HashSet::new(),
+            nullifier_set: SetAccumulator::new(),
+            commitment_mmr: MmrAccumulator::new(),
             mmr_peaks: Vec::new(),
+            mmr_root: [0u8; 32],
+            nullifier_root: [0u8; 32],
             last_pruned: Instant::now(),
             storage_size: 0,
         }
     }
 
-    /// Update nullifier window for new block
-    pub fn update_nullifier_window(&mut self, new_nullifiers: Vec<[u8; 32]>, window_size: u64) {
-        // Remove old nullifiers if window is full
-        if self.nullifier_window.len() >= window_size as usize {
-            // For simplicity, just clear and rebuild - in production would use proper sliding window
-            self.nullifier_window.clear();
+    /// Update nullifier accumulator with new nullifiers and refresh root
+    pub fn update_nullifier_set(&mut self, new_nullifiers: Vec<[u8; 32]>) {
+        for nf in new_nullifiers {
+            self.nullifier_set.insert(nf);
         }
-
-        // Add new nullifiers
-        for nullifier in new_nullifiers {
-            self.nullifier_window.insert(nullifier);
-        }
+        self.nullifier_root = self.nullifier_set.root();
     }
 
-    /// Check if a nullifier is in the recent window
+    /// Check if a nullifier has already been seen (full-history check)
     pub fn check_nullifier(&self, nullifier: &[u8; 32]) -> bool {
-        self.nullifier_window.contains(nullifier)
+        self.nullifier_set.contains(nullifier)
     }
 
     /// Update MMR peaks
     pub fn update_mmr_peaks(&mut self, peaks: Vec<(u64, SerializableHash)>) {
         self.mmr_peaks = peaks;
+    }
+
+    /// Recompute peaks and root from the current commitment MMR
+    pub fn refresh_mmr_view(&mut self) {
+        // Recompute peaks list from accumulator
+        let mut new_peaks: Vec<(u64, SerializableHash)> = Vec::new();
+        for &pos in self.commitment_mmr.peaks() {
+            if let Some(node) = self.commitment_mmr.get_node(pos) {
+                new_peaks.push((pos, node.hash));
+            }
+        }
+        self.mmr_peaks = new_peaks;
+        self.mmr_root = self
+            .commitment_mmr
+            .root()
+            .map(|h| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(h.as_bytes());
+                arr
+            })
+            .unwrap_or([0u8; 32]);
+    }
+
+    /// Compute the domain-separated leaf hash used by Tachygram for note commitments
+    pub fn leaf_hash(commitment: &[u8; 32]) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tachygram:leaf:v1");
+        hasher.update(commitment);
+        hasher.finalize()
+    }
+
+    /// Attempt to load state from disk; returns None if not present
+    pub async fn load_from_disk<P: AsRef<Path>>(data_dir: P) -> Option<Self> {
+        let path = data_dir.as_ref().join("node_state.bin");
+        if !path.exists() {
+            return None;
+        }
+        match async_fs::read(&path).await.ok().and_then(|bytes| bincode::deserialize::<PersistedNodeState>(&bytes).ok()) {
+            Some(p) => Some(Self::from(p)),
+            None => None,
+        }
+    }
+
+    /// Persist state to disk (best-effort)
+    pub async fn save_to_disk<P: AsRef<Path>>(&self, data_dir: P) {
+        let path = data_dir.as_ref().join("node_state.bin");
+        if let Ok(bytes) = bincode::serialize(&PersistedNodeState::from(self)) {
+            let _ = async_fs::write(&path, &bytes).await;
+        }
+    }
+}
+
+/// Serializable snapshot for node state persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedNodeState {
+    pub current_height: u64,
+    pub nullifier_set: SetAccumulator,
+    pub commitment_mmr: MmrAccumulator,
+    pub mmr_peaks: Vec<(u64, SerializableHash)>,
+    pub mmr_root: [u8; 32],
+    pub nullifier_root: [u8; 32],
+}
+
+impl From<PersistedNodeState> for NodeState {
+    fn from(p: PersistedNodeState) -> Self {
+        Self {
+            current_height: p.current_height,
+            nullifier_set: p.nullifier_set,
+            commitment_mmr: p.commitment_mmr,
+            mmr_peaks: p.mmr_peaks,
+            mmr_root: p.mmr_root,
+            nullifier_root: p.nullifier_root,
+            last_pruned: Instant::now(),
+            storage_size: 0,
+        }
+    }
+}
+
+impl From<&NodeState> for PersistedNodeState {
+    fn from(s: &NodeState) -> Self {
+        Self {
+            current_height: s.current_height,
+            nullifier_set: s.nullifier_set.clone(),
+            commitment_mmr: s.commitment_mmr.clone(),
+            mmr_peaks: s.mmr_peaks.clone(),
+            mmr_root: s.mmr_root,
+            nullifier_root: s.nullifier_root,
+        }
     }
 }
 
@@ -210,7 +305,10 @@ impl TachyonNode {
         let network = Arc::new(
             TachyonNetwork::new(&std::path::Path::new(&config.network_config.data_dir)).await?,
         );
-        let state = Arc::new(RwLock::new(NodeState::new()));
+        // Load persisted state if available
+        let loaded = NodeState::load_from_disk(&config.network_config.data_dir).await;
+        let initial_state = loaded.unwrap_or_else(|| NodeState::new());
+        let state = Arc::new(RwLock::new(initial_state));
         let pcd_verifier = Arc::new(SimplePcdVerifier::new());
 
         // Start background validation task
@@ -276,19 +374,37 @@ impl TachyonNode {
         // Basic transaction format validation
         tx.validate_format()?;
 
-        // Check nullifier window; accept blinded nullifiers
-        for nullifier in &tx.nullifiers {
+        // Enforce nullifier uniqueness against canonical set (full-history)
+        {
             let state = self.state.read().unwrap();
-            if state.check_nullifier(nullifier) {
+            // Anchor and roots must match canonical state at current height
+            if tx.anchor_height != state.current_height
+                || tx.pcd_mmr_root != state.mmr_root
+                || tx.pcd_nullifier_root != state.nullifier_root
+            {
                 return Ok(ValidationResult {
                     is_valid: false,
-                    error_message: Some(format!("Nullifier already spent: {:?}", nullifier)),
+                    error_message: Some("Anchor/roots do not match canonical state".to_string()),
                     gas_used: 1000,
                     validated_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs(),
                 });
+            }
+
+            for nullifier in &tx.nullifiers {
+                if state.check_nullifier(nullifier) {
+                    return Ok(ValidationResult {
+                        is_valid: false,
+                        error_message: Some(format!("Nullifier already spent: {:?}", nullifier)),
+                        gas_used: 1000,
+                        validated_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    });
+                }
             }
         }
 
@@ -366,17 +482,42 @@ impl TachyonNode {
             }
         }
 
-        // Update node state with new nullifiers and MMR peaks
-        let mut state = self.state.write().unwrap();
-        let mut new_nullifiers = Vec::new();
-        for tx in &block.transactions {
-            new_nullifiers.extend(tx.nullifiers.iter().cloned());
+        // Update node state with new nullifiers and commitments; advance anchor
+        {
+            let mut state = self.state.write().unwrap();
+
+            // Apply all nullifiers into the canonical set
+            let mut new_nullifiers = Vec::new();
+            for tx in &block.transactions {
+                new_nullifiers.extend(tx.nullifiers.iter().cloned());
+            }
+            state.update_nullifier_set(new_nullifiers);
+
+            // Append all output commitments to the MMR (domain-separated leaves)
+            for tx in &block.transactions {
+                for commitment in &tx.commitments {
+                    let leaf = NodeState::leaf_hash(commitment);
+                    // Ignore append errors in production you'd handle Result
+                    let _ = state.commitment_mmr.append(leaf);
+                }
+            }
+            // Refresh peaks and root
+            state.refresh_mmr_view();
+
+            // Advance anchor height to this block's height
+            state.current_height = block.height;
+
+            // Persist best-effort
+            let data_dir = self.config.network_config.data_dir.clone();
+            // Persist in background using a decoupled snapshot
+            let snapshot = PersistedNodeState::from(&*state);
+            let _ = tokio::spawn(async move {
+                let path = std::path::Path::new(&data_dir).join("node_state.bin");
+                if let Ok(bytes) = bincode::serialize(&snapshot) {
+                    let _ = async_fs::write(&path, &bytes).await;
+                }
+            });
         }
-        state.update_nullifier_window(
-            new_nullifiers,
-            self.config.validation_config.nullifier_window_size,
-        );
-        state.current_height = block.height;
 
         // Compute block hash
         let block_hash = self.compute_block_hash(block)?;
@@ -455,8 +596,11 @@ impl TachyonNode {
         let guard = self.state.read().unwrap();
         NodeState {
             current_height: guard.current_height,
-            nullifier_window: guard.nullifier_window.clone(),
+            nullifier_set: guard.nullifier_set.clone(),
+            commitment_mmr: guard.commitment_mmr.clone(),
             mmr_peaks: guard.mmr_peaks.clone(),
+            mmr_root: guard.mmr_root,
+            nullifier_root: guard.nullifier_root,
             last_pruned: guard.last_pruned,
             storage_size: guard.storage_size,
         }

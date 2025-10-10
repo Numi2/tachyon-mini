@@ -9,8 +9,8 @@ use pcd_core::{
     PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier, PcdTransition,
 };
 use pq_crypto::{
-    derive_nullifier, KyberPublicKey, KyberSecretKey, NullifierDerivationMode, OutOfBandPayment,
-    SimpleKem,
+    derive_nf2, derive_spend_nullifier_key, KyberPublicKey, KyberSecretKey,
+    OutOfBandPayment, SimpleKem,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -19,6 +19,9 @@ use tokio::{
     sync::{broadcast, mpsc, RwLock},
     task::JoinHandle,
 };
+use reqwest::Client as HttpClient;
+use accum_mmr::{MmrAccumulator, MmrWitness};
+use bincode;
 
 /// Wallet configuration
 #[derive(Debug, Clone)]
@@ -457,6 +460,38 @@ impl WalletSyncClient {
         }
     }
 }
+/// Minimal Zebra nullifier client (HTTP JSON), feature-gated by env var
+struct ZebraNullifierClient {
+    base_url: String,
+    http: HttpClient,
+}
+
+impl ZebraNullifierClient {
+    fn new(base_url: String) -> Self {
+        Self { base_url, http: HttpClient::new() }
+    }
+
+    async fn fetch_nullifiers_since(&self, start_height: u64) -> Result<Vec<[u8; 32]>> {
+        let url = format!("{}/nullifiers?since={}", self.base_url, start_height);
+        let resp = self.http.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let items: Vec<String> = resp.json().await?;
+        let mut out = Vec::new();
+        for hex_s in items {
+            if let Ok(bytes) = hex::decode(&hex_s) {
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    out.push(arr);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 
 impl PcdSyncClient for WalletSyncClient {
     async fn fetch_state(&self, height: u64) -> Result<Option<PcdState>> {
@@ -650,6 +685,12 @@ impl TachyonWallet {
         let pcd_manager = self.pcd_manager.clone();
         let database = self.database.clone();
 
+        // Optional Zebra nullifier client (chain-sourced nullifier set)
+        let zebra_url_opt = std::env::var("TACHYON_ZEBRA_NULLIFIER_URL").ok();
+        let zebra_client = zebra_url_opt
+            .as_ref()
+            .map(|u| ZebraNullifierClient::new(u.clone()));
+
         let sync_task = tokio::spawn(async move {
             // Subscribe to blob announcements
             let mut client = WalletSyncClient::new(network.clone());
@@ -669,6 +710,35 @@ impl TachyonWallet {
                             };
                             if let Err(e) = sync_mgr.sync_to_height(latest_height).await {
                                 tracing::error!("Sync failed: {}", e);
+                            }
+                        }
+
+                        // Chain-sourced nullifier check via Zebra if configured
+                        if let Some(ref client) = zebra_client {
+                            let unspent = database.list_unspent_notes().await;
+                            // Derive NF2 for each unspent note and check against chain nullifiers
+                            if let Ok(spend_secret) = database.get_or_generate_spend_secret().await {
+                                let snk = derive_spend_nullifier_key(&spend_secret);
+                                // Determine a starting height for fetching nullifiers
+                                let start_h = 0u64;
+                                if let Ok(chain_nfs) = client.fetch_nullifiers_since(start_h).await {
+                                    let chain_set: std::collections::HashSet<[u8;32]> = chain_nfs.into_iter().collect();
+                                    for enc_note in unspent {
+                                        if let Ok(plaintext) = enc_note.decrypt(&database.master_key) {
+                                            if let Ok(parsed) = parse_wallet_note_from_plaintext(
+                                                &plaintext,
+                                                enc_note.position,
+                                                enc_note.block_height,
+                                                enc_note.is_spent,
+                                            ) {
+                                                let nf2 = derive_nf2(&parsed.commitment, &parsed.rseed, &snk);
+                                                if chain_set.contains(&nf2) {
+                                                    let _ = database.update_note_spent_status(&parsed.commitment, true).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -698,6 +768,10 @@ impl TachyonWallet {
                                                             if let Err(e) = database.set_pcd_state(rec).await {
                                                                 tracing::warn!("Failed to persist PCD state: {}", e);
                                                             }
+                                                        }
+                                                        // Update witnesses for unspent notes against new MMR
+                                                        if let Err(e) = Self::update_witnesses_after_pcd(&database, &state).await {
+                                                            tracing::warn!("Witness update failed: {}", e);
                                                         }
                                                     }
                                                 }
@@ -880,13 +954,17 @@ impl TachyonWallet {
             .map(|s| s.anchor_height)
             .unwrap_or(0);
 
-        // Derive nullifiers using blinded mode for oblivious sync compatibility
+        // Derive NF2 spend-authority nullifiers
+        let spend_secret = self.database.get_or_generate_spend_secret().await?;
+        let snk = derive_spend_nullifier_key(&spend_secret);
         let nullifiers: Vec<[u8; 32]> = note_commitments
             .iter()
-            .map(|c| {
-                let mut seed = [0u8; 32];
-                seed.copy_from_slice(blake3::hash(c).as_bytes());
-                derive_nullifier(c, &seed, NullifierDerivationMode::Blinded)
+            .map(|cm| {
+                // For demo, derive rho from commitment; in real wallet use per-note randomness
+                let rho = blake3::hash(cm);
+                let mut rho32 = [0u8; 32];
+                rho32.copy_from_slice(rho.as_bytes());
+                derive_nf2(cm, &rho32, &snk)
             })
             .collect();
 
@@ -932,6 +1010,44 @@ impl TachyonWallet {
     /// Get current PCD state
     pub async fn get_pcd_state(&self) -> Option<PcdState> {
         self.pcd_manager.read().await.current_state().cloned()
+    }
+
+    /// Recompute and persist MMR witnesses for all unspent notes after adopting a new PCD state
+    async fn update_witnesses_after_pcd(
+        database: &WalletDatabase,
+        state: &PcdState,
+    ) -> Result<()> {
+        let mmr_bytes = state.mmr_raw();
+        if mmr_bytes.is_empty() { return Ok(()); }
+
+        let mmr: MmrAccumulator = bincode::deserialize(mmr_bytes)
+            .map_err(|e| anyhow!("MMR deserialize failed: {}", e))?;
+
+        let unspent = database.list_unspent_notes().await;
+        for enc_note in unspent {
+            let pos = enc_note.position;
+            if pos >= mmr.size() { continue; }
+            if let Ok(proof) = mmr.prove(pos) {
+                let witness = MmrWitness {
+                    position: proof.element.position,
+                    auth_path: proof
+                        .siblings
+                        .iter()
+                        .map(|s| (s.position, s.hash))
+                        .collect(),
+                    peaks: proof
+                        .peaks
+                        .iter()
+                        .map(|p| (p.position, p.hash))
+                        .collect(),
+                };
+                let witness_bytes = bincode::serialize(&witness)
+                    .map_err(|e| anyhow!("Witness serialize failed: {}", e))?;
+                let rec = storage::WitnessRecord::new(pos, &witness_bytes, &database.master_key)?;
+                let _ = database.upsert_witness(pos, rec).await;
+            }
+        }
+        Ok(())
     }
 }
 

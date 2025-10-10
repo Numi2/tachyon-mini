@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use fs2::FileExt;
+use rand::RngCore;
 use pq_crypto::{
     KyberPublicKey, KyberSecretKey, SimpleAead, SimpleKem, AES_KEY_SIZE, AES_NONCE_SIZE,
 };
@@ -247,6 +248,8 @@ pub struct WalletDatabase {
     witness_cache: Arc<RwLock<HashMap<u64, WitnessRecord>>>,
     /// In-memory OOB keypair cache
     oob_keys_cache: Arc<RwLock<Option<OobKeysRecord>>>,
+    /// In-memory spend secret cache (encrypted on disk)
+    spend_secret_cache: Arc<RwLock<Option<SpendSecretRecord>>>,
 }
 
 impl WalletDatabase {
@@ -275,6 +278,7 @@ impl WalletDatabase {
             pcd_state_cache: Arc::new(RwLock::new(None)),
             witness_cache: Arc::new(RwLock::new(HashMap::new())),
             oob_keys_cache: Arc::new(RwLock::new(None)),
+            spend_secret_cache: Arc::new(RwLock::new(None)),
         };
 
         // Load existing data from disk
@@ -357,6 +361,14 @@ impl WalletDatabase {
             *self.oob_keys_cache.write().unwrap() = Some(keys);
         }
 
+        // Load spend secret
+        let spend_path = self.db_path.join("spend_secret.bin");
+        if spend_path.exists() {
+            let data = fs::read(&spend_path).await?;
+            let rec: SpendSecretRecord = bincode::deserialize(&data)?;
+            *self.spend_secret_cache.write().unwrap() = Some(rec);
+        }
+
         Ok(())
     }
 
@@ -402,6 +414,16 @@ impl WalletDatabase {
             let keys_data = bincode::serialize(&keys)?;
             fs::write(&keys_tmp, &keys_data).await?;
             fs::rename(&keys_tmp, &keys_path).await?;
+        }
+
+        // Save spend secret if present atomically
+        let spend_path = self.db_path.join("spend_secret.bin");
+        let spend_opt = { self.spend_secret_cache.read().unwrap().clone() };
+        if let Some(rec) = spend_opt {
+            let tmp = self.db_path.join("spend_secret.bin.tmp");
+            let data = bincode::serialize(&rec)?;
+            fs::write(&tmp, &data).await?;
+            fs::rename(&tmp, &spend_path).await?;
         }
 
         Ok(())
@@ -576,6 +598,22 @@ impl WalletDatabase {
         self.set_oob_keypair(&pk, &sk).await?;
         Ok((pk, sk))
     }
+
+    /// Get or generate a spend secret (32 bytes) encrypted at rest
+    pub async fn get_or_generate_spend_secret(&self) -> Result<[u8; 32]> {
+        if let Some(rec) = self.spend_secret_cache.read().unwrap().as_ref() {
+            return rec.decrypt(&self.master_key);
+        }
+        // Generate new random spend secret
+        let mut sec = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut sec);
+        let rec = SpendSecretRecord::new(&sec, &self.master_key)?;
+        {
+            *self.spend_secret_cache.write().unwrap() = Some(rec);
+        }
+        self.save_to_disk().await?;
+        Ok(sec)
+    }
 }
 
 /// Database statistics
@@ -623,6 +661,37 @@ impl OobKeysRecord {
         }
         let sk = SimpleAead::decrypt(master_key, &self.encrypted_secret, b"oob_keys")?;
         Ok(sk)
+    }
+}
+
+/// Persisted spend secret (spend-authority key seed), encrypted at rest
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendSecretRecord {
+    /// Encrypted secret (nonce + ciphertext)
+    pub encrypted_secret: Vec<u8>,
+    /// Nonce used for encryption
+    pub nonce: [u8; AES_NONCE_SIZE],
+}
+
+impl SpendSecretRecord {
+    pub fn new(spend_secret32: &[u8; 32], master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<Self> {
+        let nonce = SimpleAead::generate_nonce();
+        let encrypted_secret = SimpleAead::encrypt(master_key, &nonce, spend_secret32, b"spend_secret")?;
+        Ok(Self { encrypted_secret, nonce })
+    }
+
+    pub fn decrypt(&self, master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<[u8; 32]> {
+        if self.encrypted_secret.len() < AES_NONCE_SIZE {
+            return Err(anyhow!("Ciphertext too short"));
+        }
+        if &self.encrypted_secret[..AES_NONCE_SIZE] != &self.nonce {
+            return Err(anyhow!("Nonce mismatch for SpendSecretRecord"));
+        }
+        let bytes = SimpleAead::decrypt(master_key, &self.encrypted_secret, b"spend_secret")?;
+        if bytes.len() != 32 { return Err(anyhow!("Spend secret wrong length")); }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
     }
 }
 

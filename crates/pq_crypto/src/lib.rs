@@ -325,6 +325,48 @@ pub fn derive_nullifier(
     }
 }
 
+// =============================
+// NF2 (Spend-authority-only) nullifier derivation
+// =============================
+
+/// Derive spend-nullifier key snk = PRF_snk(sk, "snk")
+pub fn derive_spend_nullifier_key(spend_secret: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"prf_snk:v1");
+    h.update(spend_secret);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// PRF_t(snk, rho) used as a trapdoor for the revealed nullifier
+pub fn derive_trapdoor_t(snk: &[u8; 32], rho: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"prf_t:v1");
+    h.update(snk);
+    h.update(rho);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// NF2 = H("orchard2.nf" || cm || rho || t) where t = PRF_t(snk, rho)
+pub fn derive_nf2(
+    note_commitment: &[u8; 32],
+    rho: &[u8; 32],
+    spend_nullifier_key: &[u8; 32],
+) -> [u8; 32] {
+    let t = derive_trapdoor_t(spend_nullifier_key, rho);
+    let mut h = blake3::Hasher::new();
+    h.update(b"orchard2.nf:v1");
+    h.update(note_commitment);
+    h.update(rho);
+    h.update(&t);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
 /// Token for rate limiting and unlinkability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessToken {
