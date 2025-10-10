@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use net_iroh::{BlobKind, Cid, ControlMessage, TachyonNetwork, SyncManifest};
+use node_ext as _node_ext_dep_check;
 use pcd_core::{
     PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier, PcdTransition,
 };
@@ -1002,7 +1003,7 @@ impl TachyonWallet {
         &self,
         spent_inputs: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
         output_commitments: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
-    ) -> Result<node_ext::Transaction> {
+    ) -> Result<_node_ext_dep_check::Transaction> {
         // Anchor and roots from current PCD state
         let state = self
             .pcd_manager
@@ -1071,8 +1072,8 @@ impl TachyonWallet {
         for n in &nullifiers { pcd_hasher.update(n); }
         let pcd_proof = pcd_hasher.finalize().as_bytes().to_vec();
 
-        let tx = node_ext::Transaction {
-            hash: node_ext::TransactionHash(blake3::hash(b"wallet-tx")),
+        let tx = _node_ext_dep_check::Transaction {
+            hash: _node_ext_dep_check::TransactionHash(blake3::hash(b"wallet-tx")),
             nullifiers,
             commitments: output_commitments,
             spent_commitments: spent_inputs,

@@ -5363,6 +5363,7 @@ dependencies = [
  "blake3",
  "hex",
  "net_iroh",
+ "node_ext",
  "pcd_core",
  "pq_crypto",
  "reqwest",

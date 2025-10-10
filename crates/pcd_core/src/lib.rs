@@ -318,7 +318,7 @@ impl PcdStateMachine {
                 bincode::deserialize(&transition.mmr_delta).unwrap_or_else(|_| Vec::new());
             mmr.apply_deltas(&deltas)?;
             if let Some(root) = mmr.root() {
-                new_state.mmr_root = (*root.as_bytes()).try_into().unwrap();
+                new_state.mmr_root = *root.as_bytes();
             }
             // Persist full MMR state into the PCD state for downstream witness updates
             new_state.mmr_bytes = bincode::serialize(&mmr).unwrap_or_default();
@@ -450,6 +450,10 @@ impl PcdStateMachine {
     pub fn history_length(&self) -> usize {
         self.state_history.len()
     }
+}
+
+impl Default for PcdStateMachine {
+    fn default() -> Self { Self::new() }
 }
 
 /// PCD proof verification interface

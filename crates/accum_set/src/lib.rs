@@ -68,6 +68,10 @@ pub struct SetAccumulator {
     root: [u8; 32],
 }
 
+impl Default for SetAccumulator {
+    fn default() -> Self { Self::new() }
+}
+
 impl SetAccumulator {
     /// Create a new empty accumulator
     pub fn new() -> Self {
@@ -206,7 +210,7 @@ fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     }
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
     while level.len() > 1 {
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
             let left = level[i];
@@ -238,7 +242,7 @@ fn build_merkle_path(leaves: &[[u8; 32]], mut index: usize) -> Vec<[u8; 32]> {
         path.push(sibling);
 
         // Build next level
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
             let left = level[i];

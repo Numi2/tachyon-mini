@@ -73,7 +73,7 @@ impl EncryptedNote {
         if self.encrypted_data.len() < AES_NONCE_SIZE {
             return Err(anyhow!("Ciphertext too short"));
         }
-        if &self.encrypted_data[..AES_NONCE_SIZE] != &self.nonce {
+        if self.encrypted_data[..AES_NONCE_SIZE] != self.nonce {
             return Err(anyhow!("Nonce mismatch for EncryptedNote"));
         }
         SimpleAead::decrypt(master_key, &self.encrypted_data, associated_data)
@@ -140,7 +140,7 @@ impl PcdStateRecord {
         if self.encrypted_state.len() < AES_NONCE_SIZE {
             return Err(anyhow!("Ciphertext too short"));
         }
-        if &self.encrypted_state[..AES_NONCE_SIZE] != &self.nonce {
+        if self.encrypted_state[..AES_NONCE_SIZE] != self.nonce {
             return Err(anyhow!("Nonce mismatch for PcdStateRecord"));
         }
         SimpleAead::decrypt(master_key, &self.encrypted_state, associated_data)
@@ -208,7 +208,7 @@ impl WitnessRecord {
         if self.encrypted_witness.len() < AES_NONCE_SIZE {
             return Err(anyhow!("Ciphertext too short"));
         }
-        if &self.encrypted_witness[..AES_NONCE_SIZE] != &self.nonce {
+        if self.encrypted_witness[..AES_NONCE_SIZE] != self.nonce {
             return Err(anyhow!("Nonce mismatch for WitnessRecord"));
         }
         SimpleAead::decrypt(master_key, &self.encrypted_witness, associated_data)
@@ -267,6 +267,7 @@ impl WalletDatabase {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)?;
         lock_file.lock_exclusive()?;
 
@@ -656,7 +657,7 @@ impl OobKeysRecord {
         if self.encrypted_secret.len() < AES_NONCE_SIZE {
             return Err(anyhow!("Ciphertext too short"));
         }
-        if &self.encrypted_secret[..AES_NONCE_SIZE] != &self.nonce {
+        if self.encrypted_secret[..AES_NONCE_SIZE] != self.nonce {
             return Err(anyhow!("Nonce mismatch for OobKeysRecord"));
         }
         let sk = SimpleAead::decrypt(master_key, &self.encrypted_secret, b"oob_keys")?;
@@ -684,7 +685,7 @@ impl SpendSecretRecord {
         if self.encrypted_secret.len() < AES_NONCE_SIZE {
             return Err(anyhow!("Ciphertext too short"));
         }
-        if &self.encrypted_secret[..AES_NONCE_SIZE] != &self.nonce {
+        if self.encrypted_secret[..AES_NONCE_SIZE] != self.nonce {
             return Err(anyhow!("Nonce mismatch for SpendSecretRecord"));
         }
         let bytes = SimpleAead::decrypt(master_key, &self.encrypted_secret, b"spend_secret")?;

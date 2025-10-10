@@ -183,7 +183,7 @@ impl TachyonBlobStore {
         // Read from FsStore if available
         if let Some(fs) = &self.fs_store {
             let bytes = fs.get_bytes(*hash).await?;
-            let data = Bytes::from(bytes);
+            let data = bytes;
             self.cache.write().unwrap().insert(*hash, data.clone());
             return Ok(data);
         }
@@ -551,7 +551,7 @@ impl TachyonNetwork {
                 .map_err(|e| anyhow!(e))?;
             // Return bytes from local store
             let data = fs.get_bytes(blob_ticket.hash()).await?;
-            return Ok(Bytes::from(data));
+            return Ok(data);
         }
         Err(anyhow!("Unsupported ticket format"))
     }
@@ -628,7 +628,7 @@ impl TachyonNetwork {
                 .concatenate()
                 .await
                 .map_err(|e| anyhow!(e))?;
-            return Ok(Bytes::from(out));
+            return Ok(out.into());
         }
 
         Err(anyhow!("Unsupported ticket format"))
@@ -850,9 +850,7 @@ impl ProtocolHandler for ControlProtocol {
             };
             peers.write().unwrap().insert(node_id, conn.clone());
             // handle incoming streams
-            loop {
-                match conn.accept_bi().await {
-                    Ok((mut send, recv)) => {
+            while let Ok((mut send, recv)) = conn.accept_bi().await {
                         let res = read_framed(recv).await;
                         match res.and_then(|buf| {
                             bincode::deserialize::<ControlMessage>(&buf).map_err(|e| anyhow!(e))
@@ -889,13 +887,10 @@ impl ProtocolHandler for ControlProtocol {
                                 }
                             }
                             Err(_err) => {
-                                // Failed to decode control message; drop the stream
-                                break;
+                                // Failed to decode control message; drop the stream and continue
+                                continue;
                             }
                         }
-                    }
-                    Err(_) => break,
-                }
             }
             peers.write().unwrap().remove(&node_id);
             Ok(())

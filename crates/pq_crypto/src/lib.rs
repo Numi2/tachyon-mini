@@ -250,11 +250,7 @@ impl BlindedNullifier {
     pub fn verify(&self, candidate_nullifier: &[u8; 32]) -> bool {
         // Check epoch is current or recent (within 1 epoch)
         let current_epoch = EpochTag::current();
-        let epoch_diff = if current_epoch.epoch > self.epoch_tag.epoch {
-            current_epoch.epoch - self.epoch_tag.epoch
-        } else {
-            self.epoch_tag.epoch - current_epoch.epoch
-        };
+        let epoch_diff = current_epoch.epoch.abs_diff(self.epoch_tag.epoch);
 
         if epoch_diff > 1 {
             return false;

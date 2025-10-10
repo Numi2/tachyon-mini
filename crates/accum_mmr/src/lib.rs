@@ -199,7 +199,15 @@ pub struct MmrAccumulator {
     size: u64,
 }
 
+impl Default for MmrAccumulator {
+    fn default() -> Self { Self::new() }
+}
+
 impl MmrAccumulator {
+    /// Provide a default empty accumulator
+    pub fn default_impl() -> Self {
+        Self::new()
+    }
     /// Create a new empty MMR accumulator
     pub fn new() -> Self {
         Self {
@@ -302,11 +310,10 @@ impl MmrAccumulator {
         if position >= self.size {
             return Err(anyhow!("Position out of bounds"));
         }
-        let element = self
+        let element = *self
             .nodes
             .get(&position)
-            .ok_or_else(|| anyhow!("Element not found"))?
-            .clone();
+            .ok_or_else(|| anyhow!("Element not found"))?;
 
         // Generate siblings bottom-up until reaching a peak (i.e., no parent present)
         let mut siblings = Vec::new();
@@ -332,7 +339,7 @@ impl MmrAccumulator {
             peaks: self
                 .peaks
                 .iter()
-                .map(|&pos| self.nodes.get(&pos).unwrap().clone())
+                .map(|&pos| *self.nodes.get(&pos).unwrap())
                 .collect(),
         })
     }
@@ -374,6 +381,10 @@ pub struct TachygramAccumulator {
     mmr: MmrAccumulator,
     /// Map from element bytes to MMR positions for membership proving
     index: HashMap<[u8; 32], Vec<u64>>, // an element may appear multiple times
+}
+
+impl Default for TachygramAccumulator {
+    fn default() -> Self { Self::new() }
 }
 
 impl TachygramAccumulator {

@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use reqwest::Client;
 
 /// Configuration for header sync
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HeaderSyncConfig {
     /// Network configuration
     pub network_config: NetworkConfig,
@@ -42,19 +42,8 @@ pub struct HeaderSyncConfig {
     pub pow_config: PowConfig,
 }
 
-impl Default for HeaderSyncConfig {
-    fn default() -> Self {
-        Self {
-            network_config: NetworkConfig::default(),
-            sync_config: SyncConfig::default(),
-            security_config: SecurityConfig::default(),
-            pow_config: PowConfig::default(),
-        }
-    }
-}
-
 /// Network configuration for header sync
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NetworkConfig {
     /// Data directory for header storage
     pub data_dir: String,
@@ -64,18 +53,8 @@ pub struct NetworkConfig {
     pub max_sync_peers: usize,
 }
 
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            data_dir: "./header_data".to_string(),
-            checkpoint_servers: vec!["https://checkpoint.tachyon.network".to_string()],
-            max_sync_peers: 10,
-        }
-    }
-}
-
 /// Sync configuration parameters
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncConfig {
     /// Target sync latency in milliseconds
     pub target_latency_ms: u64,
@@ -87,19 +66,8 @@ pub struct SyncConfig {
     pub checkpoint_interval: u64,
 }
 
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self {
-            target_latency_ms: 1000,
-            max_batch_size: 1000,
-            verification_timeout_ms: 5000,
-            checkpoint_interval: 1000,
-        }
-    }
-}
-
 /// Security configuration for NiPoPoW
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SecurityConfig {
     /// Security parameter k for NiPoPoW
     pub security_parameter_k: u32,
@@ -113,20 +81,8 @@ pub struct SecurityConfig {
     pub trusted_checkpoint_keys: Vec<Vec<u8>>, // raw pk bytes
 }
 
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            security_parameter_k: 10,
-            max_chain_quality: 0.51,   // Assume < 51% attack
-            min_honest_majority: 0.51, // Assume > 51% honest
-            min_checkpoint_signatures: 1,
-            trusted_checkpoint_keys: Vec::new(),
-        }
-    }
-}
-
 /// Proof-of-Work configuration, including optional Equihash verification
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PowConfig {
     /// If true, skip all PoW validation (useful for custom testnets)
     pub disable_pow_validation: bool,
@@ -136,17 +92,6 @@ pub struct PowConfig {
     pub equihash_n: u32,
     /// Equihash parameter k (e.g., 9 for Zcash main/test)
     pub equihash_k: u32,
-}
-
-impl Default for PowConfig {
-    fn default() -> Self {
-        Self {
-            disable_pow_validation: false,
-            validate_equihash_solution: false,
-            equihash_n: 200,
-            equihash_k: 9,
-        }
-    }
 }
 
 /// Header chain representation
@@ -243,11 +188,9 @@ impl HeaderChain {
         let target = compact_to_target(header.bits);
         if !cmp256_be(header.hash.as_bytes(), &target) { return false; }
         // Optionally validate Equihash solution parameters (n,k)
-        if self.pow.validate_equihash_solution {
-            if !verify_equihash_solution(header, self.pow.equihash_n, self.pow.equihash_k) {
-                return false;
-            }
-        }
+        if self.pow.validate_equihash_solution
+            && !verify_equihash_solution(header, self.pow.equihash_n, self.pow.equihash_k)
+        { return false; }
         true
     }
 
@@ -334,13 +277,13 @@ fn compact_to_target(bits: u32) -> [u8; 32] {
     let mut target = [0u8; 32];
     if exponent <= 3 {
         let shift = 3 - exponent;
-        let val = (mantissa >> (8 * shift)) as u32;
-        let be = val.to_be_bytes();
+        let val = mantissa >> (8 * shift);
+        let be = (val as u32).to_be_bytes();
         target[28..32].copy_from_slice(&be);
     } else {
         let byte_index = (exponent as usize) - 3;
         if byte_index < 32 {
-            let be = (mantissa as u32).to_be_bytes();
+        let be = mantissa.to_be_bytes();
             let start = 32 - byte_index - 4;
             if start < 32 { target[start..start + 4].copy_from_slice(&be); }
         }
@@ -433,7 +376,7 @@ impl BlockHeader {
     pub fn meets_difficulty(&self) -> bool {
         // Compute target from compact bits (Bitcoin/Zcash style)
         let target = compact_to_target(self.bits);
-        let hash_be = self.hash.0.as_bytes().clone();
+        let hash_be = *self.hash.0.as_bytes();
         // Compare 256-bit values as big-endian byte arrays
         cmp256_be(hash_be.as_ref(), &target)
     }

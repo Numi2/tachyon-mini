@@ -45,7 +45,7 @@ fn hash_pair(choice: HashChoice, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] 
             h_l.update(left);
             let mut xof_l = h_l.finalize_xof();
             let mut wide_l = [0u8; 64];
-            xof_l.read(&mut wide_l).unwrap();
+            xof_l.read_exact(&mut wide_l).unwrap();
             let lf = Fr::from_uniform_bytes(&wide_l);
 
             let mut h_r = Blake3Hasher::new();
@@ -53,7 +53,7 @@ fn hash_pair(choice: HashChoice, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] 
             h_r.update(right);
             let mut xof_r = h_r.finalize_xof();
             let mut wide_r = [0u8; 64];
-            xof_r.read(&mut wide_r).unwrap();
+            xof_r.read_exact(&mut wide_r).unwrap();
             let rf = Fr::from_uniform_bytes(&wide_r);
             let digest = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
                 .hash([lf, rf]);
@@ -129,7 +129,7 @@ impl QerkleBuilder {
         let mut level_nodes: Vec<[u8; 32]> = leaves.to_vec();
         let mut level: u32 = 0;
         while level_nodes.len() > 1 {
-            let mut next = Vec::with_capacity((level_nodes.len() + 1) / 2);
+            let mut next = Vec::with_capacity(level_nodes.len().div_ceil(2));
             for i in (0..level_nodes.len()).step_by(2) {
                 let left = level_nodes[i];
                 let right = if i + 1 < level_nodes.len() { level_nodes[i + 1] } else { left };
@@ -153,7 +153,7 @@ impl QerkleBuilder {
         let mut level: u32 = 0;
         while levels.last().unwrap().len() > 1 {
             let cur = levels.last().unwrap();
-            let mut next = Vec::with_capacity((cur.len() + 1) / 2);
+            let mut next = Vec::with_capacity(cur.len().div_ceil(2));
             let mut level_choices: Vec<HashChoice> = Vec::with_capacity(next.capacity());
             for i in (0..cur.len()).step_by(2) {
                 let left = cur[i];

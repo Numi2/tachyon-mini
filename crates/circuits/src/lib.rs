@@ -61,7 +61,7 @@ pub fn compute_transition_digest_bytes(
         hasher.update(bytes);
         let mut xof = hasher.finalize_xof();
         let mut wide = [0u8; 64];
-        xof.read(&mut wide).unwrap();
+        xof.read_exact(&mut wide).unwrap();
         Fr::from_uniform_bytes(&wide)
     }
     let prev_fr = to_fr(prev_state);
@@ -536,7 +536,7 @@ impl PcdCore {
             hasher.update(bytes);
             let mut xof = hasher.finalize_xof();
             let mut wide = [0u8; 64];
-            xof.read(&mut wide).unwrap();
+            xof.read_exact(&mut wide).unwrap();
             Fr::from_uniform_bytes(&wide)
         }
 
@@ -564,11 +564,11 @@ impl PcdCore {
         };
 
         // Prepare instance columns (prev, new, mmr, nul, anchor)
-        let inst_prev = vec![prev_fr];
-        let inst_new = vec![provided_new_fr];
-        let inst_mmr = vec![mmr_fr];
-        let inst_nul = vec![nul_fr];
-        let inst_anchor = vec![anchor_fr];
+        let inst_prev = [prev_fr];
+        let inst_new = [provided_new_fr];
+        let inst_mmr = [mmr_fr];
+        let inst_nul = [nul_fr];
+        let inst_anchor = [anchor_fr];
 
         // Build proof
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
@@ -606,7 +606,7 @@ impl PcdCore {
             hasher.update(bytes);
             let mut xof = hasher.finalize_xof();
             let mut wide = [0u8; 64];
-            xof.read(&mut wide).unwrap();
+            xof.read_exact(&mut wide).unwrap();
             Fr::from_uniform_bytes(&wide)
         }
 
@@ -617,11 +617,11 @@ impl PcdCore {
         let anchor_fr = Fr::from(anchor_height);
 
         // Prepare instance columns: prev_state, new_state, mmr_root, nullifier_root, anchor (row 0 only)
-        let inst_prev = vec![prev_fr];
-        let inst_new = vec![new_fr];
-        let inst_mmr = vec![mmr_fr];
-        let inst_nul = vec![nul_fr];
-        let inst_anchor = vec![anchor_fr];
+        let inst_prev = [prev_fr];
+        let inst_new = [new_fr];
+        let inst_mmr = [mmr_fr];
+        let inst_nul = [nul_fr];
+        let inst_anchor = [anchor_fr];
 
         let mut transcript =
             Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
@@ -1009,6 +1009,10 @@ pub mod performance {
         }
     }
 
+    impl Default for PerformanceBenchmarks {
+        fn default() -> Self { Self::new() }
+    }
+
     #[derive(Debug)]
     pub struct PerformanceReport {
         pub average_proving_time: Duration,
@@ -1020,6 +1024,7 @@ pub mod performance {
 }
 
 /// Recursive proof aggregation for PCD
+#[derive(Clone, Debug)]
 pub struct PcdAggregator {
     /// Current aggregated proof state
     pub state: Vec<u8>,
@@ -1050,6 +1055,10 @@ impl PcdAggregator {
     pub fn finalize(&self) -> Result<Vec<u8>> {
         Ok(self.state.clone())
     }
+}
+
+impl Default for PcdAggregator {
+    fn default() -> Self { Self::new() }
 }
 
 /// Aggregate Orchard-like action proofs into a single 32-byte commitment using hash chaining
