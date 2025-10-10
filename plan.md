@@ -1,5 +1,4 @@
 
-end-to-end architecture for a Tachyon-style Zcash system in Rust.
 
 	1.	Wallet (client, PCD machine)
 – Holds notes, secrets, proofs.
@@ -47,7 +46,7 @@ Key Technology Choices
 	•	Accumulators / state: MMR-based or similar append-only accumulator, optimized for batched updates and proof deltas.
 	•	Storage: hybrid – small blobs inline in embedded store; large blobs stored as files with outboard tree. (iroh-blobs follows this model)  ￼
 	•	Async runtime: Tokio (compatible with iroh).
-	•	PQ cryptography: use a standard KEM like Kyber (via OQS or equivalent Rust wrapper) for out-of-band payload confidentiality.
+	•	PQ cryptography: use a standard KEM like Kyber for out-of-band payload confidentiality.
 	•	Serialization / RPC control: use custom framed messages (e.g. via Prost) over an iroh stream; blobs handled by the content-addressed layer (not RPC).
 	•	Concurrency model / IO model: isolate blocking IO (e.g. file writes, DB) into worker threads, async facade to main runtime (pattern used in iroh).  ￼
 
