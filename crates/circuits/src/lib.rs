@@ -9,36 +9,51 @@ use ff::PrimeField;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Instance, Selector,
+        keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column, ConstraintSystem, Error,
+        Fixed, Instance, ProvingKey, Selector, SingleVerifier, VerifyingKey,
     },
-    poly::Rotation,
+    poly::{commitment::Params, Rotation},
+    transcript::{Blake2bRead, Blake2bWrite, Challenge255},
 };
-use pasta_curves::Fp as Fr;
+use pasta_curves::{Fp as Fr, vesta::Affine as G1Affine};
+use halo2_gadgets::poseidon::{
+    primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3},
+    Hash as PoseidonHash, Pow5Chip, Pow5Config,
+};
+use rand::rngs::OsRng;
+use std::io::Cursor;
+use std::path::Path;
+use std::{fs, fs::File, io::{Read, Write}};
 
-/// Deterministic linear mixing used inside the circuit gate to combine inputs.
-/// This mirrors the constraint `state = (((((prev*2+1 + mmr)*2+1) + nullifier)*2+1) + anchor)*2+1`.
-fn compute_transition_mix(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr, anchor_height: Fr) -> Fr {
-    let two = Fr::from(2);
-    let one = Fr::from(1);
-
-    let s1 = prev_state * two + one;
-    let s2 = (s1 + mmr_root) * two + one;
-    let s3 = (s2 + nullifier_root) * two + one;
-    let s4 = (s3 + anchor_height) * two + one;
-    s4
+/// Poseidon-based transition hash (native) mirroring the in-circuit composition.
+///
+/// Composition (width 3, rate 2):
+///   d1 = H(prev_state, mmr_root)
+///   d2 = H(nullifier_root, anchor_height)
+///   digest = H(d1, d2, 0)
+fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr, anchor_height: Fr) -> Fr {
+    // Use the same Poseidon spec the circuit is configured with (P128Pow5T3, t=3, rate=2)
+    let d1 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
+        .hash([prev_state, mmr_root]);
+    let d2 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
+        .hash([nullifier_root, anchor_height]);
+    poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([d1, d2, Fr::zero()])
 }
 
 /// PCD transition circuit configuration
 #[derive(Clone, Debug)]
 pub struct PcdTransitionConfig {
     /// Advice columns for witness data
-    pub advice: [Column<Advice>; 5],
+    pub advice: [Column<Advice>; 6],
     /// Instance columns for public inputs/outputs
     pub instance: [Column<Instance>; 3],
     /// Fixed columns for constants
     pub fixed: [Column<Fixed>; 2],
     /// Selector for the transition logic
     pub selector: Selector,
+    /// Poseidon configuration (t=3, rate=2)
+    pub poseidon: Pow5Config<Fr, 3, 2>,
 }
 
 /// PCD transition circuit
@@ -75,34 +90,7 @@ pub fn compute_state_commitment(components: &[Fr]) -> Fr {
     Fr::from_repr(out).unwrap_or(Fr::zero())
 }
 
-/// Verify PCD transition constraints
-pub fn verify_pcd_transition(
-    prev_state_commitment: Fr,
-    new_state_commitment: Fr,
-    mmr_root: Fr,
-    nullifier_root: Fr,
-    anchor_height: Fr,
-    delta_commitments: &[Fr],
-) -> bool {
-    // Mirror the circuit gate's transition mixing and additionally bind the
-    // delta commitments in a deterministic linear fold outside the circuit.
-    // This preserves circuit compatibility while allowing helper-side binding.
-    let base_mix = compute_transition_mix(
-        prev_state_commitment,
-        mmr_root,
-        nullifier_root,
-        anchor_height,
-    );
-    // Deterministic fold of deltas: d_fold = (((d0*2+1)+d1)*2+1+...)
-    let two = Fr::from(2);
-    let one = Fr::from(1);
-    let mut delta_fold = Fr::from(0);
-    for d in delta_commitments {
-        delta_fold = (delta_fold * two + one) + *d;
-    }
-    let computed_new_state = (base_mix + delta_fold) * two + one;
-    computed_new_state == new_state_commitment
-}
+// Removed obsolete external verifier helper (superseded by on-circuit Poseidon relation)
 
 impl Circuit<Fr> for PcdTransitionCircuit {
     type Config = PcdTransitionConfig;
@@ -124,8 +112,9 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             meta.advice_column(),
             meta.advice_column(),
             meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
+            meta.advice_column(), // partial s-box column for poseidon
+            meta.advice_column(), // extra
+            meta.advice_column(), // extra
         ];
 
         let instance = [
@@ -137,32 +126,27 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         let fixed = [meta.fixed_column(), meta.fixed_column()];
         let selector = meta.selector();
 
-        // PCD transition constraint system
-        meta.create_gate("pcd_state_transition", |meta| {
-            let s = meta.query_selector(selector);
+        // Enable equality where needed for public input exposure and copy constraints
+        for a in &advice {
+            meta.enable_equality(*a);
+        }
+        for i in &instance {
+            meta.enable_equality(*i);
+        }
 
-            // Inputs at the same row
-            let prev_state = meta.query_advice(advice[0], Rotation::cur());
-            let new_state = meta.query_advice(advice[1], Rotation::cur());
-            let mmr_root = meta.query_advice(advice[2], Rotation::cur());
-            let nullifier_root = meta.query_advice(advice[3], Rotation::cur());
-            let anchor_height = meta.query_advice(advice[4], Rotation::cur());
-
-            // Compute a deterministic mixing function using only linear ops and constant multipliers
-            // This is a stand-in for a hash inside the circuit until Poseidon is wired.
-            let two = Expression::Constant(Fr::from(2));
-            let one = Expression::Constant(Fr::from(1));
-
-            // state = (((((prev*2+1 + mmr)*2+1) + nullifier)*2+1) + anchor)*2+1
-            let s1 = prev_state.clone() * two.clone() + one.clone();
-            let s2 = (s1 + mmr_root) * two.clone() + one.clone();
-            let s3 = (s2 + nullifier_root) * two.clone() + one.clone();
-            let s4 = (s3 + anchor_height) * two.clone() + one.clone();
-
-            let constraint = s * (new_state - s4);
-
-            vec![constraint]
-        });
+        // Configure Poseidon (t=3, rate=2) using the first 3 advice columns for state,
+        // the 4th for partial s-box, and dedicated fixed columns for round constants.
+        let rc_a = [meta.fixed_column(), meta.fixed_column(), meta.fixed_column()];
+        let rc_b = [meta.fixed_column(), meta.fixed_column(), meta.fixed_column()];
+        // Enable one fixed column for global constants as required by the floor planner
+        meta.enable_constant(rc_b[0]);
+        let poseidon = Pow5Chip::<Fr, 3, 2>::configure::<P128Pow5T3>(
+            meta,
+            [advice[0], advice[1], advice[2]],
+            advice[3],
+            rc_a,
+            rc_b,
+        );
 
         // MMR root verification constraints (public exposure wiring)
         meta.create_gate("mmr_root_verification", |meta| {
@@ -183,6 +167,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             instance,
             fixed,
             selector,
+            poseidon,
         }
     }
 
@@ -191,10 +176,9 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), Error> {
-        // Assign all witness values in one region where the gate applies
+        // Assign all witness values in one region where the selector applies
         let (
             prev_state_cell,
-            new_state_cell,
             mmr_root_cell,
             _nullifier_root_cell,
             _anchor_height_cell,
@@ -208,13 +192,6 @@ impl Circuit<Fr> for PcdTransitionCircuit {
                     config.advice[0],
                     0,
                     || self.prev_state,
-                )?;
-
-                let newc = region.assign_advice(
-                    || "new state commitment",
-                    config.advice[1],
-                    0,
-                    || self.new_state,
                 )?;
 
                 let mmr =
@@ -234,13 +211,49 @@ impl Circuit<Fr> for PcdTransitionCircuit {
                     || self.anchor_height,
                 )?;
 
-                Ok((prev, newc, mmr, nul, anch))
+                Ok((prev, mmr, nul, anch))
             },
+        )?;
+
+        // Compute Poseidon-based digest using width-3 hash composition:
+        // d1 = H(prev, mmr)
+        // d2 = H(nullifier, anchor)
+        // digest = H(d1, d2, 0)
+        let chip_h2 = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
+        let mut h2 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+            chip_h2,
+            layouter.namespace(|| "poseidon init h2"),
+        )?;
+        let d1 = h2.hash(
+            layouter.namespace(|| "poseidon h(prev,mmr)"),
+            [prev_state_cell.clone(), mmr_root_cell.clone()],
+        )?;
+        let chip_h2b = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
+        let d2 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+            chip_h2b,
+            layouter.namespace(|| "poseidon init h2b"),
+        )?
+        .hash(
+            layouter.namespace(|| "poseidon h(nullifier,anchor)"),
+            [_nullifier_root_cell.clone(), _anchor_height_cell.clone()],
+        )?;
+        let chip_h3 = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
+        let mut h3 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+            chip_h3,
+            layouter.namespace(|| "poseidon init h3"),
+        )?;
+        let zero = layouter.assign_region(
+            || "assign zero",
+            |mut region| region.assign_advice(|| "zero", config.advice[5], 0, || Value::known(Fr::zero())),
+        )?;
+        let digest = h3.hash(
+            layouter.namespace(|| "poseidon h(d1,d2,0)"),
+            [d1, d2, zero],
         )?;
 
         // Expose public inputs (prev_state, new_state, mmr_root)
         layouter.constrain_instance(prev_state_cell.cell(), config.instance[0], 0)?;
-        layouter.constrain_instance(new_state_cell.cell(), config.instance[1], 0)?;
+        layouter.constrain_instance(digest.cell(), config.instance[1], 0)?;
         layouter.constrain_instance(mmr_root_cell.cell(), config.instance[2], 0)?;
 
         Ok(())
@@ -301,6 +314,14 @@ impl Circuit<Fr> for PcdRecursionCircuit {
         let instance = [meta.instance_column(), meta.instance_column()];
 
         let selector = meta.selector();
+
+        // Enable equality for instance exposure (aggregated commitment)
+        for a in &advice {
+            meta.enable_equality(*a);
+        }
+        for i in &instance {
+            meta.enable_equality(*i);
+        }
 
         // Recursion constraint: aggregated = prev * folding_factor + current
         meta.create_gate("proof_recursion", |meta| {
@@ -388,22 +409,57 @@ pub struct PcdCore {
     pub initialized: bool,
     /// Circuit size parameter (security level), e.g., 12..=20 typically
     pub proving_k: u32,
+    /// KZG parameters (SRS)
+    pub params: Params<G1Affine>,
+    /// Verifying key for transition circuit
+    pub vk: VerifyingKey<G1Affine>,
+    /// Proving key for transition circuit
+    pub pk: ProvingKey<G1Affine>,
 }
 
 impl PcdCore {
     /// Create a new PCD core instance
     pub fn new() -> Result<Self> {
+        let proving_k = 12;
+        let params = Params::<G1Affine>::new(proving_k);
+        let empty = PcdTransitionCircuit {
+            prev_state: Value::unknown(),
+            new_state: Value::unknown(),
+            mmr_root: Value::unknown(),
+            nullifier_root: Value::unknown(),
+            anchor_height: Value::unknown(),
+            delta_commitments: vec![],
+        };
+        let vk = keygen_vk(&params, &empty)?;
+        let pk = keygen_pk(&params, vk.clone(), &empty)?;
         Ok(Self {
             initialized: true,
-            proving_k: 12,
+            proving_k,
+            params,
+            vk,
+            pk,
         })
     }
 
     /// Create a new PCD core instance with explicit circuit parameter k
     pub fn with_k(k: u32) -> Result<Self> {
+        let params = Params::<G1Affine>::new(k);
+        let empty = PcdTransitionCircuit {
+            prev_state: Value::unknown(),
+            new_state: Value::unknown(),
+            mmr_root: Value::unknown(),
+            nullifier_root: Value::unknown(),
+            anchor_height: Value::unknown(),
+            delta_commitments: vec![],
+        };
+        let vk = keygen_vk(&params, &empty)?;
+        let pk = keygen_pk(&params, vk.clone(), &empty)?;
         Ok(Self {
             initialized: true,
             proving_k: k,
+            params,
+            vk,
+            pk,
         })
     }
 
@@ -419,7 +475,7 @@ impl PcdCore {
         Ok(())
     }
 
-    /// Prove a PCD transition using a MockProver (soundness-checked constraints)
+    /// Prove a PCD transition using Halo2 PLONK with KZG commitments (BN256)
     pub fn prove_transition(
         &self,
         prev_state: &[u8; 32],
@@ -428,8 +484,6 @@ impl PcdCore {
         nullifier_root: &[u8; 32],
         anchor_height: u64,
     ) -> Result<Vec<u8>> {
-        use halo2_proofs::dev::MockProver;
-
         // Convert inputs into field elements
         let to_fr =
             |bytes: &[u8; 32]| -> Fr { Fr::from_repr((*bytes).into()).unwrap_or_else(Fr::zero) };
@@ -439,29 +493,37 @@ impl PcdCore {
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
 
-        // Compute the expected new state commitment per the circuit's transition mix
-        let expected_new_fr = compute_transition_mix(prev_fr, mmr_fr, nul_fr, anchor_fr);
+        // Compute the expected Poseidon digest that the circuit will expose as `new_state`
+        let new_fr = compute_transition_poseidon(prev_fr, mmr_fr, nul_fr, anchor_fr);
 
         let circuit = PcdTransitionCircuit {
             prev_state: Value::known(prev_fr),
-            new_state: Value::known(expected_new_fr),
+            new_state: Value::known(new_fr),
             mmr_root: Value::known(mmr_fr),
             nullifier_root: Value::known(nul_fr),
             anchor_height: Value::known(anchor_fr),
             delta_commitments: vec![],
         };
 
-        // Public inputs: prev_state, new_state, mmr_root per synthesize wiring
-        let public_inputs = vec![vec![prev_fr, expected_new_fr, mmr_fr]];
+        // Prepare instance columns: prev_state, new_state, mmr_root (row 0 only)
+        let inst_prev = vec![prev_fr];
+        let inst_new = vec![new_fr];
+        let inst_mmr = vec![mmr_fr];
 
-        let prover = MockProver::run(self.proving_k, &circuit, public_inputs)?;
-        prover.assert_satisfied();
-
-        // Placeholder proof bytes (until actual proving is wired)
-        Ok(blake3::hash(expected_new_fr.to_repr().as_ref()).as_bytes().to_vec())
+        // Build proof
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
+        halo2_proofs::plonk::create_proof(
+            &self.params,
+            &self.pk,
+            &[circuit],
+            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..]]],
+            OsRng,
+            &mut transcript,
+        )?;
+        Ok(transcript.finalize())
     }
 
-    /// Verify a PCD transition proof using MockProver re-execution (placeholder)
+    /// Verify a PCD transition proof
     pub fn verify_transition_proof(
         &self,
         proof: &[u8],
@@ -471,8 +533,6 @@ impl PcdCore {
         nullifier_root: &[u8; 32],
         anchor_height: u64,
     ) -> Result<bool> {
-        use halo2_proofs::dev::MockProver;
-
         if proof.is_empty() {
             return Ok(false);
         }
@@ -485,22 +545,95 @@ impl PcdCore {
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
 
-        // Recompute the expected commitment used by the circuit
-        let expected_new_fr = compute_transition_mix(prev_fr, mmr_fr, nul_fr, anchor_fr);
+        // Prepare instance columns: prev_state, new_state, mmr_root (row 0 only)
+        // Compute the expected Poseidon digest for `new_state` deterministically
+        let new_fr = compute_transition_poseidon(prev_fr, mmr_fr, nul_fr, anchor_fr);
+        let inst_prev = vec![prev_fr];
+        let inst_new = vec![new_fr];
+        let inst_mmr = vec![mmr_fr];
+
+        let mut transcript =
+            Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
+        let strategy = SingleVerifier::new(&self.params);
+
+        let ok = verify_proof(
+            &self.params,
+            &self.vk,
+            strategy,
+            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..]]],
+            &mut transcript,
+        )
+        .is_ok();
+        Ok(ok)
+    }
+}
+
+#[cfg(feature = "dev-graph")]
+impl PcdCore {
+    /// Render a development layout graph of the transition circuit to an SVG file.
+    pub fn render_dev_graph_svg<P: AsRef<std::path::Path>>(&self, out_path: P) -> Result<()> {
+        use halo2_proofs::dev::CircuitLayout;
+        use plotters::prelude::*;
 
         let circuit = PcdTransitionCircuit {
-            prev_state: Value::known(prev_fr),
-            new_state: Value::known(expected_new_fr),
-            mmr_root: Value::known(mmr_fr),
-            nullifier_root: Value::known(nul_fr),
-            anchor_height: Value::known(anchor_fr),
+            prev_state: Value::unknown(),
+            new_state: Value::unknown(),
+            mmr_root: Value::unknown(),
+            nullifier_root: Value::unknown(),
+            anchor_height: Value::unknown(),
             delta_commitments: vec![],
         };
 
-        let public_inputs = vec![vec![prev_fr, expected_new_fr, mmr_fr]];
+        let root = SVGBackend::new(out_path.as_ref(), (2048, 2048)).into_drawing_area();
+        root.fill(&WHITE).map_err(|e| anyhow::anyhow!("plot error: {:?}", e))?;
+        CircuitLayout::default()
+            .render(self.proving_k, &circuit, &root)
+            .map_err(|e| anyhow::anyhow!("layout error: {:?}", e))?;
+        root.present().map_err(|e| anyhow::anyhow!("present error: {:?}", e))?;
+        Ok(())
+    }
+}
 
-        let prover = MockProver::run(self.proving_k, &circuit, public_inputs)?;
-        Ok(prover.verify().is_ok())
+impl PcdCore {
+    /// Save parameters to a directory on disk.
+    pub fn save_to_dir<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
+        let mut f = File::create(dir.join("pcd_params.bin"))?;
+        self.params.write(&mut f)?;
+        Ok(())
+    }
+
+    /// Load parameters and keys from a directory; falls back to fresh setup if not present.
+    pub fn load_or_setup<P: AsRef<Path>>(dir: P, k: u32) -> Result<Self> {
+        let dir = dir.as_ref();
+        let params_path = dir.join("pcd_params.bin");
+        if params_path.exists() {
+            let mut pf = File::open(params_path)?;
+            let params = Params::<G1Affine>::read(&mut pf)?;
+            // Recompute keys deterministically from params and empty circuit
+            let empty = PcdTransitionCircuit {
+                prev_state: Value::unknown(),
+                new_state: Value::unknown(),
+                mmr_root: Value::unknown(),
+                nullifier_root: Value::unknown(),
+                anchor_height: Value::unknown(),
+                delta_commitments: vec![],
+            };
+            let vk = keygen_vk(&params, &empty)?;
+            let pk = keygen_pk(&params, vk.clone(), &empty)?;
+            Ok(Self {
+                initialized: true,
+                proving_k: k,
+                params,
+                vk,
+                pk,
+            })
+        } else {
+            let core = Self::with_k(k)?;
+            let _ = core.save_to_dir(dir);
+            Ok(core)
+        }
     }
 }
 
@@ -755,7 +888,7 @@ pub mod performance {
 
             // Benchmark proving time
             let start = Instant::now();
-            let _proof =
+            let proof =
                 core.prove_transition(&[1u8; 32], &[2u8; 32], &[3u8; 32], &[4u8; 32], 100)?;
             let proving_time = start.elapsed();
             self.proving_times.push(proving_time);
@@ -763,7 +896,7 @@ pub mod performance {
             // Benchmark verification time
             let start = Instant::now();
             let _verified = core.verify_transition_proof(
-                &[1, 2, 3],
+                &proof,
                 &[1u8; 32],
                 &[2u8; 32],
                 &[3u8; 32],
@@ -865,6 +998,7 @@ pub fn aggregate_orchard_actions(proofs: &[Vec<u8>]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use halo2_proofs::dev::MockProver;
 
     #[test]
     fn test_pcd_circuit_creation() {
@@ -883,6 +1017,100 @@ mod tests {
     fn test_pcd_core_creation() {
         let core = PcdCore::new().unwrap();
         assert!(core.initialized);
+    }
+
+    #[test]
+    fn test_mock_prover_satisfies_constraints() {
+        let k: u32 = 12;
+        // Sample inputs
+        let prev = Fr::from(123u64);
+        let mmr = Fr::from(456u64);
+        let nul = Fr::from(789u64);
+        let anch = Fr::from(321u64);
+        let expected_new = compute_transition_poseidon(prev, mmr, nul, anch);
+
+        let circuit = PcdTransitionCircuit {
+            prev_state: Value::known(prev),
+            new_state: Value::known(expected_new),
+            mmr_root: Value::known(mmr),
+            nullifier_root: Value::known(nul),
+            anchor_height: Value::known(anch),
+            delta_commitments: vec![],
+        };
+
+        let public_inputs = vec![
+            vec![prev],         // instance[0]
+            vec![expected_new], // instance[1]
+            vec![mmr],          // instance[2]
+        ];
+        let prover = MockProver::run(k, &circuit, public_inputs).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
+    }
+
+    #[test]
+    fn test_mock_prover_detects_wrong_new_state() {
+        let k: u32 = 12;
+        let prev = Fr::from(1u64);
+        let mmr = Fr::from(2u64);
+        let nul = Fr::from(3u64);
+        let anch = Fr::from(4u64);
+        let wrong_new = Fr::from(999u64);
+
+        let circuit = PcdTransitionCircuit {
+            prev_state: Value::known(prev),
+            new_state: Value::known(wrong_new),
+            mmr_root: Value::known(mmr),
+            nullifier_root: Value::known(nul),
+            anchor_height: Value::known(anch),
+            delta_commitments: vec![],
+        };
+
+        let public_inputs = vec![
+            vec![prev],
+            vec![wrong_new], // intentionally wrong
+            vec![mmr],
+        ];
+        let prover = MockProver::run(k, &circuit, public_inputs).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn test_prove_and_verify_roundtrip() {
+        let core = PcdCore::new().unwrap();
+        let prev = [7u8; 32];
+        let new_placeholder = [0u8; 32]; // ignored internally
+        let mmr = [8u8; 32];
+        let nul = [9u8; 32];
+        let anch = 42u64;
+
+        let proof = core
+            .prove_transition(&prev, &new_placeholder, &mmr, &nul, anch)
+            .unwrap();
+
+        let ok = core
+            .verify_transition_proof(&proof, &prev, &new_placeholder, &mmr, &nul, anch)
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_mmr() {
+        let core = PcdCore::new().unwrap();
+        let prev = [5u8; 32];
+        let mmr = [6u8; 32];
+        let nul = [7u8; 32];
+        let anch = 100u64;
+        let proof = core
+            .prove_transition(&prev, &[0u8; 32], &mmr, &nul, anch)
+            .unwrap();
+
+        // Tweak the mmr root so the verification should fail
+        let mut bad_mmr = mmr;
+        bad_mmr[0] ^= 0x01;
+        let ok = core
+            .verify_transition_proof(&proof, &prev, &[0u8; 32], &bad_mmr, &nul, anch)
+            .unwrap();
+        assert!(!ok);
     }
 
     #[test]

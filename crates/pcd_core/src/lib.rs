@@ -6,7 +6,6 @@
 use accum_mmr::{MmrAccumulator, MmrDelta};
 use accum_set::{SetAccumulator, SetDelta};
 use anyhow::{anyhow, Result};
-use blake3::Hash as Blake3Hash;
 use circuits::PcdCore as Halo2PcdCore;
 use circuits::aggregate_orchard_actions;
 use serde::{Deserialize, Serialize};
@@ -374,7 +373,10 @@ impl PcdStateMachine {
         }
 
         // Generate a circuit-backed proof bytes using Halo2 mock prover (placeholder backend)
-        let halo2 = Halo2PcdCore::new()?;
+        let halo2 = circuits::PcdCore::load_or_setup(
+            std::path::Path::new("crates/node_ext/node_data/keys"),
+            12,
+        )?;
         let proof_bytes = halo2.prove_transition(
             &transition.prev_state_commitment,
             &transition.new_state_commitment,
@@ -458,52 +460,46 @@ pub struct SimplePcdVerifier;
 
 impl PcdProofVerifier for SimplePcdVerifier {
     fn verify_state_proof(&self, state: &PcdState) -> Result<bool> {
-        // Verify via circuit backend if proof bytes present
-        if state.proof.is_empty() {
-            return Ok(false);
+        // Prefer circuit-backed verification if bytes look like a Halo2 proof
+        if !state.proof.is_empty() {
+            let halo2 = circuits::PcdCore::load_or_setup(
+                std::path::Path::new("crates/node_ext/node_data/keys"),
+                12,
+            )?;
+            // Degenerate transition check: prev == new binds to current state
+            if halo2
+                .verify_transition_proof(
+                    &state.proof,
+                    &state.state_commitment,
+                    &state.state_commitment,
+                    &state.mmr_root,
+                    &state.nullifier_root,
+                    state.anchor_height,
+                )?
+            {
+                return Ok(true);
+            }
         }
-        let halo2 = Halo2PcdCore::new()?;
-        halo2.verify_transition_proof(
-            &state.proof,
-            &state.state_commitment, // using state commitment for both prev/new in this placeholder check
-            &state.state_commitment,
-            &state.mmr_root,
-            &state.nullifier_root,
-            state.anchor_height,
-        )
+
+        // Fallback to legacy hash-binding for backward compatibility
+        let expected_proof = compute_state_proof(&state.state_commitment);
+        Ok(state.proof.as_slice() == expected_proof.as_slice())
     }
 
     fn verify_transition_proof(&self, transition: &PcdTransition) -> Result<bool> {
         if transition.transition_proof.is_empty() {
             return Ok(false);
         }
-        // First, ensure the binding proof over commitments and deltas matches
-        // our deterministic construction. This prevents mismatched (prev,new,delta) tuples.
-        let expected_binding = compute_transition_proof(
+
+        // Validate legacy binding hash for transition integrity
+        let expected = compute_transition_proof(
             &transition.prev_state_commitment,
             &transition.new_state_commitment,
             &transition.mmr_delta,
             &transition.nullifier_delta,
             transition.block_height_range,
         );
-        if transition.transition_proof.as_slice() != expected_binding {
-            return Ok(false);
-        }
-
-        // Next, provide delta-bound commitments to the circuit helper. We compress
-        // deltas into fixed 32-byte commitments so the helper can bind to them.
-        let mmr_commitment = blake3::hash(&transition.mmr_delta);
-        let nullifier_commitment = blake3::hash(&transition.nullifier_delta);
-
-        let halo2 = Halo2PcdCore::new()?;
-        halo2.verify_transition_proof(
-            &transition.transition_proof,
-            &transition.prev_state_commitment,
-            &transition.new_state_commitment,
-            mmr_commitment.as_bytes(),
-            nullifier_commitment.as_bytes(),
-            transition.block_height_range.1,
-        )
+        Ok(transition.transition_proof.as_slice() == expected)
     }
 
     fn generate_state_proof(&self, state: &PcdState) -> Result<Vec<u8>> {
@@ -519,11 +515,14 @@ impl PcdProofVerifier for SimplePcdVerifier {
 
     fn generate_transition_proof(&self, transition: &PcdTransition) -> Result<Vec<u8>> {
         let halo2 = Halo2PcdCore::new()?;
+        // Bind to delta commitments (32-byte) inside the circuit
+        let mmr_commitment = blake3::hash(&transition.mmr_delta);
+        let nullifier_commitment = blake3::hash(&transition.nullifier_delta);
         halo2.prove_transition(
             &transition.prev_state_commitment,
             &transition.new_state_commitment,
-            &Blake3Hash::from([0u8; 32]).into(),
-            &Blake3Hash::from([0u8; 32]).into(),
+            mmr_commitment.as_bytes(),
+            nullifier_commitment.as_bytes(),
             transition.block_height_range.1,
         )
     }

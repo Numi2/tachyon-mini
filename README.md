@@ -1,385 +1,89 @@
-# Mini Tachyon
+Mini Tachyon
+============
 
-This repository is a Rust workspace that tries recreate the Tachyon-style shielded payment flow so I can check whether the moving pieces actually fit. It focuses on oblivious wallet synchronization, proof-carrying data (PCD), and validator pruning. Production hardening is out of scope. Credit:  Sean Bowe - https://seanbowe.com/blog/tachyon-scaling-zcash-oblivious-synchronization/
+Rust workspace that prototypes a Tachyon-style shielded system: wallet with proof-carrying data (PCD), oblivious sync, pruning validator, and content-addressed networking.
 
-Status: experiment
+Scope: experimental, credit to Sean Bowe & Zcash team
 
 
+What this is
+------------
+- **Wallet**: keeps encrypted notes, witnesses, and a PCD state. Syncs via OSS using blobs; builds spends
+- **OSS (Oblivious Sync Service)**: publishes deltas and transition blobs so wallets can advance state without revealing secrets.
+- **Node extension**: validates PCD proofs and enforces a sliding nullifier window; prunes old state.
+- **Accumulators**: MMR for commitments, sparse set for nullifiers; support batched deltas and witness updates.
+- **Header sync**: simplified bootstrap/checkpoint flow.
+- **Networking**: `iroh` + `iroh-blobs` for transport and content addressing.
 
-	1.	Wallet (client, PCD machine)
-– Holds notes, secrets, proofs.
-– Syncs via iroh/OSS.
-– Builds spends that include PCD.
-– PQ secure out-of-band payment handling.
-	2.	Oblivious Sync Service (OSS)
-– Heavy lifting for wallet sync.
-– Publishes deltas and transition proofs as blobs.
-– Wallets can be light.
-	3.	Node / Validator extension
-– Minimal state.
-– Verifies PCD proofs and spends.
-– Maintains short nullifier window.
-– Prunes history.
-	4.	Accumulator service / delta generator
-– Produces commitment and nullifier updates.
-– Feeds OSS and nodes.
-	5.	Header sync
-– Lets new participants join quickly without replaying all history.
 
- prototype Tachyon network:
-	•	Wallet software (with PCD logic).
-	•	Node software (with validator + pruning).
-	•	OSS (sync servers for wallets).
-	•	Shared accumulator + header sync layer (protocol substrate).
+Workspace layout
+----------------
+`crates/`:
+- `net_iroh`: network layer over iroh/iroh-blobs. Control messages, blob publish/fetch, tickets.
+- `accum_mmr`: append-only Merkle Mountain Range, deltas, witness maintenance.
+- `accum_set`: sparse set accumulator for nullifiers, batched deltas.
+- `pcd_core`: PCD state, transitions, verification glue. Hash-bound mock proofs right now.
+- `circuits`: halo2 wiring for transition/aggregation (mock prover today).
+- `wallet`: high-level wallet API: DB, sync loop, OOB payments, tx build skeleton.
+- `oss_service`: delta/transition publishing loop, access tokens, rate limits.
+- `node_ext`: validator shim: verify PCD, enforce nullifier window, prune.
+- `header_sync`: simple checkpoint/header bootstrap.
+- `pq_crypto`: Kyber KEM + AES-GCM for OOB; simple VRF-ish nullifier blinding; signing helpers.
+- `storage`: encrypted wallet DB: notes, PCD checkpoints, witnesses, OOB keys.
+- `cli`: `tachyon` command; wallet and network subcommands.
+- `bench`: async harness to exercise MMR, PCD, network, crypto, storage.
 
+
+Data model
+----------
+- `PcdState { anchor_height, state_commitment, mmr_root, nullifier_root, block_hash, proof, ... }`
+- `PcdTransition { prev_state_commitment, new_state_commitment, mmr_delta, nullifier_delta, block_height_range, transition_proof }`
+- Deltas are bincode’d batches from `accum_mmr::MmrDelta` and `accum_set::SetDelta`.
+- Proofs are mock (hash-bound) until circuits are fully wired.
+
+
+Flows
+-----
+- **Sync**: wallet subscribes → fetches blobs via tickets → applies deltas via `pcd_core` → updates `PcdState` → persists.
+- **Spend (skeleton)**: wallet selects notes → builds spend bundle → attaches `PcdState` proof at anchor.
+- **Validation**: node verifies PCD, checks nullifiers against a recent window, prunes historical state.
+- **OOB payment**: Kyber encapsulation → AEAD encrypt note meta → recipient decapsulates → wallet ingests note.
+
+
+CLI
 ---
-Design Goals
-	•	Wallets maintain proof-carrying state (PCD) to avoid heavy sync work by validators.
-	•	Validators store minimal live state, prune all old state.
-	•	Oblivious sync service (OSS) advances wallet state without learning secrets.
-	•	Networking via iroh / iroh-blobs content-addressed transfer.
-	•	PQ-ready for out-of-band secret distribution.
-	•	High performance, secure, maintainable.
+Install toolchain: rustup stable. Build from workspace root.
 
-⸻
+- Wallet
+  - Create: `cargo run -p cli -- wallet create --name test --password pass`
+  - Info: `cargo run -p cli -- wallet info --db-path ./tachyon_data/wallets/test --password pass`
+  - Notes: `cargo run -p cli -- wallet list-notes --db-path ... --password ... [--unspent-only]`
+  - OOB URI: `cargo run -p cli -- wallet oob-uri --db-path ... --password ...`
+  - Create OOB payment: `cargo run -p cli -- wallet create-payment --recipient-pk 0x.. --value 123 --db-path ... --password ...`
+  - Receive OOB payment: `cargo run -p cli -- wallet receive-payment --payment-data '<json>' --db-path ... --password ...`
+  - Sync: `cargo run -p cli -- wallet sync --db-path ... --password ...`
 
-Key Technology Choices
-	•	Networking / transport / content addressing:
-  Use iroh + iroh-blobs as core network and data transport. Iroh offers P2P QUIC with hole punching, relays, NodeId-based dialing.  ￼
-  iroh-blobs offers BLAKE3-verified streaming of blobs and chunk-level integrity.  ￼
-	•	Hashing / content addressing: BLAKE3 with the hazmat API for subtree hashing.  ￼
-	•	Zero-knowledge / proofs: halo2 (recursive where needed).
-	•	Accumulators / state: MMR-based or similar append-only accumulator, optimized for batched updates and proof deltas.
-	•	Storage: hybrid – small blobs inline in embedded store; large blobs stored as files with outboard tree. (iroh-blobs follows this model)  ￼
-	•	Async runtime: Tokio (compatible with iroh).
-	•	PQ cryptography: use a standard KEM like Kyber for out-of-band payload confidentiality.
-	•	Serialization / RPC control: use custom framed messages (e.g. via Prost) over an iroh stream; blobs handled by the content-addressed layer (not RPC).
-	•	Concurrency model / IO model: isolate blocking IO (e.g. file writes, DB) into worker threads, async facade to main runtime (pattern used in iroh).  ￼
+- Network
+  - Start node: `cargo run -p cli -- network node --data-dir ./tachyon_data --listen-addr 0.0.0.0:8080 [--bootstrap-nodes a,b]`
+  - Publish blob: `cargo run -p cli -- network publish --file ./blob.bin --kind pcd_transition --height 42`
 
-⸻
 
-System Components & Interfaces
+Assumptions & non-goals
+-----------------------
+- Fixed demo keys, localhost relay, permissive defaults; safe for local dev only.
+- Proofs are mock; performance numbers are aspirational.
+- OSS auth/rate limit is minimal.
+- API surfaces may change.
 
-Components
-	1.	Wallet (client)
-  Maintains local encrypted note database, inclusion witnesses, PCD state and recursive proof.
-  Talks to OSS via control stream, fetches blob data via iroh-blobs.
-	2.	Oblivious Sync Service (OSS)
-  Publishes deltas + PCD transitions as blobs; serves fetches; speaks control protocol.
-	3.	Accumulator backend / Delta generator
-  Computes note-commitment / nullifier MMR deltas per block. Exports blobs.
-	4.	Validator / Node extension
-  Verifies transaction-level PCD and nullifier checks in recent window. Prunes old data.
-	5.	Header chain / checkpoint sync
-  Uses NiPoPoW or skip-sync model to allow fast bootstrapping of headers.
 
-⸻
+Build & run
+-----------
+- Build: `cargo build` (or `--release`)
+- Bench: `cargo run -p bench --release`
 
-Network / Data Flow using iroh / iroh-blobs
-	•	All state deltas, PCD transition proofs, parameter blobs are stored and addressed via iroh-blobs.
-	•	OSS and node publish blobs (commitments, nullifiers, transitions) into their blob stores and announce their BLAKE3 hash (CID).
-	•	Wallet subscribes or receives announcements, fetches blobs via iroh-blobs (streaming, verifiable).
-	•	Control messages (announce, requests, responses) go over a separate iroh stream (ALPN for control).
-	•	Blobs may be chunked (≤ 16 KiB groups, or per iroh-blobs strategy) with outboard proofs for integrity.  ￼
 
-⸻
+Credits
+-------
+Idea inspired by Tachyon and Sean Bowe’s writing.
 
-Protocol Outline
 
-Out-of-band Payment (OOB)
-	•	Sender uses PQ KEM (e.g. Kyber) to encapsulate a shared secret to recipient’s public key.
-	•	Use that secret to AEAD-encrypt the note metadata (view key, randomness, etc.).
-	•	On-chain, only the note commitment and public data are published.
-	•	Recipient decapsulates and recovers the note secret.
-	•	This approach ensures on-chain does not leak note secrets and is PQ resistant for that part.
-
-Wallet State and PCD Evolution
-	•	Wallet holds:
-  • Encrypted note records
-  • Witness paths in MMR
-  • Current PCD proof / state commitment
-  • Anchor (height) at which PCD is valid
-	•	For each new block (or batch of blocks):
-  • Wallet requests from OSS the delta blobs (commitment delta, nullifier delta) and PCD transition blob(s).
-  • Fetch via iroh-blobs, verify hash, pass to MMR module to update witnesses.
-  • Supply these deltas + previous PCD state to a transition circuit that outputs new PCD + proof.
-  • Optionally, fold recursive proofs to bound proof size.
-	•	Wallet can fallback to local proving if OSS unreachable (higher cost).
-
-Spending / Transaction Construction
-	•	Wallet picks notes, constructs standard shielded spend (Orchard-like).
-	•	Attach PCD proof that wallet state is valid up to anchor A.
-	•	Reveal nullifiers.
-	•	Transaction fields: note spend bundle, PCD proof + state commitment, anchor.
-	•	Node checks:
-  • PCD proof correctness and consistency with anchor
-  • For each nullifier, that it is not in the recent window (sliding window)
-  • Validate spend proof (Orchard).
-
-Node / Validator Behavior & Pruning
-	•	Nodes maintain recent nullifier window (e.g. last W blocks).
-	•	Nodes accept only transactions whose nullifiers do not collide with window.
-	•	After safety depth, prune full commitment / nullifier history, keeping only MMR peaks, minimal proofs needed for new sync.
-	•	Keep header chain + summary roots needed to verify new blocks and PCD consistency.
-
-OSS Behavior
-	•	Tracks block production / delta generator.
-	•	Produces:
-  • commitment_delta.blob
-  • nullifier_delta.blob
-  • pcd_transition.blob
-  with agreed semantics.
-	•	Publishes them via blob store, announces via control stream.
-	•	Serves fetch requests automatically via blob protocol.
-	•	Enforces rate limits, token-based access, unlinkability of requests.
-
-⸻
-
-Rust Project Structure (workspace)
-
-tachyon-rs/
-  crates/
-    net_iroh        — wrapper over iroh + iroh-blobs, control stream, blob API  
-    accum_mmr        — accumulator, MMR, delta apply, witness updates  
-    pcd_core         — state definitions, proof interface, recursion management  
-    circuits          — halo2 circuits: transition, aggregation  
-    wallet            — wallet logic: note DB, OOB, sync client  
-    oss_service       — OSS server logic: delta generation, control logic  
-    node_ext          — validator extension: PCD verify, nullifier checks  
-    header_sync       — header chain + checkpoint / NiPoPoW logic  
-    pq_crypto         — KEM + AEAD interface for OOB  
-    storage           — DB layer (embedded store + fallback)  
-    cli               — command-line tools  
-    bench             — benchmarks & performance tests  
-
-Key trait interfaces:
-
-trait BlobStore {
-  fn put_blob(&self, cid: &[u8], data: Bytes) -> Result<()>;
-  fn fetch_blob(&self, cid: &[u8]) -> impl Future<Output = Result<Bytes>>;
-  fn has_blob(&self, cid: &[u8]) -> bool;
-}
-
-trait ControlProtocol {
-  fn send_announce(&mut self, kind: BlobKind, cid: Cid, height: u64);
-  fn send_request(&mut self, cid: Cid);
-  fn recv(&mut self) -> impl Stream<Item = ControlMessage>;
-}
-
-trait PcdState {
-  fn anchor(&self) -> u64;
-  fn state_commitment(&self) -> [u8; 32];  // or appropriate size
-  fn proof(&self) -> &[u8];
-}
-
-trait Transition {
-  fn apply(prev: &PcdState, delta_blobs: &DeltaBundle) -> (PcdState, Proof);
-}
-
-
-⸻
-
-Implementation Phases
-
-Phase 1: Core Networking + Blob Layer
-	•	Integrate iroh and iroh-blobs crates.
-	•	Create net_iroh crate that:
-  • Starts an iroh Endpoint with ALPNs.
-  • Accepts control streams and blob protocol.
-  • Exposes high-level APIs: publish_blob, subscribe_announcements, fetch_blob.
-	•	Build a minimal test: two nodes, node A publishes a blob, node B fetches and verifies via BLAKE3.
-	•	Use latest BLAKE3 hazmat API to compute subtrees and chunk proofs.  ￼
-
-Phase 2: Accumulator & MMR
-	•	Build accum_mmr crate: append-only structure, proof generation, delta application, witness updates.
-	•	Support batched deltas and shared path compression.
-	•	Tests: small sets, large sets, path correctness.
-
-Phase 3: PCD Circuits
-	•	In circuits, build a transition circuit T that proves:
-  • Given previous state commitment, applying deltas yields new state commitment consistent with MMR roots.
-  • No double-spend in nullifier delta.
-  • Anchor increments correctly.
-	•	Build recursion circuit R for proof folding.
-	•	In pcd_core, provide prove and verify APIs.
-
-Phase 4: Wallet + OSS
-	•	Wallet:
-  • OOB interface (PQ KEM + AEAD)
-  • Note DB, encrypted store
-  • Sync client: connect to OSS via control protocol, fetch blobs, apply transitions via pcd_core
-  • Spend builder: combine new PCD proof + note spend circuit
-	•	OSS:
-  • Accept registration / subscription tokens from wallets
-  • Periodically generate block deltas + PCD transitions
-  • Publish blobs and send announce messages
-  • Serve fetches
-  • Manage quotas, access control
-
-Phase 5: Validator / Node Extension
-	•	Extend node to validate tx + pcd_blob:
-  • Verify PCD, ensure nullifier non-membership in recent window
-  • Accept orchard spend proof
-  • Append to block
-	•	Pruning: discard older states keeping only needed MMR peaks and commitments.
-
-Phase 6: Header Sync & Bootstrapping
-	•	Implement NiPoPoW or skip proofs to allow new nodes to bootstrap headers + root commitments.
-	•	On boot, wallet can sync from checkpoint + deltas rather than full history.
-
-Phase 7: Hardening, Privacy, PQ Transition Path
-	•	Nullifier derivation: include epoch tag / VRF blinding so OSS cannot correlate positions.
-	•	Token rotation, request padding, batching.
-	•	Fallback local proving if OSS unreachable.
-	•	PQ migration path: optional flag to insert PQ signature witness in PCD for on-chain authentication (if protocol upgrade later).
-
-⸻
-
-iroh / iroh-blobs Specific Updates to Use
-	•	Use latest iroh (≥0.92) which supports improved mDNS, QUIC multipath, better relay fallback.  ￼
-	•	Leverage iroh-blobs (latest) for BLAKE3-verified streaming, range requests, chunked fetching.  ￼
-	•	Use BLAKE3’s hazmat API to compute subtree hashes and combine chaining values when validating partial chunks.  ￼
-	•	Use a thread-pool + blocking IO separation to handle file storage / DB in iroh-blobs style.  ￼
-
-⸻
-
-Performance & Security Targets
-	•	Wallet sync latency: ≤ 100 ms per 10 block batch on moderate connection.
-	•	Transition proving: ≤ 100–500 ms for typical delta size (depends on circuit).
-	•	Proof size (recursive folded): ≤ 32–64 KiB target.
-	•	Validator verification: ≤ few ms per transaction (PCD + spend).
-	•	Storage on node: minimal (just MMR peaks + recent window)
-	•	Bandwidth overhead: blobs compressed, chunk deduplication, delta grouping.
-	•	Security constraints:
-  • Soundness of circuits
-  • No information leakage in blobs (only reveal deltas, not note secrets)
-  • OSS cannot infer note positions (via blinding)
-  • Resist DoS (limit blob size, rate-limit access)
-  • PQ secrecy in OOB payloads
-  • Replay / reorg safety: PCD should support fork rewind and recompute.
-
-
-## High-Level Picture
-
-At its core, Mini Tachyon is a proof-carrying-data (PCD) wallet prototype that tracks commitments in a Merkle Mountain Range (MMR), manages a nullifier accumulator, and synchronizes via an “oblivious sync service” over an iroh-based gossip network.
-
-```
-wallet ─┬─ storage (encrypted DB)
-        ├─ pcd_core (state machine & transitions)
-        ├─ pq_crypto (OOB payments & primitives)
-        ├─ accum_mmr / accum_set (commitments + nullifiers)
-        └─ net_iroh (blob transport & control plane)
-             ├─ header_sync     (chain bootstrap)
-             └─ oss_service     (delta + state publisher)
-node_ext ── validates blocks via pcd_core + accumulators
-bench    ── exercises the stack end-to-end
-cli      ── front-end for wallet + network ops
-```
-
-## Crate Reference
-
-### `accum_mmr`
-- Implements a Merkle Mountain Range tailored for 32-byte “tachygram” leaves, including proof generation (`MmrProof`), membership proofs (`TachygramMembershipProof`), delta batching (`MmrDelta`), and persistence hooks (`MmrStorage`).
-- Exposes an `MmrAccumulator` used by both the wallet’s `pcd_core` state machine and the `oss_service` when constructing commitment updates.
-
-### `accum_set`
-- Provides a sparse set accumulator backed by `BTreeSet<[u8; 32]>` with batchable deltas (`SetDelta`) and Merkle-style membership witnesses over sorted elements. Witnesses expose an authentication path and verify against the accumulator root.
-- Used anywhere nullifier membership/non-membership needs to be tracked; `pcd_core` consumes deltas during state transitions, and `oss_service` produces blinded nullifier batches.
-
-### `bench`
-- An async benchmark harness (`TachyonBenchmark`) orchestrating multiple subsystems: MMR operations, PCD state/transition proof flows, network blob upload/download, crypto primitives, and storage access.
-- Valuable both as a regression detector and as sample code demonstrating crate integration.
-
-### `circuits`
-- Halo2-based circuit for PCD transitions and recursion (`PcdTransitionCircuit`, `PcdRecursionCircuit`), plus helper logic for deterministic mixing/hash simulation.
-- Currently uses a MockProver-backed proving path; wiring to a real Halo2 prover is planned next.
-
-### `cli`
-- User-facing command-line front end wrapping wallet actions (`tachyon wallet …`) and network node tasks (`tachyon network …`).
-- Calls into the `wallet` crate for database-backed operations, uses `net_iroh` to publish blobs, and configures `node_ext` when running a node.
-- Demonstrates end-to-end flows: creating wallets, generating OOB payments, syncing state, or launching a local network node.
-
-### `header_sync`
-- Simplified NiPoPoW-inspired header chain manager (`HeaderSyncManager`) that can bootstrap from checkpoints, maintain a map of block headers, and periodically sync via the network.
-- Uses `net_iroh::TachyonNetwork` to talk to peers, `pq_crypto::SuiteB` for checkpoint signatures, and persists headers to disk.
-
-### `net_iroh`
-- Thin wrapper over `iroh` + `iroh-blobs` providing:
-  - `TachyonNetwork`: sets up an endpoint, manages control-plane channels (`ControlMessage`), publishes blobs with tickets, and broadcasts announcements.
-  - `TachyonBlobStore`: local blob persistence/cache.
-- Other crates (wallet, OSS, header sync, benchmarks) rely on this layer for data movement.
-
-### `node_ext`
-- “Validator” shim for pulling data off the network, verifying PCD proofs (`SimplePcdVerifier`), enforcing nullifier windows, aggregating proofs, and pruning state.
-- Consumes `accum_mmr`, `accum_set`, `pcd_core`, `net_iroh`, and `pq_crypto`.
-- Offers hooks a production node would need: block validation (`validate_block`), transaction verification, background pruning, and state tracking.
-
-### `oss_service`
-- Oblivious Sync Service publishing batched deltas and transition proofs on an interval.
-- Generates `PcdDeltaBundle`s via `accum_mmr`/`accum_set`, produces `PcdTransition`s using `pcd_core`, and pushes blobs to the network through `net_iroh`.
-- Tracks wallet subscriptions, rate-limits clients, and keeps an in-memory record of published tickets for consumption by wallets.
-
-### `pcd_core`
-- Heart of the proof-carrying-data model:
-  - `PcdState`, `PcdTransition`, and `PcdDeltaBundle` types.
-  - `PcdStateMachine` applies deltas to accumulators (`accum_mmr`, `accum_set`), rebinds commitments, and uses `circuits::PcdCore` to produce/verify mock proofs.
-  - `PcdStateManager` adds verification/persistence hooks, while `PcdSyncManager` orchestrates incremental or bundled synchronization via a `PcdSyncClient`.
-- Shared by wallet, node extension, OSS service, and benchmarks.
-
-### `pq_crypto`
-- Collection of crypto utilities:
-  - Kyber KEM/AES-GCM for out-of-band payments (`OutOfBandPayment`).
-  - Nullifier blinding via epoch-based VRF (`BlindedNullifier`, `derive_nullifier`).
-  - Suite-B (Dilithium3 + BLAKE3) signing for checkpoints.
-  - Rate-limiting tokens and padding helpers for privacy-preserving requests.
-- Consumed by wallet, OSS, header sync, storage, and node extension.
-
-### `storage`
-- Encrypted on-disk store for wallet state (`WalletDatabase`), notes (`EncryptedNote`), PCD checkpoints (`PcdStateRecord`), witnesses (`WitnessRecord`), and OOB key material.
-- Provides atomic persistence, in-memory caches, and helpers for deriving encryption keys from the master password.
-- Used exclusively by the `wallet` crate.
-
-### `wallet`
-- High-level wallet API:
-  - Handles configuration, initial PCD state bootstrap, background sync task, and network integration.
-  - Wraps the encrypted database, PCD state manager, sync manager, OOB payment handler, and transaction builder.
-  - Interfaces with `net_iroh` (blob announcements), `pcd_core` (state updates), `pq_crypto` (OOB payments, nullifiers), and `storage` (durable state).
-
-## Data & Control Flows
-
-1. **State Evolution**  
-   - The wallet maintains a `PcdState` via `pcd_core::PcdStateManager`.  
-   - The OSS service periodically publishes `MmrDelta`, `SetDelta`, and `PcdTransition` blobs with tickets through `net_iroh`.  
-   - Wallets (via `WalletSyncClient`) listen for `BlobKind::PcdTransition`, fetch tickets, and apply transitions using `PcdStateManager`, persisting to `storage`.
-
-2. **Commitment & Nullifier Management**  
-   - `accum_mmr::MmrAccumulator` tracks note commitments; `accum_set::SetAccumulator` tracks nullifiers.
-   - Deltas originate in the OSS, are applied in the wallet/node via `pcd_core`, and validated in `node_ext`.
-
-3. **Network Layer**  
-   - `net_iroh::TachyonNetwork` handles all blob distribution: wallet sync data, OSS outputs, benchmarks, and header sync.
-   - Control messages allow announcing new blobs and subscribing to specific `BlobKind`s.
-
-4. **Wallet Operations**  
-   - `storage::WalletDatabase` encrypts/decrypts notes and states under a master key derived from the user password.
-   - OOB payments use Kyber KEM/AES through `pq_crypto`; the CLI provides helpers (`wallet create`, `wallet receive-payment`, etc.).
-
-5. **Validation & Monitoring**  
-   - `node_ext` monitors the network, aggregates proofs, and maintains a sliding window of nullifiers to prevent double spends.
-   - `bench` crate offers performance visibility across MMR, PCD, network, crypto, and storage paths.
-
-## Getting Started Tips
-
-- For CLI-driven testing, run `cargo run -p cli -- wallet create …` to set up a wallet, then explore sync or OOB flows.
-- The benchmark suite (`cargo run -p bench --release`) exercises multiple crates concurrently—useful when changing core primitives.
-- If you are modifying circuit logic, touch `circuits` first, then adjust `pcd_core::PcdStateMachine` to match any new constraints.
-- Networking or blob distribution tweaks belong in `net_iroh`; both OSS and wallet sync clients consume its APIs.
-
-## Where to Go Next
-
-- **Storage or wallet features:** focus on `storage`, `wallet`, and their interaction with `pcd_core`.
-- **Networking or sync logic:** look at `net_iroh`, `oss_service`, and `header_sync`.
-- **Cryptography experiments:** start in `pq_crypto`, then wire the results through wallet/node flows.
-- **Validation path:** explore `node_ext` alongside `pcd_core` to understand how proofs and nullifiers are enforced.
-
----

@@ -11,7 +11,7 @@
 – Wallets can be light.
 	3.	Node / Validator extension
 – Minimal state.
-– Verifies PCD proofs and spends.
+– Verifies PCD proofs and spends.car
 – Maintains short nullifier window.
 – Prunes history.
 	4.	Accumulator service / delta generator

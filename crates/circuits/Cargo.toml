@@ -16,3 +16,10 @@ ff = "0.13"
 rand.workspace = true
 halo2curves = "0.6"
 pasta_curves.workspace = true
+
+[features]
+dev-graph = ["halo2_proofs/dev-graph", "dep:plotters"]
+
+[dependencies.plotters]
+version = "0.3"
+optional = true
