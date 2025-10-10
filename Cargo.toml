@@ -31,6 +31,9 @@ thiserror = "1.0"
 # Hashing
 blake3 = "1.5"
 
+# HTTP client for checkpoint bootstrap
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Iroh networking
 # Pin iroh to 0.91.x to match iroh-blobs' internal iroh dependency
 iroh = "0.91.2"

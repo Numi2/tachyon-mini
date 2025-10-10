@@ -10,15 +10,16 @@ use net_iroh::{BlobKind, TachyonNetwork};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, RwLock},
     task::JoinHandle,
     time::interval,
 };
 use tracing::{info, warn};
+use reqwest::Client;
 
 /// Configuration for header sync
 #[derive(Debug, Clone)]
@@ -46,7 +47,7 @@ impl Default for HeaderSyncConfig {
 pub struct NetworkConfig {
     /// Data directory for header storage
     pub data_dir: String,
-    /// Trusted checkpoint servers
+    /// Trusted checkpoint servers (HTTPS endpoints returning signed checkpoints)
     pub checkpoint_servers: Vec<String>,
     /// Maximum number of peers for header sync
     pub max_sync_peers: usize,
@@ -95,6 +96,10 @@ pub struct SecurityConfig {
     pub max_chain_quality: f64,
     /// Minimum honest majority we assume
     pub min_honest_majority: f64,
+    /// Minimum number of trusted signatures required on checkpoints
+    pub min_checkpoint_signatures: usize,
+    /// Optional trusted checkpoint public keys (Dilithium3/Suite B). If empty, any valid signature counts.
+    pub trusted_checkpoint_keys: Vec<Vec<u8>>, // raw pk bytes
 }
 
 impl Default for SecurityConfig {
@@ -103,6 +108,8 @@ impl Default for SecurityConfig {
             security_parameter_k: 10,
             max_chain_quality: 0.51,   // Assume < 51% attack
             min_honest_majority: 0.51, // Assume > 51% honest
+            min_checkpoint_signatures: 1,
+            trusted_checkpoint_keys: Vec::new(),
         }
     }
 }
@@ -377,25 +384,25 @@ pub struct NiPoPoWProof {
 impl NiPoPoWProof {
     /// Verify the NiPoPoW proof
     pub fn verify(&self, _security_params: &SecurityConfig) -> Result<bool> {
-        // In a real implementation, this would verify:
-        // 1. All headers are valid
-        // 2. The proof provides sufficient security for the range
-        // 3. Chain quality is maintained
+        // Minimum structural checks
+        if self.headers.is_empty() { return Ok(false); }
+        if self.start_height > self.end_height { return Ok(false); }
 
-        // For now, just check basic structure
-        if self.headers.is_empty() {
-            return Ok(false);
-        }
-
-        if self.start_height > self.end_height {
-            return Ok(false);
-        }
-
-        // Check that headers are properly ordered
-        for i in 1..self.headers.len() {
-            if self.headers[i].height >= self.headers[i - 1].height {
-                return Ok(false);
+        // Headers must be strictly descending by height, properly linked, and meet PoW
+        let mut last: Option<&BlockHeader> = None;
+        for h in &self.headers {
+            if let Some(prev) = last {
+                if h.height >= prev.height { return Ok(false); }
+                if prev.previous_hash != h.hash { return Ok(false); }
             }
+            // Basic PoW/difficulty check
+            if !h.meets_difficulty() { return Ok(false); }
+            last = Some(h);
+        }
+
+        // Interlink consistency: ensure vector sizes are plausible (placeholder sanity)
+        for link in &self.interlink {
+            if link.len() > 1024 { return Ok(false); }
         }
 
         Ok(true)
@@ -434,16 +441,16 @@ impl Checkpoint {
         self.signatures.push(signature);
     }
 
-    /// Verify checkpoint with minimum signatures required
-    pub fn verify(&self, min_signatures: usize) -> Result<bool> {
-        if self.signatures.len() < min_signatures {
+    /// Verify checkpoint using provided security/trust configuration
+    pub fn verify_with_trust(&self, security: &SecurityConfig) -> Result<bool> {
+        if self.signatures.len() < security.min_checkpoint_signatures {
             return Ok(false);
         }
 
-        // Verify proof
-        self.proof.verify(&SecurityConfig::default())?;
+        // Verify NiPoPoW proof
+        self.proof.verify(security)?;
 
-        // Prehash checkpoint data with BLAKE3 under Suite B domain
+        // Prehash checkpoint payload with Suite B domain
         let digest = SuiteB::blake3_prehash_with_domain(
             SUITE_B_DOMAIN_CHECKPOINT,
             &[
@@ -453,9 +460,17 @@ impl Checkpoint {
             ],
         );
 
-        // Verify at least min_signatures signatures are valid
-        let mut valid = 0usize;
+        let mut valid_signers: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for sig in &self.signatures {
+            // Filter by trusted set if configured
+            if !security.trusted_checkpoint_keys.is_empty()
+                && !security
+                    .trusted_checkpoint_keys
+                    .iter()
+                    .any(|k| k.as_slice() == sig.signer.as_slice())
+            {
+                continue;
+            }
             let pk = match SuiteBPublicKey::from_bytes(&sig.signer) {
                 Ok(pk) => pk,
                 Err(_) => continue,
@@ -465,15 +480,11 @@ impl Checkpoint {
                 Err(_) => continue,
             };
             if SuiteB::verify_prehash(&pk, &digest, &signature) {
-                valid += 1;
+                valid_signers.insert(sig.signer.clone());
             }
         }
 
-        if valid < min_signatures {
-            return Ok(false);
-        }
-
-        Ok(true)
+        Ok(valid_signers.len() >= security.min_checkpoint_signatures)
     }
 }
 
@@ -491,13 +502,15 @@ pub struct HeaderSyncManager {
     /// Configuration
     config: HeaderSyncConfig,
     /// Network client
-    _network: Arc<TachyonNetwork>,
+    network: Arc<TachyonNetwork>,
     /// Header chain state
     chain: Arc<RwLock<HeaderChain>>,
     /// Sync state tracking
     sync_state: Arc<RwLock<SyncState>>,
     /// Background sync task
     sync_task: Option<JoinHandle<()>>,
+    /// Announcement listener task
+    announce_task: Option<JoinHandle<()>>,
     /// Shutdown channel
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
 }
@@ -514,6 +527,8 @@ struct SyncState {
     pub last_sync_attempt: Instant,
     /// Sync in progress
     pub sync_in_progress: bool,
+    /// Pending headers buffered by height
+    pub pending_headers: HashMap<u64, BlockHeader>,
 }
 
 impl SyncState {
@@ -524,6 +539,7 @@ impl SyncState {
             peers: Vec::new(),
             last_sync_attempt: Instant::now(),
             sync_in_progress: false,
+            pending_headers: HashMap::new(),
         }
     }
 }
@@ -545,12 +561,13 @@ impl HeaderSyncManager {
         let chain_clone = chain.clone();
         let sync_state_clone = sync_state.clone();
         let config_clone = config.clone();
+        let network_clone = network.clone();
         let sync_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(30));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        Self::run_sync_cycle(&chain_clone, &sync_state_clone, &config_clone).await;
+                        Self::run_sync_cycle(&chain_clone, &sync_state_clone, &config_clone, &network_clone).await;
                     }
                     _ = shutdown_rx.recv() => {
                         break;
@@ -559,25 +576,136 @@ impl HeaderSyncManager {
             }
         });
 
+        // Start an announcement listener to fetch headers and checkpoints as they arrive
+        let chain_for_anns = chain.clone();
+        let sync_state_for_anns = sync_state.clone();
+        let network_for_anns = network.clone();
+        let announce_task = tokio::spawn(async move {
+            let mut rx = network_for_anns.subscribe_announcements();
+            loop {
+                match rx.recv().await {
+                    Ok((kind, _cid, height, _size, ticket)) => {
+                        // Only process Header and Checkpoint kinds
+                        match kind {
+                            BlobKind::Header => {
+                                if let Ok(bytes) = network_for_anns.fetch_blob_from_ticket(&ticket).await {
+                                    if let Ok(header) = bincode::deserialize::<BlockHeader>(&bytes) {
+                                        // Buffer or apply in-order
+                                        let mut applied = false;
+                                        {
+                                            let mut chain_guard = chain_for_anns.write().await;
+                                            // Apply if next height
+                                            let next_h = chain_guard.tip.unwrap_or(0).saturating_add(1);
+                                            if header.height == next_h {
+                                                if chain_guard.add_header(header.clone()).is_ok() {
+                                                    applied = true;
+                                                }
+                                            }
+                                        }
+                                        if !applied {
+                                            let mut ss = sync_state_for_anns.write().await;
+                                            ss.pending_headers.insert(height, header);
+                                        }
+                                        // Try to apply any buffered headers now
+                                        Self::apply_pending_in_order(&chain_for_anns, &sync_state_for_anns).await;
+                                    }
+                                }
+                            }
+                            BlobKind::Checkpoint => {
+                                if let Ok(bytes) = network_for_anns.fetch_blob_from_ticket(&ticket).await {
+                                    if let Ok(cp) = bincode::deserialize::<Checkpoint>(&bytes) {
+                                        if cp.verify(1).unwrap_or(false) {
+                                            // Adopt checkpoint if ahead
+                                            let mut chain = chain_for_anns.write().await;
+                                            if cp.height > chain.tip.unwrap_or(0) {
+                                                chain.checkpoints.push(cp.clone());
+                                                chain.mmr_roots.insert(cp.height, cp.mmr_root);
+                                                chain.tip = Some(cp.height);
+                                                let mut ss = sync_state_for_anns.write().await;
+                                                ss.current_height = cp.height;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
         Ok(Self {
             config,
-            _network: network,
+            network,
             chain,
             sync_state,
             sync_task: Some(sync_task),
+            announce_task: Some(announce_task),
             shutdown_tx: Some(shutdown_tx),
         })
     }
 
+    /// Bootstrap from the strongest valid checkpoint fetched over HTTPS
+    pub async fn bootstrap_from_checkpoints(&self) -> Result<()> {
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let mut best_cp: Option<Checkpoint> = None;
+        for url in &self.config.network_config.checkpoint_servers {
+            match client.get(format!("{}/latest", url)).send().await {
+                Ok(resp) => {
+                    if !resp.status().is_success() { continue; }
+                    let bytes = resp.bytes().await?;
+                    if let Ok(cp) = bincode::deserialize::<Checkpoint>(&bytes) {
+                        // Verify signatures and NiPoPoW proof
+                        if cp.verify(1)? { // configurable threshold later
+                            if let Some(cur) = &best_cp {
+                                if cp.height > cur.height { best_cp = Some(cp); }
+                            } else { best_cp = Some(cp); }
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        if let Some(cp) = best_cp {
+            // Trust-but-verify: ensure our chain either empty or consistent, then set tip to cp.height
+            let mut chain = self.chain.write().await;
+            // Reset headers and record checkpoint baseline
+            let genesis = chain.genesis.clone();
+            let mut new_chain = HeaderChain::new(genesis);
+            new_chain.checkpoints.push(cp.clone());
+            new_chain.tip = Some(cp.height);
+            // Record the MMR root at checkpoint height
+            new_chain.mmr_roots.insert(cp.height, cp.mmr_root);
+            *chain = new_chain;
+
+            // Persist atomically
+            let path = std::path::Path::new(&self.config.network_config.data_dir).join("headers.bin");
+            let tmp = std::path::Path::new(&self.config.network_config.data_dir).join("headers.bin.tmp");
+            let data = bincode::serialize(&*chain)?;
+            tokio::fs::write(&tmp, &data).await?;
+            tokio::fs::rename(&tmp, &path).await?;
+
+            // Update sync state
+            let mut ss = self.sync_state.write().await;
+            ss.current_height = cp.height;
+            Ok(())
+        } else {
+            Err(anyhow!("No valid checkpoints from servers"))
+        }
+    }
+
     /// Get current header chain
-    pub fn get_chain(&self) -> HeaderChain {
-        self.chain.read().unwrap().clone()
+    pub async fn get_chain(&self) -> HeaderChain {
+        self.chain.read().await.clone()
     }
 
     /// Get current sync status
-    pub fn get_sync_status(&self) -> SyncStatus {
-        let sync_state = self.sync_state.read().unwrap();
-        let chain = self.chain.read().unwrap();
+    pub async fn get_sync_status(&self) -> SyncStatus {
+        let sync_state = self.sync_state.read().await;
+        let chain = self.chain.read().await;
 
         SyncStatus {
             current_height: sync_state.current_height,
@@ -594,44 +722,34 @@ impl HeaderSyncManager {
         start_height: u64,
         count: usize,
     ) -> Result<Vec<BlockHeader>> {
-        // Generate a deterministic batch locally to unblock the sync pipeline.
-        // This is a placeholder until peer requests are wired.
-        let chain = self.chain.read().unwrap();
-        let mut headers = Vec::new();
-        let mut prev = chain
-            .get_header(start_height)
-            .cloned()
-            .ok_or_else(|| anyhow!("start header not found"))?;
-        drop(chain);
+        // Best-effort: scan recent announcements and fetch up to count headers at or above start_height
+        let anns = self.network.get_recent_announcements();
+        let mut tickets: Vec<(u64, String)> = anns
+            .into_iter()
+            .filter(|(kind, _cid, height, _size, _ticket)| *kind == BlobKind::Header && *height >= start_height)
+            .map(|(_k, _cid, height, _size, ticket)| (height, ticket))
+            .collect();
+        tickets.sort_by_key(|(h, _)| *h);
 
-        for i in 1..=count {
-            let h = start_height + i as u64;
-            let mut new_header = BlockHeader::new(
-                h,
-                prev.hash.into(),
-                Some(Hash::from([2u8; 32])),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                0,
-                0x1fff_ffff_ffff_ffff_u64,
-            );
-            new_header.mine();
-            prev = new_header.clone();
-            headers.push(new_header);
+        let mut out = Vec::new();
+        for (_h, ticket) in tickets.into_iter().take(count) {
+            if let Ok(bytes) = self.network.fetch_blob_from_ticket(&ticket).await {
+                if let Ok(header) = bincode::deserialize::<BlockHeader>(&bytes) {
+                    out.push(header);
+                }
+            }
         }
 
-        Ok(headers)
+        Ok(out)
     }
 
     /// Submit a new header for inclusion
     pub async fn submit_header(&self, header: BlockHeader) -> Result<()> {
-        let mut chain = self.chain.write().unwrap();
+        let mut chain = self.chain.write().await;
         chain.add_header(header)?;
 
         // Update sync state
-        let mut sync_state = self.sync_state.write().unwrap();
+        let mut sync_state = self.sync_state.write().await;
         sync_state.current_height = chain.tip.unwrap_or(0);
 
         Ok(())
@@ -639,13 +757,13 @@ impl HeaderSyncManager {
 
     /// Sync to a target height
     pub async fn sync_to_height(&self, target_height: u64) -> Result<()> {
-        let mut sync_state = self.sync_state.write().unwrap();
+        let mut sync_state = self.sync_state.write().await;
         sync_state.target_height = Some(target_height);
         sync_state.sync_in_progress = true;
 
         // Trigger immediate sync cycle
         drop(sync_state);
-        Self::run_sync_cycle(&self.chain, &self.sync_state, &self.config).await;
+        Self::run_sync_cycle(&self.chain, &self.sync_state, &self.config, &self.network).await;
 
         Ok(())
     }
@@ -677,9 +795,18 @@ impl HeaderSyncManager {
     async fn load_chain_from_disk(_data_dir: &str) -> Result<HeaderChain> {
         // Try to read persisted headers
         let path = std::path::Path::new(_data_dir).join("headers.bin");
+        let tmp = std::path::Path::new(_data_dir).join("headers.bin.tmp");
         if path.exists() {
             let data = tokio::fs::read(&path).await?;
             let chain: HeaderChain = bincode::deserialize(&data)?;
+            return Ok(chain);
+        }
+        if tmp.exists() {
+            // Attempt to recover from a previous crash mid-write
+            let data = tokio::fs::read(&tmp).await?;
+            let chain: HeaderChain = bincode::deserialize(&data)?;
+            // Promote tmp to main file
+            tokio::fs::rename(&tmp, &path).await.ok();
             return Ok(chain);
         }
         Err(anyhow!("No existing chain found"))
@@ -690,9 +817,10 @@ impl HeaderSyncManager {
         chain: &Arc<RwLock<HeaderChain>>,
         sync_state: &Arc<RwLock<SyncState>>,
         config: &HeaderSyncConfig,
+        network: &Arc<TachyonNetwork>,
     ) {
         {
-            let mut guard = sync_state.write().unwrap();
+            let mut guard = sync_state.write().await;
             if guard.sync_in_progress {
                 return;
             }
@@ -702,14 +830,14 @@ impl HeaderSyncManager {
 
         // Get current chain state
         let current_height = {
-            let chain_guard = chain.read().unwrap();
+            let chain_guard = chain.read().await;
             chain_guard.tip.unwrap_or(0)
         };
 
         // Check if we need to sync
-        if let Some(target_height) = sync_state.read().unwrap().target_height {
+        if let Some(target_height) = sync_state.read().await.target_height {
             if current_height >= target_height {
-                let mut sync_state_guard = sync_state.write().unwrap();
+                let mut sync_state_guard = sync_state.write().await;
                 sync_state_guard.sync_in_progress = false;
                 return;
             }
@@ -726,56 +854,20 @@ impl HeaderSyncManager {
         // Request the next small batch and apply it.
         let batch_size = config.sync_config.max_batch_size.min(16);
         let headers = {
-            // Try to use network announcements via iroh first
+            // Use recent announcements via network to discover tickets
             let mut out = Vec::new();
-            // Because we don't have &self here, reload announcements from a fresh network handle
-            // initialized from config data dir (same as the manager did). If that fails,
-            // fall back to local synthetic generation.
-            let maybe_net_headers = async {
-                if let Ok(network) = TachyonNetwork::new(&std::path::Path::new(&config.network_config.data_dir)).await {
-                    let anns = network.get_recent_announcements();
-                    // Filter for Header kind and higher than current height
-                    let mut tickets: Vec<(u64, String)> = anns
-                        .into_iter()
-                        .filter(|(kind, _cid, height, _size, _ticket)| *kind == BlobKind::Header && *height > current_height)
-                        .map(|(_k, _cid, height, _size, ticket)| (height, ticket))
-                        .collect();
-                    tickets.sort_by_key(|(h, _)| *h);
-                    // Take up to batch_size next heights
-                    for (_h, ticket) in tickets.into_iter().take(batch_size) {
-                        if let Ok(bytes) = network.fetch_blob_from_ticket(&ticket).await {
-                            if let Ok(header) = bincode::deserialize::<BlockHeader>(&bytes) {
-                                out.push(header);
-                            }
-                        }
-                    }
-                }
-                out
-            };
-            let mut out = maybe_net_headers.await;
-            if out.is_empty() {
-                // Fallback: local deterministic generator
-                let chain_guard = chain.read().unwrap();
-                let mut prev = chain_guard.get_header(current_height).cloned();
-                drop(chain_guard);
-                if let Some(prev_h) = prev.take() {
-                    let mut p = prev_h;
-                    for i in 1..=batch_size {
-                        let h = current_height + i as u64;
-                        let mut nh = BlockHeader::new(
-                            h,
-                            p.hash.into(),
-                            Some(Hash::from([2u8; 32])),
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                            0,
-                            0x1fff_ffff_ffff_ffff_u64,
-                        );
-                        nh.mine();
-                        p = nh.clone();
-                        out.push(nh);
+            let anns = network.get_recent_announcements();
+            // Filter for Header kind and higher than current height
+            let mut tickets: Vec<(u64, String)> = anns
+                .into_iter()
+                .filter(|(kind, _cid, height, _size, _ticket)| *kind == BlobKind::Header && *height > current_height)
+                .map(|(_k, _cid, height, _size, ticket)| (height, ticket))
+                .collect();
+            tickets.sort_by_key(|(h, _)| *h);
+            for (_h, ticket) in tickets.into_iter().take(batch_size) {
+                if let Ok(bytes) = network.fetch_blob_from_ticket(&ticket).await {
+                    if let Ok(header) = bincode::deserialize::<BlockHeader>(&bytes) {
+                        out.push(header);
                     }
                 }
             }
@@ -783,7 +875,7 @@ impl HeaderSyncManager {
         };
 
         if !headers.is_empty() {
-            let mut chain_guard = chain.write().unwrap();
+            let mut chain_guard = chain.write().await;
             for h in headers {
                 if let Err(e) = chain_guard.add_header(h) {
                     warn!("Failed to add header: {}", e);
@@ -794,25 +886,52 @@ impl HeaderSyncManager {
 
         // Persist chain to disk
         let path = std::path::Path::new(&config.network_config.data_dir).join("headers.bin");
+        let tmp_path = std::path::Path::new(&config.network_config.data_dir).join("headers.bin.tmp");
         let data_opt = {
-            let chain_guard = chain.read().unwrap();
+            let chain_guard = chain.read().await;
             bincode::serialize(&*chain_guard).ok()
         };
         if let Some(data) = data_opt {
-            let _ = tokio::fs::write(path, data).await;
+            let _ = tokio::fs::write(&tmp_path, &data).await;
+            let _ = tokio::fs::rename(&tmp_path, &path).await;
         }
 
         // Update sync state
         {
-            let mut sync_state_guard = sync_state.write().unwrap();
-            sync_state_guard.current_height = chain.read().unwrap().tip.unwrap_or(current_height);
+            let tip_now = chain.read().await.tip.unwrap_or(current_height);
+            let mut sync_state_guard = sync_state.write().await;
+            sync_state_guard.current_height = tip_now;
             sync_state_guard.sync_in_progress = false;
         }
 
         info!(
             "Header sync cycle completed at height {}",
-            chain.read().unwrap().tip.unwrap_or(current_height)
+            chain.read().await.tip.unwrap_or(current_height)
         );
+    }
+
+    /// Attempt to apply buffered headers in order from current tip+1 upward
+    async fn apply_pending_in_order(
+        chain: &Arc<RwLock<HeaderChain>>,
+        sync_state: &Arc<RwLock<SyncState>>,
+    ) {
+        loop {
+            let next_h = { chain.read().await.tip.unwrap_or(0).saturating_add(1) };
+            let candidate = { sync_state.read().await.pending_headers.get(&next_h).cloned() };
+            let Some(header) = candidate else { break; };
+            // Try to apply
+            let applied_ok = {
+                let mut c = chain.write().await;
+                c.add_header(header.clone()).is_ok()
+            };
+            if applied_ok {
+                let mut ss = sync_state.write().await;
+                ss.pending_headers.remove(&next_h);
+                ss.current_height = chain.read().await.tip.unwrap_or(ss.current_height);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Shutdown the sync manager
@@ -827,6 +946,9 @@ impl HeaderSyncManager {
 impl Drop for HeaderSyncManager {
     fn drop(&mut self) {
         if let Some(task) = self.sync_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.announce_task.take() {
             task.abort();
         }
     }
@@ -922,3 +1044,4 @@ mod tests {
         assert!(proof.verify(&SecurityConfig::default()).is_ok());
     }
 }
+

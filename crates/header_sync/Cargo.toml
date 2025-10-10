@@ -14,3 +14,4 @@ tracing.workspace = true
 net_iroh = { path = "../net_iroh" }
 bincode.workspace = true
 pq_crypto = { path = "../pq_crypto" }
+reqwest.workspace = true
