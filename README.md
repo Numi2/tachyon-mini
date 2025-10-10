@@ -179,4 +179,26 @@ Credits
 -------
 Idea inspired by Tachyon and Sean Bowe’s writing.
 
+## Onramp (Stripe) Integration
+
+The CLI includes an `onramp` command group that integrates Stripe's fiat-to-crypto onramp so users can buy USDC directly into their wallet, then trade via the DEX.
+
+Prereqs:
+- Set `STRIPE_SECRET_KEY` with your Stripe API key.
+- Optionally set `STRIPE_WEBHOOK_SECRET` for webhook signature verification.
+
+Commands:
+- Create a session:
+  `cargo run -p cli -- onramp create-session --destination <wallet-address> --amount 1000000`
+- Start webhook server (dev):
+  `cargo run -p cli -- onramp webhook --listen 0.0.0.0:8787 --pending-file ./onramp/pending.json`
+- List pending topups:
+  `cargo run -p cli -- onramp pending --pending-file ./onramp/pending.json`
+- Claim a topup into a wallet:
+  `cargo run -p cli -- onramp claim --session-id <id> --db-path <path> --password <pw> --pending-file ./onramp/pending.json`
+
+Notes:
+- Webhook endpoint is `/webhook/stripe`. Configure this URL in your Stripe dashboard or via `stripe listen` tunnel in development.
+- Claimed USDC is credited to the wallet's generalized token ledger and is usable with the DEX commands.
+
 

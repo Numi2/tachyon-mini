@@ -3,7 +3,7 @@
 //! Command-line interface for Tachyon wallet and network tools.
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::Path;
 use tracing_subscriber;
 use wallet::{TachyonWallet, WalletConfig};
@@ -11,6 +11,7 @@ use bytes::Bytes;
 use net_iroh::{BlobKind, TachyonNetwork};
 use node_ext::{NodeConfig, NetworkConfig};
 use header_sync::{HeaderSyncConfig as HsConfig, HeaderSyncManager};
+use onramp_stripe as onramp;
 
 /// Tachyon CLI application
 #[derive(Parser)]
@@ -26,9 +27,18 @@ pub struct Cli {
     pub verbose: bool,
 
     /// Data directory
-    #[arg(short, long, default_value = "./tachyon_data")]
+    #[arg(short, long, default_value = "~/.tachyon")] 
     pub data_dir: String,
+    /// Output format (table or json)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+    /// Non-interactive mode (do not prompt)
+    #[arg(long, default_value_t = false)]
+    pub non_interactive: bool,
 }
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat { Table, Json }
 
 /// Available CLI commands
 #[derive(Subcommand)]
@@ -37,6 +47,11 @@ pub enum Commands {
     Wallet {
         #[command(subcommand)]
         wallet_command: WalletCommands,
+    },
+    /// Simple DEX operations (in-memory)
+    Dex {
+        #[command(subcommand)]
+        dex_command: DexCommands,
     },
     /// Network operations
     Network {
@@ -47,6 +62,11 @@ pub enum Commands {
     HeaderSync {
         #[command(subcommand)]
         hs_command: HeaderSyncCommands,
+    },
+    /// Stripe onramp integration
+    Onramp {
+        #[command(subcommand)]
+        onramp_command: OnrampCommands,
     },
 }
 
@@ -207,6 +227,190 @@ pub enum WalletCommands {
     },
 }
 
+/// Onramp commands
+#[derive(Subcommand)]
+pub enum OnrampCommands {
+    /// Create onramp session and print URL
+    CreateSession {
+        /// Stripe secret key (or set STRIPE_SECRET_KEY)
+        #[arg(long)]
+        secret_key: Option<String>,
+        /// Webhook secret (optional; or set STRIPE_WEBHOOK_SECRET)
+        #[arg(long)]
+        webhook_secret: Option<String>,
+        /// Destination address for USDC
+        #[arg(long)]
+        destination: String,
+        /// Destination network (ethereum|solana|polygon|avalanche|base|stellar)
+        #[arg(long, default_value = "ethereum")]
+        network: String,
+        /// Destination currency (default: usdc)
+        #[arg(long, default_value = "usdc")]
+        currency: String,
+        /// Suggested destination amount (USDC minor units, e.g., 1000000 = 1 USDC if 6 decimals)
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Start local webhook server to receive Stripe events
+    Webhook {
+        /// Listen address, e.g., 0.0.0.0:8787
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: String,
+        /// Path to persist pending topups JSON
+        #[arg(long, default_value = "./onramp/pending.json")]
+        pending_file: String,
+        /// Webhook secret (or set STRIPE_WEBHOOK_SECRET)
+        #[arg(long)]
+        webhook_secret: Option<String>,
+        /// Stripe secret key (for session lookups)
+        #[arg(long)]
+        secret_key: Option<String>,
+    },
+    /// List pending topups
+    Pending {
+        /// Path to pending topups JSON
+        #[arg(long, default_value = "./onramp/pending.json")]
+        pending_file: String,
+    },
+    /// Claim a pending topup into a wallet
+    Claim {
+        /// Session id to claim
+        #[arg(long)]
+        session_id: String,
+        /// Wallet database path
+        #[arg(long)]
+        db_path: String,
+        /// Master password
+        #[arg(long)]
+        password: String,
+        /// Path to pending topups JSON
+        #[arg(long, default_value = "./onramp/pending.json")]
+        pending_file: String,
+    },
+}
+
+/// DEX commands
+#[derive(Subcommand)]
+pub enum DexCommands {
+    /// Show balances (USDC/base)
+    Balance {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+    /// Watch orderbook and trades (polling)
+    Watch {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Poll interval millis
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Depth levels
+        #[arg(long, default_value_t = 10)]
+        depth: usize,
+    },
+    /// Deposit USDC
+    DepositUsdc {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Amount (USDC units)
+        #[arg(short, long)]
+        amount: u64,
+    },
+    /// Deposit base asset units (for selling)
+    DepositBase {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Amount (base units)
+        #[arg(short, long)]
+        amount: u64,
+    },
+    /// Place a limit order
+    PlaceLimit {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Side (bid/ask)
+        #[arg(short, long)]
+        side: String,
+        /// Price (quote per base, e.g., USDC per unit)
+        #[arg(short, long)]
+        price: u64,
+        /// Quantity (base units)
+        #[arg(short, long)]
+        qty: u64,
+    },
+    /// Place a market order
+    PlaceMarket {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Side (bid/ask)
+        #[arg(short, long)]
+        side: String,
+        /// Quantity (base units)
+        #[arg(short, long)]
+        qty: u64,
+    },
+    /// Cancel an order by id
+    Cancel {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Order ID
+        #[arg(short, long)]
+        id: u64,
+    },
+    /// Show orderbook snapshot
+    OrderBook {
+        /// Depth levels to show
+        #[arg(short, long, default_value_t = 10)]
+        depth: usize,
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+    /// Show recent trades
+    Trades {
+        /// Limit
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password (prompt if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+}
+
 /// Network-specific commands
 #[derive(Subcommand)]
 pub enum NetworkCommands {
@@ -271,7 +475,15 @@ pub enum HeaderSyncCommands {
 
 /// Run the CLI application
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Expand ~ in data_dir
+    if cli.data_dir.starts_with("~/") {
+        if let Some(home) = dirs_next::home_dir() {
+            let rest = &cli.data_dir[2..];
+            cli.data_dir = format!("{}/{}", home.to_string_lossy(), rest);
+        }
+    }
 
     // Initialize logging
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
@@ -289,8 +501,10 @@ pub async fn run() -> Result<()> {
         Commands::Wallet { wallet_command } => {
             execute_wallet_command(wallet_command, &cli.data_dir).await
         }
+        Commands::Dex { dex_command } => execute_dex_command(dex_command, cli.format, cli.non_interactive).await,
         Commands::Network { network_command } => execute_network_command(network_command).await,
         Commands::HeaderSync { hs_command } => execute_header_sync_command(hs_command).await,
+        Commands::Onramp { onramp_command } => execute_onramp_command(onramp_command).await,
     }
 }
 
@@ -631,6 +845,156 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
     Ok(())
 }
 
+/// Execute DEX commands
+fn prompt_password(non_interactive: bool) -> Result<String> {
+    if non_interactive { return Err(anyhow!("password is required in non-interactive mode")); }
+    let pw = rpassword::prompt_password("Password: ")?;
+    Ok(pw)
+}
+
+async fn execute_dex_command(command: DexCommands, format: OutputFormat, non_interactive: bool) -> Result<()> {
+    match command {
+        DexCommands::Balance { db_path, password } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let (usdc, usdc_locked, base, base_locked) = wallet.get_balances().await?;
+            match format {
+                OutputFormat::Json => {
+                    let out = serde_json::json!({"usdc": usdc, "usdc_locked": usdc_locked, "base": base, "base_locked": base_locked});
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                OutputFormat::Table => {
+                    println!("USDC: {} (locked {})", usdc, usdc_locked);
+                    println!("BASE: {} (locked {})", base, base_locked);
+                }
+            }
+        }
+        DexCommands::DepositUsdc { db_path, password, amount } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            wallet.deposit_usdc(amount).await?;
+            println!("Deposited {} USDC", amount);
+        }
+        DexCommands::DepositBase { db_path, password, amount } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            wallet.deposit_base(amount).await?;
+            println!("Deposited {} BASE", amount);
+        }
+        DexCommands::PlaceLimit { db_path, password, side, price, qty } => {
+            let s = match side.to_lowercase().as_str() { "bid" => dex::Side::Bid, "ask" => dex::Side::Ask, _ => return Err(anyhow!("invalid side")) };
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let (id, trades) = wallet.place_limit_order(s, price, qty).await?;
+            println!("Order placed id={}", id.0);
+            for t in trades {
+                println!("Trade: side={:?} price={} qty={}", t.taker_side, t.price.0, t.quantity.0);
+            }
+        }
+        DexCommands::PlaceMarket { db_path, password, side, qty } => {
+            let s = match side.to_lowercase().as_str() { "bid" => dex::Side::Bid, "ask" => dex::Side::Ask, _ => return Err(anyhow!("invalid side")) };
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let (id, trades) = wallet.place_market_order(s, qty).await?;
+            println!("Market order id={}", id.0);
+            for t in trades { println!("Trade: side={:?} price={} qty={}", t.taker_side, t.price.0, t.quantity.0); }
+        }
+        DexCommands::Cancel { db_path, password, id } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let ok = wallet.cancel_order(dex::OrderId(id)).await?;
+            println!("{}", if ok { "cancelled" } else { "not-found" });
+        }
+        DexCommands::OrderBook { depth, db_path, password } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let ob = wallet.orderbook(depth);
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({"bids": ob.bids.iter().map(|(p,q)| serde_json::json!({"price": p.0, "qty": q})).collect::<Vec<_>>(), "asks": ob.asks.iter().map(|(p,q)| serde_json::json!({"price": p.0, "qty": q})).collect::<Vec<_>>()}))?);
+                }
+                OutputFormat::Table => {
+                    println!("Bids:");
+                    for (p, q) in ob.bids { println!("  {} @ {}", q, p.0); }
+                    println!("Asks:");
+                    for (p, q) in ob.asks { println!("  {} @ {}", q, p.0); }
+                }
+            }
+        }
+        DexCommands::Trades { limit, db_path, password } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let trades = wallet.trades(limit);
+            match format {
+                OutputFormat::Json => {
+                    let rows: Vec<_> = trades.into_iter().map(|t| serde_json::json!({"side": format!("{:?}", t.taker_side).to_lowercase(), "price": t.price.0, "qty": t.quantity.0})).collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                OutputFormat::Table => {
+                    for t in trades { println!("{:?}: qty={} price={}", t.taker_side, t.quantity.0, t.price.0); }
+                }
+            }
+        }
+        DexCommands::Watch { db_path, password, interval_ms, depth } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.or_else(|| prompt_password(non_interactive).ok()).unwrap_or_default();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            loop {
+                let ob = wallet.orderbook(depth);
+                let trades = wallet.trades(10);
+                match format {
+                    OutputFormat::Json => {
+                        let json = serde_json::json!({
+                            "orderbook": {
+                                "bids": ob.bids.iter().map(|(p,q)| serde_json::json!({"price": p.0, "qty": q})).collect::<Vec<_>>(),
+                                "asks": ob.asks.iter().map(|(p,q)| serde_json::json!({"price": p.0, "qty": q})).collect::<Vec<_>>()
+                            },
+                            "trades": trades.iter().map(|t| serde_json::json!({"side": format!("{:?}", t.taker_side).to_lowercase(), "price": t.price.0, "qty": t.quantity.0})).collect::<Vec<_>>()
+                        });
+                        println!("{}", serde_json::to_string_pretty(&json)?);
+                    }
+                    OutputFormat::Table => {
+                        println!("Bids:");
+                        for (p,q) in &ob.bids { println!("  {} @ {}", q, p.0); }
+                        println!("Asks:");
+                        for (p,q) in &ob.asks { println!("  {} @ {}", q, p.0); }
+                        println!("Recent trades:");
+                        for t in trades { println!("{:?}: qty={} price={}", t.taker_side, t.quantity.0, t.price.0); }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Extract the 0x<hex> Kyber public key from an OOB URI
 fn parse_oob_pk_hex_from_uri(uri: &str) -> Result<String> {
     let lower = uri.to_lowercase();
@@ -756,6 +1120,41 @@ async fn execute_header_sync_command(command: HeaderSyncCommands) -> Result<()> 
             mgr.sync_to_height(latest).await?;
             let status = mgr.get_sync_status().await;
             println!("Synced to height {} (target {:?})", status.current_height, status.target_height);
+        }
+    }
+    Ok(())
+}
+
+/// Execute onramp commands
+async fn execute_onramp_command(command: OnrampCommands) -> Result<()> {
+    match command {
+        OnrampCommands::CreateSession { secret_key, webhook_secret: _, destination, network, currency, amount } => {
+            let key = secret_key.or_else(|| std::env::var("STRIPE_SECRET_KEY").ok()).ok_or_else(|| anyhow!("missing stripe secret key"))?;
+            let cfg = onramp::OnrampConfig { stripe_secret_key: key, webhook_secret: None, destination_address: destination, destination_network: network, destination_currency: currency };
+            let session = onramp::create_onramp_session(&cfg, amount).await?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"id": session.session_id, "url": session.url}))?);
+        }
+        OnrampCommands::Webhook { listen, pending_file, webhook_secret, secret_key } => {
+            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
+            let secret = webhook_secret.or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").ok());
+            let stripe_sk = secret_key.or_else(|| std::env::var("STRIPE_SECRET_KEY").ok());
+            let addr: std::net::SocketAddr = listen.parse().map_err(|_| anyhow!("invalid listen addr"))?;
+            onramp::start_webhook_server(addr, store.clone(), secret, stripe_sk).await?;
+        }
+        OnrampCommands::Pending { pending_file } => {
+            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
+            let list = store.list().await?;
+            println!("{}", serde_json::to_string_pretty(&list)?);
+        }
+        OnrampCommands::Claim { session_id, db_path, password, pending_file } => {
+            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            onramp::claim_pending_into_wallet(&session_id, &store, &wallet).await?;
+            println!("ok");
         }
     }
     Ok(())

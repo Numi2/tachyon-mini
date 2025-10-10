@@ -1,0 +1,22 @@
+[package]
+name = "dex"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+parking_lot = "0.12"
+serde_json.workspace = true
+bincode.workspace = true
+
+[features]
+default = []
+# Placeholder feature for optional external engine integration
+external_orderbook = []
+

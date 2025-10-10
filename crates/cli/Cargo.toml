@@ -25,3 +25,6 @@ node_ext = { path = "../node_ext" }
 header_sync = { path = "../header_sync" }
 bytes = "1.6"
 blake3 = "1.5"
+rpassword = "7"
+dirs-next = "2"
+onramp_stripe = { path = "../onramp_stripe" }

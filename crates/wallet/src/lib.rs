@@ -23,6 +23,7 @@ use tokio::{
 use reqwest::Client as HttpClient;
 use accum_mmr::{MmrAccumulator, MmrWitness};
 use bincode;
+use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, OwnerId as DexOwnerId, OrderId as DexOrderId, OrderBookSnapshot as DexSnapshot, Trade as DexTrade};
 
 /// Wallet configuration
 #[derive(Debug, Clone)]
@@ -324,6 +325,8 @@ pub struct TachyonWallet {
     sync_task: Option<JoinHandle<()>>,
     /// Shutdown channel
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
+    /// In-memory DEX service (single-market) for demo
+    dex: Arc<DexService>,
 }
 
 /// Out-of-band payment handler
@@ -614,6 +617,7 @@ impl TachyonWallet {
             oob_handler,
             sync_task: None,
             shutdown_tx: None,
+            dex: Arc::new(DexService::new()),
         })
     }
 
@@ -834,6 +838,135 @@ impl TachyonWallet {
             pending_payments: self.oob_handler.read().await.pending_payments.len(),
         })
     }
+
+    /// Get balances (available and locked) for USDC and base asset
+    pub async fn get_balances(&self) -> Result<(u64, u64, u64, u64)> {
+        Ok((
+            self.database.get_usdc_balance().await,
+            self.database.get_locked_usdc().await,
+            self.database.get_base_balance().await,
+            self.database.get_locked_base().await,
+        ))
+    }
+
+    /// Deposit USDC into the wallet
+    pub async fn deposit_usdc(&self, amount: u64) -> Result<()> {
+        self.database.deposit_usdc(amount).await
+    }
+
+    /// Deposit base asset units (for demo/testing)
+    pub async fn deposit_base(&self, amount: u64) -> Result<()> {
+        self.database.deposit_base(amount).await
+    }
+
+    /// Place a limit order and lock funds accordingly. Returns order id and trades executed.
+    pub async fn place_limit_order(&self, side: DexSide, price: u64, qty: u64) -> Result<(DexOrderId, Vec<DexTrade>)> {
+        match side {
+            DexSide::Bid => {
+                let required_quote = price.saturating_mul(qty);
+                self.database.lock_usdc(required_quote).await?;
+            }
+            DexSide::Ask => {
+                self.database.lock_base(qty).await?;
+            }
+        }
+
+        let (id, trades) = self.dex.place_limit(DexOwnerId(1), side, DexPrice(price), DexQty(qty))?;
+        // Settle trades: move between locked and available balances
+        for t in &trades {
+            match t.taker_side {
+                DexSide::Bid => {
+                    // We are the taker (bid) only if owner matches; for demo we assume owner id=1
+                    if t.taker_owner.0 == 1 {
+                        self.database.settle_bid_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
+                    } else if t.maker_owner.0 == 1 {
+                        self.database.settle_ask_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
+                    }
+                }
+                DexSide::Ask => {
+                    if t.taker_owner.0 == 1 {
+                        self.database.settle_ask_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
+                    } else if t.maker_owner.0 == 1 {
+                        self.database.settle_bid_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
+                    }
+                }
+            }
+        }
+
+        // If any residual locked funds remain on this order, they stay locked until cancel or fill.
+        Ok((id, trades))
+    }
+
+    /// Place a market order. Locks max expected spend for bids (estimation) and base for asks.
+    pub async fn place_market_order(&self, side: DexSide, qty: u64) -> Result<(DexOrderId, Vec<DexTrade>)> {
+        match side {
+            DexSide::Bid => {
+                // Estimate cost at current book; lock that much USDC
+                let (filled, cost) = self.dex.estimate_market_cost(DexSide::Bid, DexQty(qty));
+                if filled == 0 { return Ok((DexOrderId(0), Vec::new())); }
+                self.database.lock_usdc(cost).await?;
+                let (id, trades) = self.dex.place_market(DexOwnerId(1), DexSide::Bid, DexQty(qty))?;
+                // Settle trades and refund any unused locked USDC
+                let mut spent = 0u64;
+                for t in &trades {
+                    if t.taker_owner.0 == 1 {
+                        spent = spent.saturating_add(t.price.0.saturating_mul(t.quantity.0));
+                        self.database.deposit_base(t.quantity.0).await?;
+                    } else if t.maker_owner.0 == 1 {
+                        self.database.spend_locked_base(t.quantity.0).await?;
+                        self.database.deposit_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
+                    }
+                }
+                if cost > spent { self.database.unlock_usdc(cost - spent).await?; }
+                self.database.spend_locked_usdc(spent).await?;
+                Ok((id, trades))
+            }
+            DexSide::Ask => {
+                self.database.lock_base(qty).await?;
+                let (id, trades) = self.dex.place_market(DexOwnerId(1), DexSide::Ask, DexQty(qty))?;
+                let mut sold = 0u64;
+                for t in &trades {
+                    if t.taker_owner.0 == 1 {
+                        sold = sold.saturating_add(t.quantity.0);
+                        self.database.deposit_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
+                    } else if t.maker_owner.0 == 1 {
+                        self.database.spend_locked_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
+                        self.database.deposit_base(t.quantity.0).await?;
+                    }
+                }
+                if qty > sold { self.database.unlock_base(qty - sold).await?; }
+                self.database.spend_locked_base(sold).await?;
+                Ok((id, trades))
+            }
+        }
+    }
+
+    /// Cancel an order and unlock remaining locked funds.
+    pub async fn cancel_order(&self, id: DexOrderId) -> Result<bool> {
+        if let Some(order) = self.dex.get_order(id) {
+            let ok = self.dex.cancel(id)?;
+            if ok {
+                match order.side {
+                    DexSide::Bid => {
+                        let remaining_cost = order.price.0.saturating_mul(order.remaining.0);
+                        let _ = self.database.unlock_usdc(remaining_cost).await?;
+                    }
+                    DexSide::Ask => {
+                        let _ = self.database.unlock_base(order.remaining.0).await?;
+                    }
+                }
+            }
+            Ok(ok)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get orderbook snapshot
+    pub fn orderbook(&self, depth: usize) -> DexSnapshot { self.dex.orderbook(depth) }
+
+    /// Get recent trades
+    pub fn trades(&self, limit: usize) -> Vec<DexTrade> { self.dex.recent_trades(limit) }
 
     /// Receive an out-of-band payment
     pub async fn receive_oob_payment(&self, payment: OutOfBandPayment) -> Result<[u8; 32]> {

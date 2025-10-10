@@ -250,6 +250,8 @@ pub struct WalletDatabase {
     oob_keys_cache: Arc<RwLock<Option<OobKeysRecord>>>,
     /// In-memory spend secret cache (encrypted on disk)
     spend_secret_cache: Arc<RwLock<Option<SpendSecretRecord>>>,
+    /// In-memory token ledger (generalized balances)
+    token_ledger: Arc<RwLock<TokenLedger>>, 
 }
 
 impl WalletDatabase {
@@ -280,6 +282,7 @@ impl WalletDatabase {
             witness_cache: Arc::new(RwLock::new(HashMap::new())),
             oob_keys_cache: Arc::new(RwLock::new(None)),
             spend_secret_cache: Arc::new(RwLock::new(None)),
+            token_ledger: Arc::new(RwLock::new(TokenLedger::default())),
         };
 
         // Load existing data from disk
@@ -370,6 +373,32 @@ impl WalletDatabase {
             *self.spend_secret_cache.write().unwrap() = Some(rec);
         }
 
+        // Load token ledger v2 (preferred), or migrate legacy balances if present
+        let ledger_v2_path = self.db_path.join("balances_v2.bin");
+        if ledger_v2_path.exists() {
+            let data = fs::read(&ledger_v2_path).await?;
+            let ledger: TokenLedger = bincode::deserialize(&data)?;
+            *self.token_ledger.write().unwrap() = ledger;
+        } else {
+            let legacy_path = self.db_path.join("balances.bin");
+            if legacy_path.exists() {
+                let data = fs::read(&legacy_path).await?;
+                if let Ok(legacy) = bincode::deserialize::<TokenBalancesLegacy>(&data) {
+                    let mut ledger = TokenLedger::default();
+                    ledger.set_meta(TOKEN_USDC.to_string(), TokenMeta { decimals: 6 });
+                    ledger.set_meta(TOKEN_BASE.to_string(), TokenMeta { decimals: 0 });
+                    ledger.set_balance(TOKEN_USDC, legacy.usdc, legacy.usdc_locked);
+                    ledger.set_balance(TOKEN_BASE, legacy.base, legacy.base_locked);
+                    *self.token_ledger.write().unwrap() = ledger;
+                    // Persist migrated v2
+                    let tmp = self.db_path.join("balances_v2.bin.tmp");
+                    let data = bincode::serialize(&*self.token_ledger.read().unwrap())?;
+                    fs::write(&tmp, &data).await?;
+                    fs::rename(&tmp, &ledger_v2_path).await?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -426,6 +455,16 @@ impl WalletDatabase {
             fs::write(&tmp, &data).await?;
             fs::rename(&tmp, &spend_path).await?;
         }
+
+        // Save token ledger v2 atomically
+        let ledger_v2_path = self.db_path.join("balances_v2.bin");
+        let ledger_tmp = self.db_path.join("balances_v2.bin.tmp");
+        let ledger_data = {
+            let ledger = self.token_ledger.read().unwrap();
+            bincode::serialize(&*ledger)?
+        };
+        fs::write(&ledger_tmp, &ledger_data).await?;
+        fs::rename(&ledger_tmp, &ledger_v2_path).await?;
 
         Ok(())
     }
@@ -700,6 +739,189 @@ impl Drop for WalletDatabase {
     fn drop(&mut self) {
         // Best-effort unlock; dropping the file will also release the lock
         let _ = fs2::FileExt::unlock(&self.lock_file);
+    }
+}
+
+/// Legacy fixed-token balances file format (for migration only)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct TokenBalancesLegacy {
+    pub usdc: u64,
+    pub base: u64,
+    pub usdc_locked: u64,
+    pub base_locked: u64,
+}
+
+pub const TOKEN_USDC: &str = "USDC";
+pub const TOKEN_BASE: &str = "BASE";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TokenMeta { pub decimals: u8 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct BalanceRecord { pub available: u64, pub locked: u64 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenLedger {
+    balances: HashMap<String, BalanceRecord>,
+    meta: HashMap<String, TokenMeta>,
+}
+
+impl TokenLedger {
+    fn set_meta(&mut self, token: String, meta: TokenMeta) { self.meta.insert(token, meta); }
+    fn ensure_token(&mut self, token: &str) {
+        self.balances.entry(token.to_string()).or_insert_with(BalanceRecord::default);
+    }
+    fn set_balance(&mut self, token: &str, available: u64, locked: u64) {
+        self.balances.insert(token.to_string(), BalanceRecord { available, locked });
+    }
+    fn available_of(&self, token: &str) -> u64 { self.balances.get(token).map(|b| b.available).unwrap_or(0) }
+    fn locked_of(&self, token: &str) -> u64 { self.balances.get(token).map(|b| b.locked).unwrap_or(0) }
+    fn credit_available(&mut self, token: &str, amount: u64) {
+        self.ensure_token(token);
+        let e = self.balances.get_mut(token).unwrap();
+        e.available = e.available.saturating_add(amount);
+    }
+    fn debit_available(&mut self, token: &str, amount: u64) -> Result<()> {
+        self.ensure_token(token);
+        let e = self.balances.get_mut(token).unwrap();
+        if e.available < amount { return Err(anyhow!("insufficient available balance for {}", token)); }
+        e.available -= amount; Ok(())
+    }
+    fn lock(&mut self, token: &str, amount: u64) -> Result<()> {
+        self.ensure_token(token);
+        let e = self.balances.get_mut(token).unwrap();
+        if e.available < amount { return Err(anyhow!("insufficient available to lock for {}", token)); }
+        e.available -= amount; e.locked = e.locked.saturating_add(amount); Ok(())
+    }
+    fn unlock(&mut self, token: &str, amount: u64) -> Result<()> {
+        self.ensure_token(token);
+        let e = self.balances.get_mut(token).unwrap();
+        if e.locked < amount { return Err(anyhow!("unlock exceeds locked for {}", token)); }
+        e.locked -= amount; e.available = e.available.saturating_add(amount); Ok(())
+    }
+    fn spend_locked(&mut self, token: &str, amount: u64) -> Result<()> {
+        self.ensure_token(token);
+        let e = self.balances.get_mut(token).unwrap();
+        if e.locked < amount { return Err(anyhow!("spend exceeds locked for {}", token)); }
+        e.locked -= amount; Ok(())
+    }
+}
+
+impl WalletDatabase {
+    /// Get current USDC balance
+    pub async fn get_usdc_balance(&self) -> u64 { self.get_token_available(TOKEN_USDC).await }
+
+    /// Deposit USDC into the wallet
+    pub async fn deposit_usdc(&self, amount: u64) -> Result<()> { self.credit_token(TOKEN_USDC, amount).await }
+
+    /// Withdraw USDC from the wallet
+    pub async fn withdraw_usdc(&self, amount: u64) -> Result<()> { self.debit_token(TOKEN_USDC, amount).await }
+
+    /// Get base asset balance
+    pub async fn get_base_balance(&self) -> u64 { self.get_token_available(TOKEN_BASE).await }
+
+    /// Deposit base asset units (for selling). For demo/testing.
+    pub async fn deposit_base(&self, amount: u64) -> Result<()> { self.credit_token(TOKEN_BASE, amount).await }
+
+    /// Withdraw base asset units (for settlement)
+    pub async fn withdraw_base(&self, amount: u64) -> Result<()> { self.debit_token(TOKEN_BASE, amount).await }
+
+    /// Get locked USDC
+    pub async fn get_locked_usdc(&self) -> u64 { self.get_token_locked(TOKEN_USDC).await }
+
+    /// Get locked base
+    pub async fn get_locked_base(&self) -> u64 { self.get_token_locked(TOKEN_BASE).await }
+
+    /// Lock USDC for open orders
+    pub async fn lock_usdc(&self, amount: u64) -> Result<()> { self.lock_token(TOKEN_USDC, amount).await }
+
+    /// Unlock USDC back to available
+    pub async fn unlock_usdc(&self, amount: u64) -> Result<()> { self.unlock_token(TOKEN_USDC, amount).await }
+
+    /// Spend locked USDC (filled amount)
+    pub async fn spend_locked_usdc(&self, amount: u64) -> Result<()> { self.spend_locked_token(TOKEN_USDC, amount).await }
+
+    /// Lock base for open sell orders
+    pub async fn lock_base(&self, amount: u64) -> Result<()> { self.lock_token(TOKEN_BASE, amount).await }
+
+    /// Unlock base back to available
+    pub async fn unlock_base(&self, amount: u64) -> Result<()> { self.unlock_token(TOKEN_BASE, amount).await }
+
+    /// Spend locked base (filled amount)
+    pub async fn spend_locked_base(&self, amount: u64) -> Result<()> { self.spend_locked_token(TOKEN_BASE, amount).await }
+
+    /// Atomic settlement for a bid fill: spend locked USDC and credit base.
+    pub async fn settle_bid_fill(&self, base_qty: u64, quote_cost: u64) -> Result<()> {
+        {
+            let mut ledger = self.token_ledger.write().unwrap();
+            ledger.spend_locked(TOKEN_USDC, quote_cost)?;
+            ledger.credit_available(TOKEN_BASE, base_qty);
+        }
+        self.save_to_disk().await
+    }
+
+    /// Atomic settlement for an ask fill: spend locked base and credit USDC.
+    pub async fn settle_ask_fill(&self, base_qty: u64, quote_gain: u64) -> Result<()> {
+        {
+            let mut ledger = self.token_ledger.write().unwrap();
+            ledger.spend_locked(TOKEN_BASE, base_qty)?;
+            ledger.credit_available(TOKEN_USDC, quote_gain);
+        }
+        self.save_to_disk().await
+    }
+
+    /// Generic helpers
+    pub async fn credit_token(&self, token: &str, amount: u64) -> Result<()> {
+        if amount == 0 { return Ok(()); }
+        {
+            let mut ledger = self.token_ledger.write().unwrap();
+            ledger.credit_available(token, amount);
+        }
+        self.save_to_disk().await
+    }
+
+    pub async fn debit_token(&self, token: &str, amount: u64) -> Result<()> {
+        if amount == 0 { return Ok(()); }
+        {
+            let mut ledger = self.token_ledger.write().unwrap();
+            ledger.debit_available(token, amount)?;
+        }
+        self.save_to_disk().await
+    }
+
+    pub async fn lock_token(&self, token: &str, amount: u64) -> Result<()> {
+        if amount == 0 { return Ok(()); }
+        {
+            let mut ledger = self.token_ledger.write().unwrap();
+            ledger.lock(token, amount)?;
+        }
+        self.save_to_disk().await
+    }
+
+    pub async fn unlock_token(&self, token: &str, amount: u64) -> Result<()> {
+        if amount == 0 { return Ok(()); }
+        {
+            let mut ledger = self.token_ledger.write().unwrap();
+            ledger.unlock(token, amount)?;
+        }
+        self.save_to_disk().await
+    }
+
+    pub async fn spend_locked_token(&self, token: &str, amount: u64) -> Result<()> {
+        if amount == 0 { return Ok(()); }
+        {
+            let mut ledger = self.token_ledger.write().unwrap();
+            ledger.spend_locked(token, amount)?;
+        }
+        self.save_to_disk().await
+    }
+
+    pub async fn get_token_available(&self, token: &str) -> u64 {
+        self.token_ledger.read().unwrap().available_of(token)
+    }
+
+    pub async fn get_token_locked(&self, token: &str) -> u64 {
+        self.token_ledger.read().unwrap().locked_of(token)
     }
 }
 

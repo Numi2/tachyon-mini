@@ -21,6 +21,7 @@ bincode.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hex = "0.4"
 accum_mmr = { path = "../accum_mmr" }
+dex = { path = "../dex" }
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -14,6 +14,8 @@ members = [
     "crates/cli",
     "crates/bench",
     "crates/qerkle",
+    "crates/dex",
+    "crates/onramp_stripe",
 ]
 resolver = "2"
 
@@ -96,6 +98,8 @@ cli = { path = "crates/cli" }
 bench = { path = "crates/bench" }
 accum_set = { path = "crates/accum_set" }
 qerkle = { path = "crates/qerkle" }
+dex = { path = "crates/dex" }
+onramp_stripe = { path = "crates/onramp_stripe" }
 
 [workspace.package]
 version = "0.1.0"
