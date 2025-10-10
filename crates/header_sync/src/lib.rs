@@ -160,6 +160,8 @@ pub struct HeaderChain {
     pub tip: Option<u64>,
     /// MMR roots for each height
     pub mmr_roots: HashMap<u64, SerializableHash>,
+    /// Nullifier set roots for each height
+    pub nullifier_roots: HashMap<u64, SerializableHash>,
     /// Checkpoint data for fast sync
     pub checkpoints: Vec<Checkpoint>,
     /// PoW configuration governing header validation
@@ -177,6 +179,7 @@ impl HeaderChain {
             headers,
             tip: Some(0),
             mmr_roots: HashMap::new(),
+            nullifier_roots: HashMap::new(),
             checkpoints: Vec::new(),
             pow: PowConfig::default(),
         }
@@ -486,6 +489,8 @@ pub struct Checkpoint {
     pub header_hash: SerializableHash,
     /// MMR root at checkpoint
     pub mmr_root: SerializableHash,
+    /// Nullifier set root at checkpoint
+    pub nullifier_root: SerializableHash,
     /// NiPoPoW proof to this checkpoint
     pub proof: NiPoPoWProof,
     /// Trusted signatures
@@ -494,11 +499,12 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     /// Create a new checkpoint
-    pub fn new(height: u64, header_hash: Hash, mmr_root: Hash, proof: NiPoPoWProof) -> Self {
+    pub fn new(height: u64, header_hash: Hash, mmr_root: Hash, nullifier_root: Hash, proof: NiPoPoWProof) -> Self {
         Self {
             height,
             header_hash: header_hash.into(),
             mmr_root: mmr_root.into(),
+            nullifier_root: nullifier_root.into(),
             proof,
             signatures: Vec::new(),
         }
@@ -525,6 +531,7 @@ impl Checkpoint {
                 &self.height.to_le_bytes(),
                 self.header_hash.as_bytes(),
                 self.mmr_root.as_bytes(),
+                self.nullifier_root.as_bytes(),
             ],
         );
 
@@ -688,6 +695,7 @@ impl HeaderSyncManager {
                                             if cp.height > chain.tip.unwrap_or(0) {
                                                 chain.checkpoints.push(cp.clone());
                                                 chain.mmr_roots.insert(cp.height, cp.mmr_root);
+                                                chain.nullifier_roots.insert(cp.height, cp.nullifier_root);
                                                 chain.tip = Some(cp.height);
                                                 let mut ss = sync_state_for_anns.write().await;
                                                 ss.current_height = cp.height;
@@ -745,8 +753,9 @@ impl HeaderSyncManager {
             let mut new_chain = HeaderChain::with_pow_config(genesis, self.config.pow_config.clone());
             new_chain.checkpoints.push(cp.clone());
             new_chain.tip = Some(cp.height);
-            // Record the MMR root at checkpoint height
+            // Record the roots at checkpoint height
             new_chain.mmr_roots.insert(cp.height, cp.mmr_root);
+            new_chain.nullifier_roots.insert(cp.height, cp.nullifier_root);
             *chain = new_chain;
 
             // Persist atomically

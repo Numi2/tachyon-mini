@@ -997,6 +997,98 @@ impl TachyonWallet {
         })
     }
 
+    /// Build a node transaction with membership witnesses for spent inputs
+    pub async fn build_node_transaction(
+        &self,
+        spent_inputs: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
+        output_commitments: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
+    ) -> Result<node_ext::Transaction> {
+        // Anchor and roots from current PCD state
+        let state = self
+            .pcd_manager
+            .read()
+            .await
+            .current_state()
+            .cloned()
+            .ok_or_else(|| anyhow!("No current PCD state"))?;
+
+        // Create membership witnesses by proving positions from embedded MMR
+        let mmr_bytes = state.mmr_raw();
+        let mmr: MmrAccumulator = bincode::deserialize(mmr_bytes)
+            .map_err(|e| anyhow!("MMR deserialize failed: {}", e))?;
+
+        let mut witnesses: Vec<Vec<u8>> = Vec::new();
+        for cm in &spent_inputs {
+            if let Some(enc_note) = self.database.get_note(cm).await {
+                if let Ok(proof) = mmr.prove(enc_note.position) {
+                    let witness = MmrWitness {
+                        position: proof.element.position,
+                        auth_path: proof
+                            .siblings
+                            .iter()
+                            .map(|s| (s.position, s.hash))
+                            .collect(),
+                        peaks: proof
+                            .peaks
+                            .iter()
+                            .map(|p| (p.position, p.hash))
+                            .collect(),
+                    };
+                    witnesses.push(bincode::serialize(&witness)?);
+                } else {
+                    witnesses.push(Vec::new());
+                }
+            } else {
+                witnesses.push(Vec::new());
+            }
+        }
+
+        // Derive nullifiers (NF2) for spent inputs
+        let spend_secret = self.database.get_or_generate_spend_secret().await?;
+        let snk = pq_crypto::derive_spend_nullifier_key(&spend_secret);
+        let nullifiers: Vec<[u8; 32]> = spent_inputs
+            .iter()
+            .map(|cm| {
+                let rho = blake3::hash(cm);
+                let mut rho32 = [0u8; 32];
+                rho32.copy_from_slice(rho.as_bytes());
+                pq_crypto::derive_nf2(cm, &rho32, &snk)
+            })
+            .collect();
+
+        // Bind spend proof
+        let mut spend_hasher = blake3::Hasher::new();
+        spend_hasher.update(b"spend_proof_binding:v1");
+        spend_hasher.update(&state.anchor_height.to_le_bytes());
+        for n in &nullifiers { spend_hasher.update(n); }
+        for c in &output_commitments { spend_hasher.update(c); }
+        let spend_proof = spend_hasher.finalize().as_bytes().to_vec();
+
+        // Compose PCD binding proof
+        let mut pcd_hasher = blake3::Hasher::new();
+        pcd_hasher.update(b"tx_pcd_binding");
+        pcd_hasher.update(&state.anchor_height.to_le_bytes());
+        for n in &nullifiers { pcd_hasher.update(n); }
+        let pcd_proof = pcd_hasher.finalize().as_bytes().to_vec();
+
+        let tx = node_ext::Transaction {
+            hash: node_ext::TransactionHash(blake3::hash(b"wallet-tx")),
+            nullifiers,
+            commitments: output_commitments,
+            spent_commitments: spent_inputs,
+            membership_witnesses: witnesses,
+            pcd_proof,
+            pcd_prev_state_commitment: state.state_commitment,
+            pcd_new_state_commitment: state.state_commitment,
+            pcd_mmr_root: state.mmr_root,
+            pcd_nullifier_root: state.nullifier_root,
+            anchor_height: state.anchor_height,
+            spend_proof,
+        };
+
+        Ok(tx)
+    }
+
     /// Sync wallet state to latest
     pub async fn sync(&self) -> Result<()> {
         let mut sync_manager = self.sync_manager.write().await;

@@ -8,28 +8,30 @@ Scope: experimental, credit to Sean Bowe & Zcash team
 
 What this is
 ------------
-- **Wallet**: keeps encrypted notes, witnesses, and a PCD state. Syncs via OSS using blobs; builds spends
-- **OSS (Oblivious Sync Service)**: publishes deltas and transition blobs so wallets can advance state without revealing secrets.
-- **Node extension**: validates PCD proofs and enforces a sliding nullifier window; prunes old state.
+- **Wallet**: keeps encrypted notes, witnesses, and a PCD state; derives FVKey-independent nullifiers (NF2) from a spend-secret; syncs via height-keyed Manifests; builds spends.
+- **OSS (Oblivious Sync Service)**: publishes per-height Manifests that reference commitment MMR deltas, nullifier deltas, and PCD transition blobs. Peers see only content hashes/sizes.
+- **Node extension**: maintains canonical commitment MMR and nullifier SetAccumulator; verifies PCD; enforces nullifier uniqueness across full history; prunes old state.
 - **Accumulators**: MMR for commitments, sparse set for nullifiers; support batched deltas and witness updates.
 - **Header sync**: simplified bootstrap/checkpoint flow.
-- **Networking**: `iroh` + `iroh-blobs` for transport and content addressing.
+- **Networking**: `iroh` + `iroh-blobs` for transport and content addressing; includes `BlobKind::Manifest` and a `SyncManifest` index by height.
+- **Chain nullifier client (optional)**: wallet can query a Zebra HTTP endpoint for observed nullifiers using TLS (`reqwest` + `rustls`).
+- **Witness maintenance**: after adopting a new PCD state, the wallet recomputes and persists MMR witnesses for all unspent notes.
 
 
 Workspace layout
 ----------------
 `crates/`:
-- `net_iroh`: network layer over iroh/iroh-blobs. Control messages, blob publish/fetch, tickets.
+- `net_iroh`: network layer over iroh/iroh-blobs. Control messages, blob publish/fetch, tickets, and per-height `SyncManifest` with `BlobKind::Manifest`.
 - `accum_mmr`: append-only Merkle Mountain Range, deltas, witness maintenance.
 - `accum_set`: sparse set accumulator for nullifiers, batched deltas.
 - `pcd_core`: PCD state, transitions, verification glue. Uses Halo2 proofs for transitions.
 - `circuits`: Halo2 transition circuit with Poseidon binding; real prover/verifier.
-- `wallet`: high-level wallet API: DB, sync loop, OOB payments, tx build skeleton.
-- `oss_service`: delta/transition publishing loop, access tokens, rate limits.
-- `node_ext`: validator shim: verify PCD, enforce nullifier window, prune.
+- `wallet`: high-level wallet API: DB, sync loop consuming Manifests, OOB payments, NF2 nullifiers, optional Zebra integration.
+- `oss_service`: publishes per-height Manifests, commitment/nullifier deltas, and PCD transitions; access tokens & rate limits.
+- `node_ext`: validator shim: verify PCD, enforce canonical nullifier uniqueness, match anchor roots, prune.
 - `header_sync`: simple checkpoint/header bootstrap.
-- `pq_crypto`: Kyber KEM + AES-GCM for OOB; simple VRF-ish nullifier blinding; signing helpers.
-- `storage`: encrypted wallet DB: notes, PCD checkpoints, witnesses, OOB keys.
+- `pq_crypto`: Kyber KEM + AES-GCM for OOB; NF2 PRFs (`derive_spend_nullifier_key`, `derive_nf2`); signing helpers.
+- `storage`: encrypted wallet DB: notes, PCD checkpoints, witnesses, OOB keys, and an encrypted spend secret.
 - `cli`: `tachyon` command; wallet and network subcommands.
 - `bench`: async harness to exercise MMR, PCD, network, crypto, storage.
 - `qerkle`: dynamic-hash Merkle tree (BLAKE3 + Poseidon) with Kyber-encrypted metadata and inclusion proofs.
@@ -41,16 +43,41 @@ Data model
 - `PcdTransition { prev_state_commitment, new_state_commitment, mmr_delta, nullifier_delta, block_height_range, transition_proof }`
 - Deltas are bincode’d batches from `accum_mmr::MmrDelta` and `accum_set::SetDelta`.
 - Proofs are Halo2-based for state transitions (no mocks/stubs).
+- `SyncManifest { height, items: Vec<ManifestItem{ kind, cid, size, ticket, height }] }` published per height; contains only public metadata.
 
 
 Flows
 -----
-- **Sync**: wallet subscribes → fetches blobs via tickets → applies deltas via `pcd_core` → updates `PcdState` → persists.
-- **Spend (skeleton)**: wallet selects notes → builds spend bundle → attaches `PcdState` proof at anchor.
-- **Validation**: node verifies PCD, checks nullifiers against a recent window, prunes historical state.
+- **Sync**: wallet subscribes to Manifests → fetches per-height deltas/proofs via tickets → applies via `pcd_core` → updates `PcdState` → persists; OSS learns only CIDs/sizes.
+- **Chain nullifier observation (optional)**: if `TACHYON_ZEBRA_NULLIFIER_URL` is set, the wallet fetches recent nullifiers, derives NF2 per unspent note, and flags locally-spent notes.
+- **Spend (skeleton)**: wallet selects notes → derives NF2 using a spend secret (not from FVKey) → builds spend bundle → attaches `PcdState` proof at anchor.
+- **Validation**: node verifies PCD, enforces nullifier uniqueness against the canonical set, and requires `anchor_height`, `mmr_root`, and `nullifier_root` to match the node’s canonical state; old state can be pruned.
 - **OOB payment**: Kyber encapsulation → AEAD encrypt note meta → recipient decapsulates → wallet ingests note.
 - **Qerkle (experimental)**: build dynamic-hash Merkle roots using per-level hash choices; produce inclusion proofs that carry sibling path and hash-choice bits; optionally encrypt root+seed metadata with Kyber for distribution.
 
+Nullifiers (NF2)
+----------------
+- Goal: nullifiers must be uncomputable from any viewing key (FVKey) and only computable by the spend authority, while remaining publicly unique.
+- Derivation implemented in `pq_crypto`:
+  - `snk = PRF_snk(sk, "snk")`
+  - `t = PRF_t(snk, ρ)`
+  - `NF2 = H("orchard2.nf" || cm || ρ || t)`
+- Wallet computes NF2 only when spending using a locally encrypted spend secret; OSS learns no spend hints.
+- Node maintains one global nullifier set keyed by the revealed bytes; enforces uniqueness without extra secrets.
+
+Configuration
+-------------
+Environment variables supported by the wallet (see `WalletConfig::from_env()`):
+
+- `TACHYON_DB_PATH`: wallet database directory (default `./wallet_db`).
+- `TACHYON_MASTER_PASSWORD`: password used to derive the DB master key.
+- `TACHYON_IROH_DATA_DIR`: network data directory (default `./wallet_data`).
+- `TACHYON_BOOTSTRAP_NODES`: comma-separated bootstrap peers.
+- `TACHYON_OSS_ENDPOINTS`: comma-separated OSS endpoints (default `localhost:8080`).
+- `TACHYON_SYNC_INTERVAL_SECS`: background sync period (default `30`).
+- `TACHYON_MAX_SYNC_BATCH_SIZE`: max blocks per sync batch (default `10`).
+- `TACHYON_ZEBRA_NULLIFIER_URL`: optional Zebra base URL (enables chain nullifier observation).
+- `TACHYON_ALLOW_INSECURE=1`: allow localhost endpoints and default password for dev.
 
 Adopt Out-of-Band Payments (no protocol changes)
 ------------------------------------------------
@@ -109,78 +136,11 @@ Qerkle usage (dev)
 - Encrypt metadata (root + seed) for a recipient:
   - `EncryptedMetadata::encrypt(&KyberPublicKey, root, seed)` / `decrypt(&KyberSecretKey)`.
 
-Crypto:
-Searching the codebase for signature schemes and crypto libraries.
-
-
-[3 tools called]
-
-Checking `crates/pq_crypto/src/lib.rs` for signature schemes.
-
-
-[2 tools called]
-
-Checking for other signature schemes in networking and dependencies.
-
-
-[2 tools called]
-
-Checking Cargo.lock for signature-related dependencies.
-
-
-[1 tool called]
-
-## Signature Schemes Used in Tachyon Mini
-
-### 1. **Dilithium3 (Post-Quantum Digital Signatures)**
-- **Library**: `pqcrypto-dilithium = "0.5"`
-- **Location**: `crates/pq_crypto/src/lib.rs`
-- **Usage**: Suite B signing API for checkpoint verification
-- **Features**:
-  - Dilithium3 key generation (`SuiteB::generate_keypair()`)
-  - Prehashed signing with BLAKE3 (`SuiteB::sign_prehash()`)
-  - Signature verification (`SuiteB::verify_prehash()`)
-  - Domain-separated hashing for checkpoint signing
-
-### 2. **Ed25519 (via ed25519-dalek)**
-- **Library**: `ed25519-dalek` (transitive dependency)
-- **Usage**: Networking layer (likely via iroh/libp2p)
-- **Features**: Ed25519 signatures for peer identity and authentication
-
-### 3. **Ring-based Cryptography**
-- **Library**: `ring = "0.17.14"` (transitive dependency)
-- **Usage**: TLS/SSL via rustls
-- **Features**: ECDSA signatures for TLS certificates
-
-### 4. **Pairing-based Cryptography**
-- **Library**: `pairing = "0.23.0"` (transitive dependency)
-- **Usage**: Zero-knowledge proofs (halo2)
-- **Features**: BLS signatures and pairing operations
-
-## Additional Cryptographic Components
-
-### **Kyber768 (Post-Quantum KEM)**
-- **Library**: `pqcrypto-kyber = "0.8"`
-- **Usage**: Key encapsulation for out-of-band payments
-- **Features**: Kyber768 key generation, encapsulation, and decapsulation
-
-### **AES-256-GCM**
-- **Library**: `aes-gcm = "0.10"`
-- **Usage**: Symmetric encryption for out-of-band payments
-- **Features**: Authenticated encryption with associated data
-
-### **BLAKE3**
-- **Library**: `blake3 = "1.5"`
-- **Usage**: Hashing, nullifier derivation, and signature prehashing
-- **Features**: Fast cryptographic hashing
-
-## Summary
-
-The project uses:
-1. **Primary signature scheme**: Dilithium3 (post-quantum)
-2. **Networking signatures**: Ed25519 (via iroh/libp2p)
-3. **TLS signatures**: ECDSA (via rustls/ring)
-4. **ZK proof signatures**: BLS/pairing-based (via halo2)
+Cryptography (overview)
+-----------------------
+- Kyber768 (pq KEM) + AES-256-GCM for OOB note encryption.
+- BLAKE3 for hashing and NF2 PRFs; Poseidon inside circuits.
+- Halo2 for PCD transition proofs; Dilithium3 (Suite B) for checkpoint signing.
 
 
 CLI
