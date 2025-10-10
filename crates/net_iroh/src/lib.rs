@@ -57,10 +57,36 @@ pub enum BlobKind {
     NullifierDelta,
     /// PCD transition blob
     PcdTransition,
+    /// Sync manifest (snapshot/delta index) blob
+    Manifest,
     /// Header blob
     Header,
     /// Checkpoint blob
     Checkpoint,
+}
+
+/// A manifest entry describing a single published blob at a given height
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestItem {
+    /// Blob kind
+    pub kind: BlobKind,
+    /// Content identifier (BLAKE3 hash)
+    pub cid: Cid,
+    /// Block height key
+    pub height: u64,
+    /// Size in bytes
+    pub size: usize,
+    /// Retrieval ticket (iroh-blobs ticket string)
+    pub ticket: String,
+}
+
+/// Sync manifest summarizing all public blobs for a given height
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncManifest {
+    /// Height this manifest refers to
+    pub height: u64,
+    /// Entries included in this manifest
+    pub items: Vec<ManifestItem>,
 }
 
 /// Control message types
@@ -87,8 +113,8 @@ pub enum ControlMessage {
     Unsubscribe { kinds: Vec<BlobKind> },
     /// Request headers by consecutive height range
     GetHeadersByHeight { start: u64, count: u32 },
-    /// Response with headers for a requested height range
-    HeadersByHeight { start: u64, headers: Vec<Vec<u8>> },
+    /// Response with headers for a requested height range; includes heights alongside bytes
+    HeadersByHeight { start: u64, headers: Vec<(u64, Vec<u8>)> },
 }
 
 /// Tachyon blob store wrapper around iroh-blobs
@@ -201,6 +227,8 @@ pub struct TachyonNetwork {
     published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>>,
     /// Recent announcements (kind, cid, height, size, ticket) from peers and self
     recent_announcements: Arc<RwLock<Vec<(BlobKind, Cid, u64, usize, String)>>>,
+    /// Optional header provider used to serve header bytes by height
+    header_provider: Arc<RwLock<Option<Arc<dyn HeaderProvider>>>>,
 }
 
 /// Blob store trait for dependency injection
@@ -218,6 +246,15 @@ pub trait BlobStore: Send + Sync + 'static {
         &'a self,
         cid: &'a Cid,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
+/// Header provider for serving headers by height to peers
+pub trait HeaderProvider: Send + Sync + 'static {
+    fn get_headers_by_height<'a>(
+        &'a self,
+        start: u64,
+        count: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u64, Vec<u8>)>> + Send + 'a>>;
 }
 
 impl BlobStore for TachyonBlobStore {
@@ -271,6 +308,7 @@ impl TachyonNetwork {
             peers: peers.clone(),
             control_tx: control_tx.clone(),
             published: published.clone(),
+            header_provider: Arc::new(RwLock::new(None)),
         };
 
         // Register control protocol and iroh-blobs provider for remote blob serving
@@ -330,12 +368,18 @@ impl TachyonNetwork {
             router,
             published,
             recent_announcements,
+            header_provider: control_proto.header_provider.clone(),
         })
     }
 
     /// Get our node ID
     pub fn node_id(&self) -> NodeId {
         self.endpoint.node_id()
+    }
+
+    /// Register a header provider to serve headers by height to peers
+    pub fn set_header_provider(&self, provider: Arc<dyn HeaderProvider>) {
+        *self.header_provider.write().unwrap() = Some(provider);
     }
 
     /// Publish a blob to the network
@@ -410,13 +454,14 @@ impl TachyonNetwork {
         peer_id: NodeId,
         start: u64,
         count: u32,
-    ) -> Result<Vec<Vec<u8>>> {
-        let peers = self.peers.read().unwrap();
-        let conn = peers
-            .get(&peer_id)
-            .ok_or_else(|| anyhow!("not connected to requested peer"))?
-            .clone();
-        drop(peers);
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let conn = {
+            let peers = self.peers.read().unwrap();
+            peers
+                .get(&peer_id)
+                .ok_or_else(|| anyhow!("not connected to requested peer"))?
+                .clone()
+        };
 
         let (mut send, recv) = conn.open_bi().await?;
         let req = ControlMessage::GetHeadersByHeight { start, count };
@@ -436,7 +481,7 @@ impl TachyonNetwork {
         &self,
         start: u64,
         count: u32,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
         let peers: Vec<NodeId> = self.peers_connected();
         if peers.is_empty() {
             return Err(anyhow!("no connected peers"));
@@ -773,6 +818,7 @@ async fn read_framed(mut recv: RecvStream) -> Result<Vec<u8>> {
 struct ControlProtocol {
     peers: Arc<RwLock<HashMap<NodeId, Connection>>>,
     control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
+    header_provider: Arc<RwLock<Option<Arc<dyn HeaderProvider>>>>,
     published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>>,
 }
 
@@ -784,6 +830,7 @@ impl ProtocolHandler for ControlProtocol {
         let peers = self.peers.clone();
         let tx = self.control_tx.clone();
         let published = self.published.clone();
+        let header_provider = self.header_provider.clone();
         Box::pin(async move {
             let node_id = match conn.remote_node_id() {
                 Ok(id) => id,
@@ -801,21 +848,21 @@ impl ProtocolHandler for ControlProtocol {
                             Ok(msg) => {
                                 match msg {
                                     ControlMessage::GetHeadersByHeight { start, count } => {
-                                        // Gather locally published Header blobs by height
-                                        let mut headers: Vec<(u64, Vec<u8>)> = published
-                                            .read()
-                                            .unwrap()
-                                            .iter()
-                                            .filter(|(kind, _bytes, h)| *kind == BlobKind::Header && *h >= start)
-                                            .map(|(_k, bytes, h)| (*h, bytes.clone()))
-                                            .collect();
-                                        headers.sort_by_key(|(h, _)| *h);
-                                        let headers_bytes: Vec<Vec<u8>> = headers
-                                            .into_iter()
-                                            .take(count as usize)
-                                            .map(|(_h, b)| b)
-                                            .collect();
-                                        let resp = ControlMessage::HeadersByHeight { start, headers: headers_bytes };
+                                        // Prefer registered provider; fallback to published list
+                                        let headers_pairs: Vec<(u64, Vec<u8>)> = if let Some(provider) = header_provider.read().unwrap().clone() {
+                                            provider.get_headers_by_height(start, count).await
+                                        } else {
+                                            let mut headers: Vec<(u64, Vec<u8>)> = published
+                                                .read()
+                                                .unwrap()
+                                                .iter()
+                                                .filter(|(kind, _bytes, h)| *kind == BlobKind::Header && *h >= start)
+                                                .map(|(_k, bytes, h)| (*h, bytes.clone()))
+                                                .collect();
+                                            headers.sort_by_key(|(h, _)| *h);
+                                            headers.into_iter().take(count as usize).collect()
+                                        };
+                                        let resp = ControlMessage::HeadersByHeight { start, headers: headers_pairs };
                                         if let Ok(encoded) = bincode::serialize(&resp) {
                                             let _ = write_framed(&mut send, &encoded).await;
                                         }

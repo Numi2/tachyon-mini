@@ -15,3 +15,8 @@ net_iroh = { path = "../net_iroh" }
 bincode.workspace = true
 pq_crypto = { path = "../pq_crypto" }
 reqwest.workspace = true
+
+[features]
+# Enable integration points for Zebra/Zcash header parsing and Equihash PoW verification.
+# This feature gates code paths that expect exact Zcash header serialization and PoW checks.
+zcash_zebra = []

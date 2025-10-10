@@ -53,6 +53,54 @@ pub enum Commands {
 /// Wallet-specific commands
 #[derive(Subcommand)]
 pub enum WalletCommands {
+    /// Share a simple OOB recipient URI for a named wallet
+    Share {
+        /// Wallet name (under <data_dir>/wallets/<name>)
+        #[arg(short, long)]
+        name: String,
+
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Send an out-of-band payment in one step
+    ///
+    /// Accepts either a full OOB URI (tachyon:oobpay?pk=0x...) or raw 0x<pk> for --to
+    SendOob {
+        /// Sender wallet name (under <data_dir>/wallets/<from>)
+        #[arg(long)]
+        from: String,
+
+        /// Master password for sender wallet
+        #[arg(short, long)]
+        password: String,
+
+        /// Recipient OOB URI (tachyon:oobpay?pk=0x...) or 0x<kyber-pk-hex>
+        #[arg(long)]
+        to: String,
+
+        /// Amount/value to send
+        #[arg(short, long)]
+        value: u64,
+
+        /// Optional memo
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// Claim an out-of-band payment from JSON blob
+    ClaimOob {
+        /// Receiver wallet name (under <data_dir>/wallets/<name>)
+        #[arg(short, long)]
+        name: String,
+
+        /// Master password for receiver wallet
+        #[arg(short, long)]
+        password: String,
+
+        /// Payment JSON (from the sender)
+        #[arg(long)]
+        json: String,
+    },
     /// Create a new wallet
     Create {
         /// Wallet name
@@ -249,6 +297,97 @@ pub async fn run() -> Result<()> {
 /// Execute wallet commands
 async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Result<()> {
     match command {
+        WalletCommands::Share { name, password } => {
+            let db_path = format!("{}/wallets/{}", data_dir, name);
+            let wallet_path = Path::new(&db_path);
+            if !wallet_path.exists() {
+                println!("Wallet not found at: {}", db_path);
+                return Ok(());
+            }
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let pk = wallet.get_oob_public_key().await;
+            let uri = format!(
+                "tachyon:oobpay?pk=0x{}&scheme=kyber768",
+                hex::encode(pk.as_bytes())
+            );
+            println!("{}", uri);
+        }
+        WalletCommands::SendOob { from, password, to, value, memo } => {
+            let db_path = format!("{}/wallets/{}", data_dir, from);
+            let wallet_path = Path::new(&db_path);
+            if !wallet_path.exists() {
+                println!("Wallet not found at: {}", db_path);
+                return Ok(());
+            }
+
+            // Build wallet
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+
+            // Parse recipient pk from URI or hex
+            let recipient_pk_bytes = if to.starts_with("tachyon:oobpay") {
+                parse_oob_pk_hex_from_uri(&to)?.into_bytes()
+            } else {
+                to.trim_start_matches("0x").to_string().into_bytes()
+            };
+            let recipient_pk_raw = hex::decode(&recipient_pk_bytes)?;
+            let recipient_pk = pq_crypto::KyberPublicKey::from_bytes(&recipient_pk_raw)?;
+
+            // Compose note metadata
+            let recipient_bytes = blake3::hash(recipient_pk.as_bytes());
+            let mut h_commit = blake3::Hasher::new();
+            h_commit.update(b"note_commitment:v1");
+            h_commit.update(&value.to_le_bytes());
+            h_commit.update(recipient_bytes.as_bytes());
+            let commitment = h_commit.finalize();
+
+            let mut h_rseed = blake3::Hasher::new();
+            h_rseed.update(b"rseed:v1");
+            h_rseed.update(commitment.as_bytes());
+            let rseed = h_rseed.finalize();
+
+            let memo_bytes = memo.unwrap_or_default().into_bytes();
+            let mut meta = Vec::new();
+            meta.extend_from_slice(commitment.as_bytes());
+            meta.extend_from_slice(&value.to_le_bytes());
+            meta.extend_from_slice(recipient_bytes.as_bytes());
+            meta.extend_from_slice(rseed.as_bytes());
+            meta.extend_from_slice(&(memo_bytes.len() as u16).to_le_bytes());
+            meta.extend_from_slice(&memo_bytes);
+
+            let payment = wallet
+                .create_oob_payment(recipient_pk, meta, b"cli_payment".to_vec())
+                .await?;
+            let json = serde_json::to_string(&payment)?;
+            println!("{}", json);
+        }
+        WalletCommands::ClaimOob { name, password, json } => {
+            let db_path = format!("{}/wallets/{}", data_dir, name);
+            let wallet_path = Path::new(&db_path);
+            if !wallet_path.exists() {
+                println!("Wallet not found at: {}", db_path);
+                return Ok(());
+            }
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            let payment: pq_crypto::OutOfBandPayment = serde_json::from_str(&json)?;
+            let hash = wallet.receive_oob_payment(payment).await?;
+            if let Some(note) = wallet.process_oob_payment(&hash).await? {
+                println!("ok:value={}", note.value);
+            } else {
+                println!("no-note");
+            }
+        }
         WalletCommands::Create {
             name,
             password,
@@ -490,6 +629,23 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
     }
 
     Ok(())
+}
+
+/// Extract the 0x<hex> Kyber public key from an OOB URI
+fn parse_oob_pk_hex_from_uri(uri: &str) -> Result<String> {
+    let lower = uri.to_lowercase();
+    if !lower.starts_with("tachyon:oobpay") {
+        return Err(anyhow::anyhow!("invalid oob uri"));
+    }
+    let parts: Vec<&str> = uri.split('?').collect();
+    if parts.len() < 2 { return Err(anyhow::anyhow!("missing query")); }
+    for kv in parts[1].split('&') {
+        let mut it = kv.split('=');
+        let k = it.next().unwrap_or("");
+        let v = it.next().unwrap_or("");
+        if k == "pk" { return Ok(v.to_string()); }
+    }
+    Err(anyhow::anyhow!("pk not found in uri"))
 }
 
 /// Execute network commands

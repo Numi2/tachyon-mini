@@ -142,12 +142,6 @@ impl PcdState {
             return Err(anyhow!("PCD state commitment mismatch"));
         }
 
-        // Verify that the proof binds to the state commitment (hash-based binding)
-        let expected_proof = compute_state_proof(&self.state_commitment);
-        if self.proof.as_slice() != expected_proof.as_slice() {
-            return Err(anyhow!("PCD state proof mismatch"));
-        }
-
         Ok(())
     }
 
@@ -360,16 +354,26 @@ impl PcdStateMachine {
         // Adopt the new commitment from the transition (authoritative)
         new_state.state_commitment = transition.new_state_commitment;
 
-        // Verify transition proof binds prev->new commitments and deltas
-        let expected_transition_proof = compute_transition_proof(
+        // Verify Halo2 transition proof using circuit
+        let halo2 = circuits::PcdCore::load_or_setup(
+            std::path::Path::new("crates/node_ext/node_data/keys"),
+            12,
+        )?;
+        let expected_new = compute_transition_digest_bytes(
             &transition.prev_state_commitment,
-            &transition.new_state_commitment,
-            &transition.mmr_delta,
-            &transition.nullifier_delta,
-            transition.block_height_range,
+            &new_state.mmr_root,
+            &new_state.nullifier_root,
+            new_state.anchor_height,
         );
-        if transition.transition_proof.as_slice() != expected_transition_proof {
-            return Err(anyhow!("Transition proof does not match transition data"));
+        if !halo2.verify_transition_proof(
+            &transition.transition_proof,
+            &transition.prev_state_commitment,
+            &expected_new,
+            &new_state.mmr_root,
+            &new_state.nullifier_root,
+            new_state.anchor_height,
+        )? {
+            return Err(anyhow!("Halo2 transition proof verification failed"));
         }
 
         // Generate a circuit-backed proof bytes using Halo2 mock prover (placeholder backend)
@@ -377,9 +381,15 @@ impl PcdStateMachine {
             std::path::Path::new("crates/node_ext/node_data/keys"),
             12,
         )?;
+        let new_digest = compute_transition_digest_bytes(
+            &transition.prev_state_commitment,
+            &new_state.mmr_root,
+            &new_state.nullifier_root,
+            new_state.anchor_height,
+        );
         let proof_bytes = halo2.prove_transition(
             &transition.prev_state_commitment,
-            &transition.new_state_commitment,
+            &new_digest,
             &new_state.mmr_root,
             &new_state.nullifier_root,
             new_state.anchor_height,

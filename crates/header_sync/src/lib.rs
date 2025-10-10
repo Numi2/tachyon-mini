@@ -5,10 +5,16 @@
 
 use anyhow::{anyhow, Result};
 use blake3::Hash;
+#[cfg(feature = "zcash_zebra")]
+use zebra_chain::parameters::Network as ZebraNetwork;
+#[cfg(feature = "zcash_zebra")]
+use zebra_chain::work::equihash::Solution as ZebraEquihashSolution;
+#[cfg(feature = "zcash_zebra")]
+use zebra_chain::work::difficulty::Expanded as ZebraExpandedTarget;
+#[cfg(feature = "zcash_zebra")]
+use zebra_chain::block::Header as ZebraHeader;
 use pq_crypto::{SuiteB, SuiteBPublicKey, SuiteBSignature, SUITE_B_DOMAIN_CHECKPOINT};
 use net_iroh::{BlobKind, TachyonNetwork};
-use net_iroh::Cid as NetCid;
-use iroh::NodeId as PeerId;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -115,6 +121,30 @@ impl Default for SecurityConfig {
             min_honest_majority: 0.51, // Assume > 51% honest
             min_checkpoint_signatures: 1,
             trusted_checkpoint_keys: Vec::new(),
+        }
+    }
+}
+
+/// Proof-of-Work configuration, including optional Equihash verification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowConfig {
+    /// If true, skip all PoW validation (useful for custom testnets)
+    pub disable_pow_validation: bool,
+    /// If true, validate Equihash solution according to configured parameters
+    pub validate_equihash_solution: bool,
+    /// Equihash parameter n (e.g., 200 for Zcash main/test)
+    pub equihash_n: u32,
+    /// Equihash parameter k (e.g., 9 for Zcash main/test)
+    pub equihash_k: u32,
+}
+
+impl Default for PowConfig {
+    fn default() -> Self {
+        Self {
+            disable_pow_validation: false,
+            validate_equihash_solution: false,
+            equihash_n: 200,
+            equihash_k: 9,
         }
     }
 }
@@ -712,7 +742,7 @@ impl HeaderSyncManager {
             let mut chain = self.chain.write().await;
             // Reset headers and record checkpoint baseline
             let genesis = chain.genesis.clone();
-            let mut new_chain = HeaderChain::new(genesis);
+            let mut new_chain = HeaderChain::with_pow_config(genesis, self.config.pow_config.clone());
             new_chain.checkpoints.push(cp.clone());
             new_chain.tip = Some(cp.height);
             // Record the MMR root at checkpoint height
@@ -826,7 +856,7 @@ impl HeaderSyncManager {
             0x1d00ffff,
         );
 
-        Ok(HeaderChain::new(genesis_header))
+        Ok(HeaderChain::with_pow_config(genesis_header, config.pow_config.clone()))
     }
 
     /// Load chain from disk storage
@@ -894,8 +924,8 @@ impl HeaderSyncManager {
         let mut headers: Vec<BlockHeader> = Vec::new();
         // Try request/response from any peer first
         if let Ok(raw_headers) = network.request_headers_from_any_peer_by_height(current_height + 1, batch_size).await {
-            for raw in raw_headers {
-                if let Some(h) = Self::decode_header_fallback(&raw) { headers.push(h); }
+            for (_height, raw) in raw_headers {
+                if let Some(h) = Self::decode_header_strict(&raw, &config.pow_config) { headers.push(h); }
             }
         }
         // If empty, fall back to announcements-as-hints
@@ -909,7 +939,7 @@ impl HeaderSyncManager {
             tickets.sort_by_key(|(h, _)| *h);
             for (_h, ticket) in tickets.into_iter().take(batch_size as usize) {
                 if let Ok(bytes) = network.fetch_blob_from_ticket(&ticket).await {
-                    if let Some(header) = Self::decode_header_fallback(&bytes) {
+                    if let Some(header) = Self::decode_header_strict(&bytes, &config.pow_config) {
                         headers.push(header);
                     }
                 }
@@ -953,42 +983,48 @@ impl HeaderSyncManager {
     }
 
     /// Decode header from either our bincode representation or raw Zcash header bytes
-    fn decode_header_fallback(bytes: &[u8]) -> Option<BlockHeader> {
-        // Try bincode first
-        if let Ok(h) = bincode::deserialize::<BlockHeader>(bytes) {
-            return Some(h);
-        }
-        // Try Zcash raw header: 4(version) + 32(prev) + 32(merkle) + 32(reserved) + 32(hashLightClientRoot?) + 32(finalSaplingRoot?) + 4(time) + 4(bits) + 4(nonce) + var equihash solution
-        // For interoperability, accept at least (legacy) 140-byte header prefix and treat solution as the rest.
-        if bytes.len() >= 140 {
-            // This is a placeholder minimal parse, not full Zebra header; we treat prev hash and time/bits/nonce
-            let prev = {
-                let mut arr = [0u8; 32];
-                // Zcash header prevhash is little-endian in serialization; reverse to big-endian for display-level comparisons if needed
-                arr.copy_from_slice(&bytes[4..36]);
-                blake3::Hash::from(arr)
-            };
-            let time_bytes = &bytes[4 + 32 + 32 + 32 + 32 + 32..4 + 32 + 32 + 32 + 32 + 32 + 4];
-            let bits_bytes = &bytes[4 + 32 + 32 + 32 + 32 + 32 + 4..4 + 32 + 32 + 32 + 32 + 32 + 8];
-            let nonce_bytes = &bytes[4 + 32 + 32 + 32 + 32 + 32 + 8..4 + 32 + 32 + 32 + 32 + 32 + 12];
-            let timestamp = u32::from_le_bytes(time_bytes.try_into().ok()?) as u64;
-            let bits = u32::from_le_bytes(bits_bytes.try_into().ok()?);
-            let nonce = u32::from_le_bytes(nonce_bytes.try_into().ok()?) as u64;
-            let mut header = BlockHeader {
-                height: 0, // unknown from raw header alone
-                previous_hash: prev.into(),
-                hash: SerializableHash(blake3::hash(bytes)),
-                mmr_root: None,
-                timestamp,
-                nonce,
-                bits,
-                solution: bytes[140..].to_vec(),
-            };
-            // Honor difficulty rules for our chain representation
-            header.hash = SerializableHash(header.compute_hash());
-            return Some(header);
+    fn decode_header_strict(bytes: &[u8], _pow: &PowConfig) -> Option<BlockHeader> {
+        // Try bincode first (internal format)
+        if let Ok(h) = bincode::deserialize::<BlockHeader>(bytes) { return Some(h); }
+        // Otherwise, try parsing exact Zcash header and solution using Zebra and map to our struct
+        #[cfg(feature = "zcash_zebra")]
+        {
+            use zebra_chain::serialization::ZcashDeserialize;
+            use std::io::Cursor;
+            if let Ok(zebra_header) = zebra_chain::block::Header::zcash_deserialize(Cursor::new(bytes)) {
+                // Extract fields
+                let prev = zebra_header.previous_block_hash().0;
+                let time = zebra_header.time().timestamp() as u64;
+                let bits = zebra_header.difficulty_threshold().to_consensus();
+                let solution_bytes = zebra_header.solution().as_bytes().to_vec();
+                // Compute the Zcash block hash using Zebra and store it into our `hash` for linking
+                let z_hash = zebra_header.hash();
+                let hdr = BlockHeader {
+                    height: 0,
+                    previous_hash: SerializableHash(Hash::from(prev)),
+                    hash: SerializableHash(Hash::from(z_hash.0)),
+                    mmr_root: None,
+                    timestamp: time,
+                    nonce: zebra_header.nonce().0 as u64,
+                    bits,
+                    solution: solution_bytes,
+                };
+                // Strict PoW via Zebra if enabled in config
+                if pow.disable_pow_validation { return Some(hdr); }
+                // Validate Equihash solution and difficulty target via Zebra's internal checks
+                if zebra_header.is_equihash_solution_valid() && zebra_header.work().is_ok() {
+                    return Some(hdr);
+                }
+                return None;
+            }
         }
         None
+    }
+
+    /// Verify an Equihash solution according to configured parameters (n, k).
+    /// Placeholder implementation: requires non-empty solution. Replace with Zebra verifier under a feature flag.
+    fn _verify_equihash_internal(header: &BlockHeader, n: u32, k: u32) -> bool {
+        verify_equihash_solution(header, n, k)
     }
 
     /// Attempt to apply buffered headers in order from current tip+1 upward
@@ -1124,5 +1160,31 @@ mod tests {
         let proof = chain.generate_nipopow_proof(0, 0).unwrap();
         assert!(proof.verify(&SecurityConfig::default()).is_ok());
     }
+}
+
+/// Verify Equihash solution for the given header and parameters (n,k).
+/// Placeholder: returns true if `solution` field is non-empty.
+fn verify_equihash_solution(header: &BlockHeader, _n: u32, _k: u32) -> bool {
+    // If Zebra feature is enabled, attempt strict verification using zebra-chain
+    #[cfg(feature = "zcash_zebra")]
+    {
+        // Build a Zebra header from raw fields where possible.
+        // Note: Our internal header structure is simplified; for strict verification,
+        // the caller should pass raw Zcash header bytes via decode_header_fallback.
+        if header.solution.is_empty() { return false; }
+        // Convert nBits to Expanded target
+        let expanded = ZebraExpandedTarget::from_consensus(header.bits);
+        // Parse Equihash solution
+        if let Ok(sol) = ZebraEquihashSolution::from_bytes(&header.solution) {
+            // Zebra's header PoW hash is based on Zcash serialization; since we don't
+            // preserve full serialization here, rely on solution validity alone.
+            // Consumers that require exact checks should feed in raw Zcash headers and
+            // perform full Zebra verification at the integration layer.
+            return sol.is_valid(200, 9);
+        }
+        return false;
+    }
+    // Fallback placeholder when feature is disabled
+    !header.solution.is_empty()
 }
 

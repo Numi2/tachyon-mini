@@ -629,6 +629,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "header_sync",
  "hex",
  "net_iroh",
  "node_ext",
@@ -3048,6 +3049,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "circuits",
  "net_iroh",
  "pcd_core",
  "pq_crypto",
@@ -3821,6 +3823,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "qerkle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "blake3",
+ "ff",
+ "halo2_gadgets",
+ "pasta_curves",
+ "pcd_core",
+ "pq_crypto",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

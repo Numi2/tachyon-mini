@@ -5,13 +5,14 @@
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use net_iroh::{BlobKind, BlobStore, Cid, ControlMessage, TachyonNetwork};
+use net_iroh::{BlobKind, BlobStore, Cid, ControlMessage, TachyonNetwork, SyncManifest, ManifestItem};
 use pq_crypto::{derive_nullifier, NullifierDerivationMode};
 use pq_crypto::AccessToken;
 use pcd_core::{PcdDeltaBundle, PcdState, PcdTransition};
 use accum_mmr::{MmrDelta, SerializableHash};
 use accum_set::SetDelta;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::{
     collections::HashMap,
     path::Path,
@@ -325,6 +326,38 @@ impl ObliviousSyncService {
             .publish_blob_with_ticket(BlobKind::PcdTransition, transition_data.clone().into(), height_next)
             .await?;
 
+        // Build and publish a manifest for this height
+        let manifest = SyncManifest {
+            height: height_next,
+            items: vec![
+                ManifestItem {
+                    kind: BlobKind::CommitmentDelta,
+                    cid: _mmr_cid,
+                    height: height_next,
+                    size: mmr_bytes.len(),
+                    ticket: mmr_ticket.clone(),
+                },
+                ManifestItem {
+                    kind: BlobKind::NullifierDelta,
+                    cid: _nf_cid,
+                    height: height_next,
+                    size: nf_bytes.len(),
+                    ticket: nf_ticket.clone(),
+                },
+                ManifestItem {
+                    kind: BlobKind::PcdTransition,
+                    cid: _tr_cid,
+                    height: height_next,
+                    size: transition_data.len(),
+                    ticket: transition_ticket.clone(),
+                },
+            ],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        let (_mf_cid, manifest_ticket) = network
+            .publish_blob_with_ticket(BlobKind::Manifest, manifest_bytes.clone().into(), height_next)
+            .await?;
+
         // Record tickets for client distribution
         {
             let mut list = published.write().unwrap();
@@ -348,6 +381,13 @@ impl ObliviousSyncService {
                 size: transition_data.len(),
                 cid: net_iroh::Cid::from(blake3::hash(&transition_data)),
                 ticket: transition_ticket,
+            });
+            list.push(PublishedBlobInfo {
+                kind: BlobKind::Manifest,
+                height: height_next,
+                size: manifest_bytes.len(),
+                cid: net_iroh::Cid::from(blake3::hash(&manifest_bytes)),
+                ticket: manifest_ticket,
             });
         }
 

@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use blake3::Hasher as Blake3Hasher;
-use ff::PrimeField;
+use ff::{PrimeField, FromUniformBytes};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
@@ -23,22 +23,26 @@ use halo2_gadgets::poseidon::{
 use rand::rngs::OsRng;
 use std::io::Cursor;
 use std::path::Path;
-use std::{fs, fs::File, io::{Read, Write}};
+use std::{fs, fs::File};
 
 /// Poseidon-based transition hash (native) mirroring the in-circuit composition.
 ///
-/// Composition (width 3, rate 2):
-///   d1 = H(prev_state, mmr_root)
-///   d2 = H(nullifier_root, anchor_height)
-///   digest = H(d1, d2, 0)
+/// Composition with domain separation (width 3, rate 2):
+///   d1 = H(TAG_D1, prev_state, mmr_root)
+///   d2 = H(TAG_D2, nullifier_root, anchor_height)
+///   digest = H(TAG_D3, d1, d2)
 fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr, anchor_height: Fr) -> Fr {
     // Use the same Poseidon spec the circuit is configured with (P128Pow5T3, t=3, rate=2)
-    let d1 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
-        .hash([prev_state, mmr_root]);
-    let d2 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
-        .hash([nullifier_root, anchor_height]);
+    let tag_d1 = Fr::from(1u64);
+    let tag_d2 = Fr::from(2u64);
+    let tag_d3 = Fr::from(3u64);
+
+    let d1 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([tag_d1, prev_state, mmr_root]);
+    let d2 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([tag_d2, nullifier_root, anchor_height]);
     poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
-        .hash([d1, d2, Fr::zero()])
+        .hash([tag_d3, d1, d2])
 }
 
 /// Compute the transition Poseidon digest and return canonical 32-byte encoding
@@ -48,11 +52,18 @@ pub fn compute_transition_digest_bytes(
     nullifier_root: &[u8; 32],
     anchor_height: u64,
 ) -> [u8; 32] {
-    let to_fr = |bytes: &[u8; 32]| -> Fr {
-        // Accept any 32 bytes by reducing mod p to avoid panics with non-canonical inputs
-        // This must match encoding used elsewhere when interpreting 32-byte digests as field elements
-        Fr::from_le_bytes_mod_order(bytes)
-    };
+    // Map arbitrary 32 bytes into a field element using uniform bytes derivation
+    fn to_fr(bytes: &[u8; 32]) -> Fr {
+        use blake3::Hasher;
+        use std::io::Read as _;
+        let mut hasher = Hasher::new();
+        hasher.update(b"pcd:fr:uniform:v1");
+        hasher.update(bytes);
+        let mut xof = hasher.finalize_xof();
+        let mut wide = [0u8; 64];
+        xof.read(&mut wide).unwrap();
+        Fr::from_uniform_bytes(&wide)
+    }
     let prev_fr = to_fr(prev_state);
     let mmr_fr = to_fr(mmr_root);
     let nul_fr = to_fr(nullifier_root);
@@ -191,7 +202,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         // Assign all witness values in one region where the selector applies
         let (
             prev_state_cell,
-            new_state_cell,
+            _new_state_cell,
             mmr_root_cell,
             _nullifier_root_cell,
             _anchor_height_cell,
@@ -235,48 +246,54 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             },
         )?;
 
-        // Compute Poseidon-based digest using width-3 hash composition:
-        // d1 = H(prev, mmr)
-        // d2 = H(nullifier, anchor)
-        // digest = H(d1, d2, 0)
+        // Compute Poseidon-based digest with domain separation using width-3 hash composition:
+        // d1 = H(TAG_D1, prev, mmr)
+        // d2 = H(TAG_D2, nullifier, anchor)
+        // digest = H(TAG_D3, d1, d2)
         let chip_h2 = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
-        let mut h2 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+        let h2 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
             chip_h2,
             layouter.namespace(|| "poseidon init h2"),
         )?;
+        let tag_d1_cell = layouter.assign_region(
+            || "assign tag_d1",
+            |mut region| region.assign_advice(|| "tag_d1", config.advice[5], 0, || Value::known(Fr::from(1u64))),
+        )?;
         let d1 = h2.hash(
             layouter.namespace(|| "poseidon h(prev,mmr)"),
-            [prev_state_cell.clone(), mmr_root_cell.clone()],
+            [tag_d1_cell.clone(), prev_state_cell.clone(), mmr_root_cell.clone()],
         )?;
         let chip_h2b = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
-        let d2 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+        let h2b = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
             chip_h2b,
             layouter.namespace(|| "poseidon init h2b"),
-        )?
-        .hash(
+        )?;
+        let tag_d2_cell = layouter.assign_region(
+            || "assign tag_d2",
+            |mut region| region.assign_advice(|| "tag_d2", config.advice[5], 0, || Value::known(Fr::from(2u64))),
+        )?;
+        let d2 = h2b.hash(
             layouter.namespace(|| "poseidon h(nullifier,anchor)"),
-            [_nullifier_root_cell.clone(), _anchor_height_cell.clone()],
+            [tag_d2_cell.clone(), _nullifier_root_cell.clone(), _anchor_height_cell.clone()],
         )?;
         let chip_h3 = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
-        let mut h3 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+        let h3 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
             chip_h3,
             layouter.namespace(|| "poseidon init h3"),
         )?;
-        let zero = layouter.assign_region(
-            || "assign zero",
-            |mut region| region.assign_advice(|| "zero", config.advice[5], 0, || Value::known(Fr::zero())),
+        let tag_d3_cell = layouter.assign_region(
+            || "assign tag_d3",
+            |mut region| region.assign_advice(|| "tag_d3", config.advice[5], 0, || Value::known(Fr::from(3u64))),
         )?;
         let digest = h3.hash(
-            layouter.namespace(|| "poseidon h(d1,d2,0)"),
-            [d1, d2, zero],
+            layouter.namespace(|| "poseidon h(d1,d2,tag)"),
+            [tag_d3_cell.clone(), d1, d2],
         )?;
-
-        // Enforce new_state witness equals computed digest
-        layouter.constrain_equal(digest.cell(), new_state_cell.cell())?;
 
         // Expose public inputs (prev_state, new_state, mmr_root, nullifier_root, anchor_height)
         layouter.constrain_instance(prev_state_cell.cell(), config.instance[0], 0)?;
-        layouter.constrain_instance(new_state_cell.cell(), config.instance[1], 0)?;
+        // Expose computed digest as new_state public input to avoid requiring an equality API
+        layouter.constrain_instance(digest.cell(), config.instance[1], 0)?;
         layouter.constrain_instance(mmr_root_cell.cell(), config.instance[2], 0)?;
         layouter.constrain_instance(_nullifier_root_cell.cell(), config.instance[3], 0)?;
         layouter.constrain_instance(_anchor_height_cell.cell(), config.instance[4], 0)?;
@@ -510,7 +527,18 @@ impl PcdCore {
         anchor_height: u64,
     ) -> Result<Vec<u8>> {
         // Convert inputs into field elements (mod-order mapping for 32-byte digests)
-        let to_fr = |bytes: &[u8; 32]| -> Fr { Fr::from_le_bytes_mod_order(bytes) };
+        // Map 32 bytes into field via uniform bytes
+        fn to_fr(bytes: &[u8; 32]) -> Fr {
+            use blake3::Hasher;
+            use std::io::Read as _;
+            let mut hasher = Hasher::new();
+            hasher.update(b"pcd:fr:uniform:v1");
+            hasher.update(bytes);
+            let mut xof = hasher.finalize_xof();
+            let mut wide = [0u8; 64];
+            xof.read(&mut wide).unwrap();
+            Fr::from_uniform_bytes(&wide)
+        }
 
         let prev_fr = to_fr(prev_state);
         let mmr_fr = to_fr(mmr_root);
@@ -569,7 +597,18 @@ impl PcdCore {
             return Ok(false);
         }
 
-        let to_fr = |bytes: &[u8; 32]| -> Fr { Fr::from_le_bytes_mod_order(bytes) };
+        // Map 32 bytes into field via uniform bytes
+        fn to_fr(bytes: &[u8; 32]) -> Fr {
+            use blake3::Hasher;
+            use std::io::Read as _;
+            let mut hasher = Hasher::new();
+            hasher.update(b"pcd:fr:uniform:v1");
+            hasher.update(bytes);
+            let mut xof = hasher.finalize_xof();
+            let mut wide = [0u8; 64];
+            xof.read(&mut wide).unwrap();
+            Fr::from_uniform_bytes(&wide)
+        }
 
         let prev_fr = to_fr(prev_state);
         let new_fr = to_fr(new_state);
@@ -1071,9 +1110,11 @@ mod tests {
         };
 
         let public_inputs = vec![
-            vec![prev],         // instance[0]
-            vec![expected_new], // instance[1]
-            vec![mmr],          // instance[2]
+            vec![prev],         // instance[0] prev
+            vec![expected_new], // instance[1] new
+            vec![mmr],          // instance[2] mmr
+            vec![nul],          // instance[3] nul
+            vec![anch],         // instance[4] anchor
         ];
         let prover = MockProver::run(k, &circuit, public_inputs).unwrap();
         assert_eq!(prover.verify(), Ok(()));
@@ -1099,8 +1140,10 @@ mod tests {
 
         let public_inputs = vec![
             vec![prev],
-            vec![wrong_new], // intentionally wrong
+            vec![wrong_new], // intentionally wrong new
             vec![mmr],
+            vec![nul],
+            vec![anch],
         ];
         let prover = MockProver::run(k, &circuit, public_inputs).unwrap();
         assert!(prover.verify().is_err());
@@ -1110,17 +1153,17 @@ mod tests {
     fn test_prove_and_verify_roundtrip() {
         let core = PcdCore::new().unwrap();
         let prev = [7u8; 32];
-        let new_placeholder = [0u8; 32]; // ignored internally
         let mmr = [8u8; 32];
         let nul = [9u8; 32];
         let anch = 42u64;
+        let new_digest = compute_transition_digest_bytes(&prev, &mmr, &nul, anch);
 
         let proof = core
-            .prove_transition(&prev, &new_placeholder, &mmr, &nul, anch)
+            .prove_transition(&prev, &new_digest, &mmr, &nul, anch)
             .unwrap();
 
         let ok = core
-            .verify_transition_proof(&proof, &prev, &new_placeholder, &mmr, &nul, anch)
+            .verify_transition_proof(&proof, &prev, &new_digest, &mmr, &nul, anch)
             .unwrap();
         assert!(ok);
     }
@@ -1132,15 +1175,16 @@ mod tests {
         let mmr = [6u8; 32];
         let nul = [7u8; 32];
         let anch = 100u64;
+        let new_digest = compute_transition_digest_bytes(&prev, &mmr, &nul, anch);
         let proof = core
-            .prove_transition(&prev, &[0u8; 32], &mmr, &nul, anch)
+            .prove_transition(&prev, &new_digest, &mmr, &nul, anch)
             .unwrap();
 
         // Tweak the mmr root so the verification should fail
         let mut bad_mmr = mmr;
         bad_mmr[0] ^= 0x01;
         let ok = core
-            .verify_transition_proof(&proof, &prev, &[0u8; 32], &bad_mmr, &nul, anch)
+            .verify_transition_proof(&proof, &prev, &new_digest, &bad_mmr, &nul, anch)
             .unwrap();
         assert!(!ok);
     }

@@ -7,6 +7,7 @@ use accum_mmr::SerializableHash;
 use anyhow::{anyhow, Result};
 use blake3::Hash;
 use net_iroh::TachyonNetwork;
+use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
 use pcd_core::aggregation::aggregate_action_proofs;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -294,7 +295,14 @@ impl TachyonNode {
         // Verify PCD proof
         let pcd_valid = self
             .pcd_verifier
-            .verify_proof(&tx.pcd_proof, &tx.pcd_state_commitment, &tx.anchor_height)
+            .verify_proof(
+                &tx.pcd_proof,
+                &tx.pcd_prev_state_commitment,
+                &tx.pcd_new_state_commitment,
+                &tx.pcd_mmr_root,
+                &tx.pcd_nullifier_root,
+                &tx.anchor_height,
+            )
             .await?;
 
         if !pcd_valid {
@@ -534,9 +542,15 @@ pub struct Transaction {
     pub commitments: Vec<[u8; 32]>,
     /// PCD proof data
     pub pcd_proof: Vec<u8>,
-    /// PCD state commitment
-    pub pcd_state_commitment: [u8; 32],
-    /// Anchor height for PCD validity
+    /// Previous PCD state commitment (public input 0)
+    pub pcd_prev_state_commitment: [u8; 32],
+    /// New PCD state commitment (public input 1)
+    pub pcd_new_state_commitment: [u8; 32],
+    /// MMR root (public input 2)
+    pub pcd_mmr_root: [u8; 32],
+    /// Nullifier root (public input 3)
+    pub pcd_nullifier_root: [u8; 32],
+    /// Anchor height for PCD validity (public input 4)
     pub anchor_height: u64,
     /// Spend proof data
     pub spend_proof: Vec<u8>,
@@ -553,6 +567,16 @@ impl Transaction {
         }
         if self.pcd_proof.is_empty() {
             return Err(anyhow!("Transaction must have PCD proof"));
+        }
+        // Basic consistency: new state matches circuit digest
+        let expected_new = compute_transition_digest_bytes(
+            &self.pcd_prev_state_commitment,
+            &self.pcd_mmr_root,
+            &self.pcd_nullifier_root,
+            self.anchor_height,
+        );
+        if expected_new != self.pcd_new_state_commitment {
+            return Err(anyhow!("PCD new_state_commitment does not match circuit digest"));
         }
         Ok(())
     }
@@ -608,17 +632,22 @@ impl SimplePcdVerifier {
     pub async fn verify_proof(
         &self,
         proof: &[u8],
-        _state_commitment: &[u8; 32],
-        _anchor_height: &u64,
+        prev_state: &[u8; 32],
+        new_state: &[u8; 32],
+        mmr_root: &[u8; 32],
+        nullifier_root: &[u8; 32],
+        anchor_height: &u64,
     ) -> Result<bool> {
-        // In a real implementation, this would use halo2 to verify the proof
-        // For now, just check if proof is non-empty and state commitment looks valid
-        if proof.is_empty() {
-            return Ok(false);
-        }
-
-        // Simple check: proof should contain the state commitment
-        Ok(proof.iter().any(|&b| b != 0))
+        if proof.is_empty() { return Ok(false); }
+        let core = Halo2PcdCore::load_or_setup(std::path::Path::new("crates/node_ext/node_data/keys"), 12)?;
+        core.verify_transition_proof(
+            proof,
+            prev_state,
+            new_state,
+            mmr_root,
+            nullifier_root,
+            *anchor_height,
+        )
     }
 }
 
@@ -627,10 +656,13 @@ impl PcdVerifier for SimplePcdVerifier {
     async fn verify_proof(
         &self,
         proof: &[u8],
-        state_commitment: &[u8; 32],
+        prev_state: &[u8; 32],
+        new_state: &[u8; 32],
+        mmr_root: &[u8; 32],
+        nullifier_root: &[u8; 32],
         anchor_height: &u64,
     ) -> Result<bool> {
-        self.verify_proof(proof, state_commitment, anchor_height)
+        self.verify_proof(proof, prev_state, new_state, mmr_root, nullifier_root, anchor_height)
             .await
     }
 }
@@ -641,7 +673,10 @@ pub trait PcdVerifier: Send + Sync {
     async fn verify_proof(
         &self,
         proof: &[u8],
-        state_commitment: &[u8; 32],
+        prev_state: &[u8; 32],
+        new_state: &[u8; 32],
+        mmr_root: &[u8; 32],
+        nullifier_root: &[u8; 32],
         anchor_height: &u64,
     ) -> Result<bool>;
 }
@@ -664,7 +699,10 @@ mod tests {
             nullifiers: vec![[1u8; 32]],
             commitments: vec![[2u8; 32]],
             pcd_proof: vec![1, 2, 3],
-            pcd_state_commitment: [3u8; 32],
+            pcd_prev_state_commitment: [3u8; 32],
+            pcd_new_state_commitment: compute_transition_digest_bytes(&[3u8; 32], &[10u8; 32], &[11u8; 32], 100),
+            pcd_mmr_root: [10u8; 32],
+            pcd_nullifier_root: [11u8; 32],
             anchor_height: 100,
             spend_proof: vec![4, 5, 6],
         };
@@ -683,7 +721,10 @@ mod tests {
                     nullifiers: vec![[1u8; 32]],
                     commitments: vec![[2u8; 32]],
                     pcd_proof: vec![1, 2, 3],
-                    pcd_state_commitment: [3u8; 32],
+                    pcd_prev_state_commitment: [3u8; 32],
+                    pcd_new_state_commitment: compute_transition_digest_bytes(&[3u8; 32], &[10u8; 32], &[11u8; 32], 100),
+                    pcd_mmr_root: [10u8; 32],
+                    pcd_nullifier_root: [11u8; 32],
                     anchor_height: 100,
                     spend_proof: vec![4, 5, 6],
                 },
@@ -692,7 +733,10 @@ mod tests {
                     nullifiers: vec![[3u8; 32]],
                     commitments: vec![[4u8; 32]],
                     pcd_proof: vec![7, 8, 9],
-                    pcd_state_commitment: [5u8; 32],
+                    pcd_prev_state_commitment: [5u8; 32],
+                    pcd_new_state_commitment: compute_transition_digest_bytes(&[5u8; 32], &[12u8; 32], &[13u8; 32], 100),
+                    pcd_mmr_root: [12u8; 32],
+                    pcd_nullifier_root: [13u8; 32],
                     anchor_height: 100,
                     spend_proof: vec![7, 8, 9],
                 },

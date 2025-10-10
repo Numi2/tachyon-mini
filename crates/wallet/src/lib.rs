@@ -247,6 +247,61 @@ impl TryFrom<EncryptedNote> for WalletNote {
     }
 }
 
+/// Parse a wallet note from plaintext bytes
+///
+/// Layout: [commitment(32) | value(8) | recipient(32) | rseed(32) | memo_len(2) | memo(..)]
+fn parse_wallet_note_from_plaintext(
+    data: &[u8],
+    position: u64,
+    block_height: u64,
+    is_spent: bool,
+) -> Result<WalletNote> {
+    if data.len() < NOTE_COMMITMENT_SIZE + 8 + 32 + 32 + 2 {
+        return Err(anyhow!("Note payload too short"));
+    }
+
+    let mut offset = 0usize;
+    let mut commitment = [0u8; NOTE_COMMITMENT_SIZE];
+    commitment.copy_from_slice(&data[offset..offset + NOTE_COMMITMENT_SIZE]);
+    offset += NOTE_COMMITMENT_SIZE;
+
+    let mut value_bytes = [0u8; 8];
+    value_bytes.copy_from_slice(&data[offset..offset + 8]);
+    let value = u64::from_le_bytes(value_bytes);
+    offset += 8;
+
+    let mut recipient = [0u8; 32];
+    recipient.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let mut rseed = [0u8; 32];
+    rseed.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+
+    let mut memo_len_bytes = [0u8; 2];
+    memo_len_bytes.copy_from_slice(&data[offset..offset + 2]);
+    let memo_len = u16::from_le_bytes(memo_len_bytes) as usize;
+    offset += 2;
+
+    let memo = if memo_len > 0 && offset + memo_len <= data.len() {
+        Some(String::from_utf8_lossy(&data[offset..offset + memo_len]).to_string())
+    } else {
+        None
+    };
+
+    Ok(WalletNote {
+        commitment,
+        value,
+        recipient,
+        rseed,
+        position,
+        block_height,
+        is_spent,
+        witness_data: Vec::new(),
+        memo,
+    })
+}
+
 /// Wallet state and operations
 pub struct TachyonWallet {
     /// Wallet configuration
@@ -699,7 +754,36 @@ impl TachyonWallet {
     /// Process a pending OOB payment
     pub async fn process_oob_payment(&self, payment_hash: &[u8; 32]) -> Result<Option<WalletNote>> {
         let mut handler = self.oob_handler.write().await;
-        handler.process_payment(payment_hash)
+        let note_opt = handler.process_payment(payment_hash)?;
+
+        if let Some(note) = note_opt.clone() {
+            // Reconstruct plaintext payload for storage
+            let mut note_data = Vec::new();
+            note_data.extend_from_slice(&note.commitment);
+            note_data.extend_from_slice(&note.value.to_le_bytes());
+            note_data.extend_from_slice(&note.recipient);
+            note_data.extend_from_slice(&note.rseed);
+            let memo_bytes = note
+                .memo
+                .as_deref()
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_else(|| Vec::new());
+            let memo_len = (memo_bytes.len() as u16).to_le_bytes();
+            note_data.extend_from_slice(&memo_len);
+            note_data.extend_from_slice(&memo_bytes);
+
+            // Encrypt and persist the note
+            let enc_note = EncryptedNote::new(
+                note.position,
+                note.block_height,
+                &note_data,
+                &self.database.master_key,
+            )?;
+            self.database.add_note(note.commitment, enc_note).await?;
+            Ok(Some(note))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Create an out-of-band payment for sending
@@ -730,8 +814,15 @@ impl TachyonWallet {
         let mut wallet_notes = Vec::new();
 
         for enc_note in encrypted_notes {
-            if let Ok(wallet_note) = WalletNote::try_from(enc_note) {
-                wallet_notes.push(wallet_note);
+            if let Ok(plaintext) = enc_note.decrypt(&self.database.master_key) {
+                if let Ok(wallet_note) = parse_wallet_note_from_plaintext(
+                    &plaintext,
+                    enc_note.position,
+                    enc_note.block_height,
+                    enc_note.is_spent,
+                ) {
+                    wallet_notes.push(wallet_note);
+                }
             }
         }
 
@@ -744,8 +835,15 @@ impl TachyonWallet {
         let mut wallet_notes = Vec::new();
 
         for enc_note in encrypted_notes {
-            if let Ok(wallet_note) = WalletNote::try_from(enc_note) {
-                wallet_notes.push(wallet_note);
+            if let Ok(plaintext) = enc_note.decrypt(&self.database.master_key) {
+                if let Ok(wallet_note) = parse_wallet_note_from_plaintext(
+                    &plaintext,
+                    enc_note.position,
+                    enc_note.block_height,
+                    enc_note.is_spent,
+                ) {
+                    wallet_notes.push(wallet_note);
+                }
             }
         }
 

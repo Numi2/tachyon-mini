@@ -1,0 +1,20 @@
+[package]
+name = "qerkle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+blake3 = { workspace = true }
+pcd_core = { workspace = true }
+pq_crypto = { workspace = true }
+halo2_gadgets = { workspace = true }
+ff = { workspace = true }
+pasta_curves = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+

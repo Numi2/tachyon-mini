@@ -22,5 +22,6 @@ pq_crypto = { path = "../pq_crypto" }
 hex = "0.4"
 net_iroh = { path = "../net_iroh" }
 node_ext = { path = "../node_ext" }
+header_sync = { path = "../header_sync" }
 bytes = "1.6"
 blake3 = "1.5"

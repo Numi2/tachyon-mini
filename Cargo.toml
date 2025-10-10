@@ -13,6 +13,7 @@ members = [
     "crates/storage",
     "crates/cli",
     "crates/bench",
+    "crates/qerkle",
 ]
 resolver = "2"
 
@@ -38,6 +39,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Pin iroh to 0.91.x to match iroh-blobs' internal iroh dependency
 iroh = "0.91.2"
 iroh-blobs = "0.92.0"
+
+## Note: crate-specific optional deps (e.g., zebra-chain, equihash) are declared in their crates
 
 # Zero-knowledge proofs
 halo2_proofs = "0.3"
@@ -92,6 +95,7 @@ storage = { path = "crates/storage" }
 cli = { path = "crates/cli" }
 bench = { path = "crates/bench" }
 accum_set = { path = "crates/accum_set" }
+qerkle = { path = "crates/qerkle" }
 
 [workspace.package]
 version = "0.1.0"

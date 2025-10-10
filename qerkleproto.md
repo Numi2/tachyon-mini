@@ -5,7 +5,7 @@ efficiently.
 3.1. Hash Function Randomization
 A dedicated dynamic hash selection mechanism enhances the unpredictability and 
 security of the  Merkle Tree (qerkle). By using cryptographic random number
-generators at each tree level, the system randomly alternates among SHAKE-256, Blake3, and Poseidon—
+generators at each tree level, the system randomly alternates amongBlake3, and Poseidon—
 hash functions proven to resist Grover’s Algorithm-based attacks . This randomized structure
 eliminates predictability, increasing entropy and mitigating risks from precomputed and collision-based
 attacks. Moreover, if any hash function becomes vulnerable, the system can seamlessly switch to an
@@ -19,13 +19,13 @@ technologies besides using logarithmic proof generation methodologies.
 a) Step-by-Step Process for qerkle Construction The creation process for  Merkle Trees (qerkles) requires sequential protocols to
 achieve both  security features and dynamic hashing applications and cryptographic
 stability. Data transformation first encrypts data into cryptographic byte notations before these
-cryptographically coded numbers are processed by hash functions, which make up SHAKE-256 and
+cryptographically coded numbers are processed by hash functions, which make up  and
 Blake3, along with Poseidon. The standardization process turns information into an encrypted state before
 it proceeds to cryptographic processing.
 Dynamic hashing with  security comes into action at this point. The cryptographic
 random number generator (CRNG) incorporated into each node level enables a dynamic process to select
 hash functions. The randomization method chooses node pairs using cryptographic methods, and all three
-hash functions (SHAKE-256, Blake3 and Poseidon) complete the procedure. The system implements this
+hash functions (, Blake3 and Poseidon) complete the procedure. The system implements this
 step to eliminate dependency on a static hash function, which decreases the chance of future cryptographic
 vulnerabilities appearing.
 The structure uses two different modes for pairs but involves repeated duplication of the final node
@@ -85,7 +85,7 @@ framework.
 4.1. Dynamic Hash Function Selection
 qerkle leverages a cryptographic random number generator (CRNG) to dynamically select a post-
  secure hash. This approach produces cryptographic security using multiple different
-cryptographic primitives.  hash operation SHAKE-256 stands as a NIST-standardized hash
+cryptographic primitives.  hash operation  stands as a NIST-standardized hash
 function [4] and joins Blake3 as an optimized high-speed hashing solution [5] together with Poseidon,
 which focuses on zk-STARKs and cryptographic proof optimization [6]. Randomized hashing strengthens
 guesswork protection, which prevents pre-calculated  assault methods, including Grover’s
@@ -129,7 +129,7 @@ data.
 Before constructing the Merkle Tree, we collect all the data blocks that must be securely hashed and
 verified. Each data block represents information, such as transaction details, Each data block is hashed using a randomly selected  hash function. The available hash
 functions include.
-• SHAKE-256 (NIST  standard)
+•  (NIST  standard)
 Blake3 (High-speed cryptographic hash)
 • Poseidon (Optimized for zk-STARKs and blockchain verification)
 A cryptographic random number generator (CRNG) selects one of these hash functions for each
@@ -144,7 +144,7 @@ only one final root value remains.
 PSEUDO CODE
 #  Merkle Tree (qerkle) Implementation
 #  cryptographic primitives:
-# - SHAKE-256, Blake3, Poseidon for hashing
+# - , Blake3, Poseidon for hashing
 # - Kyber1024 for encryption
 # - zk-STARKs for verification
 # Global constants
