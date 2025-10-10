@@ -4,7 +4,7 @@
 //! PCD state synchronization, and transaction construction.
 
 use anyhow::{anyhow, Result};
-use net_iroh::{BlobKind, Cid, ControlMessage, TachyonNetwork};
+use net_iroh::{BlobKind, Cid, ControlMessage, TachyonNetwork, SyncManifest};
 use pcd_core::{
     PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier, PcdTransition,
 };
@@ -438,6 +438,7 @@ impl WalletSyncClient {
                 BlobKind::CommitmentDelta,
                 BlobKind::NullifierDelta,
                 BlobKind::PcdTransition,
+                BlobKind::Manifest,
             ],
         };
         // In a real implementation we'd send this over a control channel.
@@ -475,28 +476,42 @@ impl PcdSyncClient for WalletSyncClient {
             start_height,
             end_height
         );
-        // Attempt to stitch recently published deltas collected from announcements
-        // by fetching from tickets in the network's published cache (best-effort)
-        let published = self.network.get_published().await;
-        let mmr_segments: Vec<Vec<u8>> = published
-            .iter()
-            .filter(|p| matches!(p.0, BlobKind::CommitmentDelta))
-            .filter(|p| p.2 >= start_height && p.2 <= end_height)
-            .map(|p| p.1.clone())
+        // Prefer manifests by height to discover blob tickets without relying on nullifiers
+        let anns = self.network.get_recent_announcements();
+        let mut manifests: Vec<(u64, String)> = anns
+            .into_iter()
+            .filter(|(k, _cid, h, _s, _t)| *k == BlobKind::Manifest && *h >= start_height && *h <= end_height)
+            .map(|(_k, _cid, h, _s, t)| (h, t))
             .collect();
-        let nf_segments: Vec<Vec<u8>> = published
-            .iter()
-            .filter(|p| matches!(p.0, BlobKind::NullifierDelta))
-            .filter(|p| p.2 >= start_height && p.2 <= end_height)
-            .map(|p| p.1.clone())
-            .collect();
+        manifests.sort_by_key(|(h, _)| *h);
 
-        if mmr_segments.is_empty() && nf_segments.is_empty() {
-            return Ok(None);
+        let mut mmr_segments: Vec<Vec<u8>> = Vec::new();
+        let mut nf_segments: Vec<Vec<u8>> = Vec::new();
+
+        for (_h, ticket) in manifests {
+            if let Ok(bytes) = self.network.fetch_blob_from_ticket(&ticket).await {
+                if let Ok(manifest) = serde_json::from_slice::<SyncManifest>(&bytes) {
+                    for item in manifest.items {
+                        match item.kind {
+                            BlobKind::CommitmentDelta => {
+                                if let Ok(seg) = self.network.fetch_blob_from_ticket(&item.ticket).await {
+                                    mmr_segments.push(seg.to_vec());
+                                }
+                            }
+                            BlobKind::NullifierDelta => {
+                                if let Ok(seg) = self.network.fetch_blob_from_ticket(&item.ticket).await {
+                                    nf_segments.push(seg.to_vec());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
 
-        let bundle = pcd_core::PcdDeltaBundle::new(mmr_segments, nf_segments, (start_height, end_height));
-        Ok(Some(bundle))
+        if mmr_segments.is_empty() && nf_segments.is_empty() { return Ok(None); }
+        Ok(Some(pcd_core::PcdDeltaBundle::new(mmr_segments, nf_segments, (start_height, end_height))))
     }
 
     async fn fetch_transition_proof(

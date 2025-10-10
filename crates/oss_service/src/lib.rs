@@ -521,6 +521,7 @@ impl ObliviousSyncService {
                         match msg {
                             Ok((kind, cid, height, size, ticket)) => {
                                 let mut list = published.write().unwrap();
+                                // Only record public, height-keyed manifests and blobs; ignore wallet-specific hints
                                 let already_exists = list.iter().any(|e| e.cid == cid);
                                 if !already_exists {
                                     list.push(PublishedBlobInfo { kind, height, size, cid, ticket });

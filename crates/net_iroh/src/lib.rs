@@ -814,12 +814,24 @@ async fn read_framed(mut recv: RecvStream) -> Result<Vec<u8>> {
 }
 
 // Control protocol that accepts control ALPN connections and forwards messages
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ControlProtocol {
     peers: Arc<RwLock<HashMap<NodeId, Connection>>>,
     control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
     header_provider: Arc<RwLock<Option<Arc<dyn HeaderProvider>>>>,
     published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>>,
+}
+
+impl std::fmt::Debug for ControlProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoid printing non-Debug fields like the HeaderProvider trait object.
+        let peers_len = self.peers.read().map(|p| p.len()).unwrap_or(0);
+        let published_len = self.published.read().map(|v| v.len()).unwrap_or(0);
+        f.debug_struct("ControlProtocol")
+            .field("peers_len", &peers_len)
+            .field("published_len", &published_len)
+            .finish()
+    }
 }
 
 impl ProtocolHandler for ControlProtocol {
@@ -849,7 +861,10 @@ impl ProtocolHandler for ControlProtocol {
                                 match msg {
                                     ControlMessage::GetHeadersByHeight { start, count } => {
                                         // Prefer registered provider; fallback to published list
-                                        let headers_pairs: Vec<(u64, Vec<u8>)> = if let Some(provider) = header_provider.read().unwrap().clone() {
+                                        let provider_opt: Option<Arc<dyn HeaderProvider>> = {
+                                            header_provider.read().unwrap().clone()
+                                        };
+                                        let headers_pairs: Vec<(u64, Vec<u8>)> = if let Some(provider) = provider_opt {
                                             provider.get_headers_by_height(start, count).await
                                         } else {
                                             let mut headers: Vec<(u64, Vec<u8>)> = published
