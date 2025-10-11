@@ -16,6 +16,7 @@ ff = "0.13"
 rand.workspace = true
 halo2curves = "0.6"
 pasta_curves.workspace = true
+ragu.path = "../ragu"
 
 [features]
 dev-graph = ["halo2_proofs/dev-graph", "dep:plotters"]

@@ -14,6 +14,7 @@ use iroh_blobs::{
 };
 use iroh_blobs::protocol::ChunkRangesExt;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -40,21 +41,14 @@ type Published = Vec<(BlobKind, Vec<u8>, u64)>;
 type AnnounceRecord = (BlobKind, Cid, u64, usize, String);
 type AnnounceList = Vec<AnnounceRecord>;
 type HeaderList = Vec<(u64, Vec<u8>)>;
-type HeaderListFuture<'a> = Pin<Box<dyn Future<Output = HeaderList> + Send + 'a>>;
+pub type HeaderListFuture<'a> = Pin<Box<dyn Future<Output = HeaderList> + Send + 'a>>;
 
 // Integrity verification is provided by iroh-blobs via BLAKE3-verified streams.
 
 /// Protocol identifiers for ALPN
 pub const CONTROL_ALPN: &[u8] = b"tachyon/ctrl";
-/// Hardcoded relay URL used in tickets and dialing
+/// Default relay URL (can be overridden with TACHYON_RELAY_URL)
 const DEFAULT_RELAY_URL: &str = "relay://localhost:4400";
-/// Hardcoded 32-byte secret key for stable NodeId (example only; replace in production)
-const SECRET_KEY_BYTES: [u8; 32] = [
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-    0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10,
-    0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98,
-    0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f, 0x01,
-];
 
 /// Blob content identifier (BLAKE3 hash)
 pub type Cid = Hash;
@@ -126,6 +120,8 @@ pub enum ControlMessage {
     GetHeadersByHeight { start: u64, count: u32 },
     /// Response with headers for a requested height range; includes heights alongside bytes
     HeadersByHeight { start: u64, headers: Vec<(u64, Vec<u8>)> },
+    /// Authenticate control channel (optional). If TACHYON_CTRL_TOKEN is set, peers must send this first.
+    Auth { token: String },
     /// Deliver an out-of-band payment payload to a peer.
     ///
     /// The hash should be a 32-byte BLAKE3 digest that uniquely identifies the
@@ -223,7 +219,10 @@ impl TachyonBlobStore {
 }
 
 fn default_relay_url() -> iroh::RelayUrl {
-    DEFAULT_RELAY_URL.parse::<iroh::RelayUrl>().expect("invalid DEFAULT_RELAY_URL")
+    std::env::var("TACHYON_RELAY_URL")
+        .ok()
+        .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
+        .unwrap_or_else(|| DEFAULT_RELAY_URL.parse::<iroh::RelayUrl>().expect("invalid DEFAULT_RELAY_URL"))
 }
 
 /// High-level network interface
@@ -305,10 +304,10 @@ impl BlobStore for TachyonBlobStore {
 impl TachyonNetwork {
     /// Create a new TachyonNetwork instance
     pub async fn new(data_dir: &std::path::Path) -> Result<Self> {
-        // Create iroh endpoint with hardcoded identity and always-on discovery
+        // Create iroh endpoint with persisted identity and discovery disabled by default
         let mut builder = Endpoint::builder();
-        let secret_key = SecretKey::from_bytes(&SECRET_KEY_BYTES);
-        builder = builder.secret_key(secret_key).discovery_n0();
+        let secret_key = persist_or_load_secret_key(data_dir)?;
+        builder = builder.secret_key(secret_key);
         let endpoint = builder.bind().await?;
 
         // Create convenience local blob store for legacy callers/benches
@@ -331,6 +330,8 @@ impl TachyonNetwork {
             control_tx: control_tx.clone(),
             published: published.clone(),
             header_provider: Arc::new(RwLock::new(None)),
+            auth_ok: Arc::new(RwLock::new(HashMap::new())),
+            rate: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Register control protocol and iroh-blobs provider for remote blob serving
@@ -833,6 +834,9 @@ impl TachyonNetwork {
         oob_events: &broadcast::Sender<([u8; 32], Vec<u8>, NodeId)>,
     ) {
         match message {
+            ControlMessage::Auth { .. } => {
+                // Handled in accept(); ignore here.
+            }
             ControlMessage::Announce {
                 kind,
                 cid,
@@ -894,6 +898,8 @@ struct ControlProtocol {
     control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
     header_provider: Arc<RwLock<Option<Arc<dyn HeaderProvider>>>>,
     published: Arc<RwLock<Published>>,
+    auth_ok: Arc<RwLock<HashMap<NodeId, bool>>>,
+    rate: Arc<RwLock<HashMap<NodeId, RateState>>>,
 }
 
 impl std::fmt::Debug for ControlProtocol {
@@ -917,12 +923,19 @@ impl ProtocolHandler for ControlProtocol {
         let tx = self.control_tx.clone();
         let published = self.published.clone();
         let header_provider = self.header_provider.clone();
+        let auth_ok = self.auth_ok.clone();
+        let rate = self.rate.clone();
         Box::pin(async move {
             let node_id = match conn.remote_node_id() {
                 Ok(id) => id,
                 Err(_) => return Ok(()),
             };
             peers.write().unwrap().insert(node_id, conn.clone());
+            // If a control token is configured, require an Auth message before processing others
+            let ctrl_token = std::env::var("TACHYON_CTRL_TOKEN").ok();
+            if ctrl_token.is_some() {
+                auth_ok.write().unwrap().insert(node_id, false);
+            }
             // handle incoming streams
             while let Ok((mut send, recv)) = conn.accept_bi().await {
                         let res = read_framed(recv).await;
@@ -930,6 +943,60 @@ impl ProtocolHandler for ControlProtocol {
                             bincode::deserialize::<ControlMessage>(&buf).map_err(|e| anyhow!(e))
                         }) {
                             Ok(msg) => {
+                        // Optional auth gate
+                        if let Some(token) = ctrl_token.as_ref() {
+                            // Determine whether this is an auth message and update the map
+                            let is_auth_msg = matches!(msg, ControlMessage::Auth { .. });
+                            let authed_after_update: bool = {
+                                let mut authed_map = auth_ok.write().unwrap();
+                                let entry = authed_map.entry(node_id).or_insert(false);
+                                if is_auth_msg {
+                                    if let ControlMessage::Auth { token: provided } = &msg {
+                                        if provided == token {
+                                            *entry = true;
+                                        }
+                                    }
+                                }
+                                *entry
+                            }; // drop lock before any await
+
+                            if is_auth_msg {
+                                // Ack auth result without holding the lock
+                                let _ = write_framed(
+                                    &mut send,
+                                    &bincode::serialize(&ControlMessage::OobAck { hash: [0u8; 32] })
+                                        .unwrap_or_default(),
+                                )
+                                .await;
+                                continue;
+                            }
+
+                            if !authed_after_update {
+                                // Drop unauthenticated message
+                                continue;
+                            }
+                        }
+
+                        // Simple per-peer rate limiting (requests per second)
+                        {
+                            let rps: u32 = std::env::var("TACHYON_CTRL_RPS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            // Update window and count without holding the lock across awaits
+                            let exceeded = {
+                                let mut map = rate.write().unwrap();
+                                let st = map.entry(node_id).or_insert(RateState { window_start: now, count: 0 });
+                                if now != st.window_start {
+                                    st.window_start = now;
+                                    st.count = 0;
+                                }
+                                st.count = st.count.saturating_add(1);
+                                st.count > rps
+                            };
+                            if exceeded {
+                                // Exceeded; drop silently
+                                continue;
+                            }
+                        }
                                 match msg {
                                     ControlMessage::GetHeadersByHeight { start, count } => {
                                         // Prefer registered provider; fallback to published list
@@ -980,3 +1047,25 @@ impl ProtocolHandler for ControlProtocol {
         })
     }
 }
+
+/// Persist or load a stable SecretKey under the data directory
+fn persist_or_load_secret_key(data_dir: &std::path::Path) -> Result<SecretKey> {
+    use rand::RngCore;
+    let key_path = data_dir.join("node_key");
+    if let Ok(bytes) = std::fs::read(&key_path) {
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            return Ok(SecretKey::from_bytes(&arr));
+        }
+    }
+    // Generate and persist
+    std::fs::create_dir_all(data_dir).ok();
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    std::fs::write(&key_path, bytes)?;
+    Ok(SecretKey::from_bytes(&bytes))
+}
+
+#[derive(Clone, Copy)]
+struct RateState { window_start: u64, count: u32 }

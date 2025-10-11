@@ -6,6 +6,27 @@ Rust workspace that prototypes a Tachyon-style shielded system: wallet with proo
 Scope: experimental, credit to Sean Bowe & Zcash team
 
 
+Core idea (simple)
+------------------
+- Two trees:
+  - Tree 1: all coin commitments ever created (append-only).
+  - Tree 2: all nullifiers of spent coins (insert-only; no deletes).
+
+- When spending a coin:
+  1. Prove the coin is in the coin tree.
+  2. Prove the spend nullifier is not in the nullifier tree.
+  3. Insert the nullifier into the nullifier tree.
+
+- Block rule:
+  - One block-wide proof (Halo2 + Poseidon2) checks all spends, inserts, and new coins at once.
+  - Validators verify only this succinct proof and update the two accumulators.
+
+- Why it works:
+  - No deletions → simpler, faster accumulators and witness updates.
+  - Wallets apply small per-block deltas.
+  - Verifiers avoid replaying transactions; they check one succinct proof.
+
+
 What this is
 ------------
 - **Wallet**: keeps encrypted notes, witnesses, and a PCD state; derives FVKey-independent nullifiers (NF2) from a spend-secret; syncs via height-keyed Manifests; builds spends.

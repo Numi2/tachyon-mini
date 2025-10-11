@@ -14,7 +14,7 @@ use zebra_chain::work::difficulty::Expanded as ZebraExpandedTarget;
 #[cfg(feature = "zcash_zebra")]
 use zebra_chain::block::Header as ZebraHeader;
 use pq_crypto::{SuiteB, SuiteBPublicKey, SuiteBSignature, SUITE_B_DOMAIN_CHECKPOINT};
-use net_iroh::{BlobKind, TachyonNetwork};
+use net_iroh::{BlobKind, HeaderProvider, TachyonNetwork};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -573,6 +573,9 @@ impl HeaderSyncManager {
         let chain = Arc::new(RwLock::new(Self::load_or_create_chain(&config).await?));
         let sync_state = Arc::new(RwLock::new(SyncState::new()));
 
+        // Register a header provider so peers can fetch headers by height
+        network.set_header_provider(Arc::new(ChainHeaderProvider { chain: chain.clone() }));
+
         // Start background sync task
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
 
@@ -926,6 +929,11 @@ impl HeaderSyncManager {
             "Header sync cycle completed at height {}",
             chain.read().await.tip.unwrap_or(current_height)
         );
+
+        // Optionally publish a checkpoint at configured intervals
+        if config.sync_config.checkpoint_interval > 0 {
+            Self::maybe_publish_checkpoint(chain, network, config).await;
+        }
     }
 
     /// Decode header from either our bincode representation or raw Zcash header bytes
@@ -1133,4 +1141,85 @@ fn verify_equihash_solution(header: &BlockHeader, _n: u32, _k: u32) -> bool {
     // Fallback placeholder when feature is disabled
     !header.solution.is_empty()
 }
+
+/// Provide headers by height to the network layer for serving peers
+struct ChainHeaderProvider {
+    chain: Arc<RwLock<HeaderChain>>,
+}
+
+impl HeaderProvider for ChainHeaderProvider {
+    fn get_headers_by_height<'a>(&'a self, start: u64, count: u32) -> net_iroh::HeaderListFuture<'a> {
+        Box::pin(async move {
+            let chain = self.chain.read().await;
+            let end = start.saturating_add(count as u64).saturating_sub(1);
+            let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+            for h in start..=end {
+                if let Some(header) = chain.get_header(h) {
+                    if let Ok(bytes) = bincode::serialize(header) {
+                        out.push((h, bytes));
+                    }
+                }
+            }
+            out
+        })
+    }
+}
+
+impl HeaderSyncManager {
+    /// Possibly publish a checkpoint if the tip hits a checkpoint interval.
+    async fn maybe_publish_checkpoint(
+        chain: &Arc<RwLock<HeaderChain>>,
+        network: &Arc<TachyonNetwork>,
+        config: &HeaderSyncConfig,
+    ) {
+        let (tip_h, tip_hdr, mmr_root, nf_root) = {
+            let c = chain.read().await;
+            let tip_h = match c.tip { Some(h) => h, None => return };
+            // Only publish on interval boundaries
+            if config.sync_config.checkpoint_interval == 0 || tip_h % config.sync_config.checkpoint_interval != 0 {
+                return;
+            }
+            let hdr = match c.get_header(tip_h) { Some(h) => h.clone(), None => return };
+            let mmr_root = c.mmr_roots.get(&tip_h).cloned().unwrap_or_else(|| SerializableHash(Hash::from([0u8; 32])));
+            let nf_root = c.nullifier_roots.get(&tip_h).cloned().unwrap_or_else(|| SerializableHash(Hash::from([0u8; 32])));
+            (tip_h, hdr, mmr_root, nf_root)
+        };
+
+        // Construct a modest NiPoPoW proof over a recent window
+        let start = tip_h.saturating_sub(config.sync_config.checkpoint_interval.saturating_mul(2));
+        let proof = {
+            let c = chain.read().await;
+            // Fall back to a small proof if generation fails
+            c.generate_nipopow_proof(start, tip_h).unwrap_or_else(|_| NiPoPoWProof { start_height: start, end_height: tip_h, headers: vec![tip_hdr.clone()], interlink: Vec::new() })
+        };
+
+        let cp = Checkpoint::new(
+            tip_h,
+            tip_hdr.hash.into(),
+            mmr_root.into(),
+            nf_root.into(),
+            proof,
+        );
+
+        // Serialize and publish
+        if let Ok(bytes) = bincode::serialize(&cp) {
+            let _ = network
+                .publish_blob_with_ticket(BlobKind::Checkpoint, bytes.into(), tip_h)
+                .await;
+        }
+        // Persist by updating the on-disk chain snapshot with the new checkpoint entry
+        {
+            let mut c = chain.write().await;
+            c.checkpoints.push(cp);
+        }
+            let c = chain.read().await;
+            let path = std::path::Path::new(&config.network_config.data_dir).join("headers.bin");
+            let tmp = std::path::Path::new(&config.network_config.data_dir).join("headers.bin.tmp");
+            if let Ok(data) = bincode::serialize(&*c) {
+                let _ = tokio::fs::write(&tmp, &data).await;
+                let _ = tokio::fs::rename(&tmp, &path).await;
+            }
+    }
+}
+
 

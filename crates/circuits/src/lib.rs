@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # circuits
 //!
 //! Zero-knowledge proof circuits for Tachyon PCD system.
@@ -5,7 +6,7 @@
 
 use anyhow::Result;
 use blake3::Hasher as Blake3Hasher;
-use ff::{PrimeField, FromUniformBytes};
+use ff::{PrimeField, FromUniformBytes, Field};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
@@ -24,6 +25,11 @@ use rand::rngs::OsRng;
 use std::io::Cursor;
 use std::path::Path;
 use std::{fs, fs::File};
+use ragu::circuit as ragu_circuit;
+use ragu::circuit::{Circuit as _, Sink as _};
+use ragu::drivers::{PublicInput, PublicInputDriver};
+use ragu::maybe as ragu_maybe;
+use ragu::maybe::Maybe as _;
 
 /// Poseidon-based transition hash (native) mirroring the in-circuit composition.
 ///
@@ -43,6 +49,99 @@ fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr,
         .hash([tag_d2, nullifier_root, anchor_height]);
     poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
         .hash([tag_d3, d1, d2])
+}
+
+// -----------------------------
+// ragu integration
+// -----------------------------
+
+// Use ragu's concrete production driver for public input extraction
+type HostProverDriver = PublicInputDriver<Fr>;
+
+#[derive(Clone, Copy)]
+struct TransitionInput {
+    prev_state: Fr,
+    mmr_root: Fr,
+    nullifier_root: Fr,
+    anchor_height: Fr,
+}
+
+#[derive(Clone, Copy)]
+struct TransitionIO<W> {
+    prev_state: W,
+    new_state: W,
+    mmr_root: W,
+    nullifier_root: W,
+    anchor_height: W,
+}
+
+struct TransitionRagu;
+
+impl ragu_circuit::Circuit<Fr> for TransitionRagu {
+    type Instance<'instance> = TransitionInput;
+    type IO<'source, D: ragu_circuit::Driver<F = Fr>> = TransitionIO<<D as ragu_circuit::Driver>::W>;
+    type Witness<'witness> = TransitionInput;
+    type Aux<'witness> = ();
+
+    fn input<'instance, D: ragu_circuit::Driver<F = Fr>>(
+        &self,
+        _dr: &mut D,
+        input: ragu_circuit::Witness<D, Self::Instance<'instance>>,
+    ) -> Result<Self::IO<'instance, D>, anyhow::Error> {
+        use ragu_maybe::Maybe as _;
+        let i = input.take();
+        let new_state = compute_transition_poseidon(i.prev_state, i.mmr_root, i.nullifier_root, i.anchor_height);
+        let dr_local = _dr;
+        Ok(TransitionIO {
+            prev_state: dr_local.from_field(i.prev_state),
+            new_state: dr_local.from_field(new_state),
+            mmr_root: dr_local.from_field(i.mmr_root),
+            nullifier_root: dr_local.from_field(i.nullifier_root),
+            anchor_height: dr_local.from_field(i.anchor_height),
+        })
+    }
+
+    fn main<'witness, D: ragu_circuit::Driver<F = Fr>>(
+        &self,
+        dr: &mut D,
+        witness: ragu_circuit::Witness<D, Self::Witness<'witness>>,
+    ) -> Result<(Self::IO<'witness, D>, ragu_circuit::Witness<D, Self::Aux<'witness>>), anyhow::Error> {
+        let io = self.input(dr, witness)?;
+        // Produce a Maybe<()> value without constraining MaybeKind further
+        let aux: ragu_circuit::Witness<D, ()> = <
+            <D as ragu_circuit::Driver>::MaybeKind as ragu_maybe::MaybeKind
+        >::Rebind::<()>
+        ::just(|| ());
+        Ok((io, aux))
+    }
+
+    fn output<'source, D: ragu_circuit::Driver<F = Fr>>(
+        &self,
+        _dr: &mut D,
+        io: Self::IO<'source, D>,
+        output: &mut D::IO,
+    ) -> Result<(), anyhow::Error> {
+        output.absorb(io.prev_state);
+        output.absorb(io.new_state);
+        output.absorb(io.mmr_root);
+        output.absorb(io.nullifier_root);
+        output.absorb(io.anchor_height);
+        Ok(())
+    }
+}
+
+fn ragu_compute_transition_public_inputs(prev: Fr, mmr: Fr, nul: Fr, anchor: Fr) -> Result<[Fr; 5], anyhow::Error> {
+    let circuit = TransitionRagu;
+    let mut dr = HostProverDriver::default();
+    let input = ragu_maybe::Always(TransitionInput { prev_state: prev, mmr_root: mmr, nullifier_root: nul, anchor_height: anchor });
+    let io = circuit.input(&mut dr, input)?;
+    let mut sink: PublicInput<Fr> = PublicInput { values: Vec::with_capacity(5) };
+    circuit.output(&mut dr, io, &mut sink)?;
+    // Order: prev, new, mmr, nul, anchor
+    if sink.values.len() != 5 {
+        return Err(anyhow::anyhow!("unexpected public input count"));
+    }
+    Ok([sink.values[0], sink.values[1], sink.values[2], sink.values[3], sink.values[4]])
 }
 
 /// Compute the transition Poseidon digest and return canonical 32-byte encoding
@@ -544,10 +643,11 @@ impl PcdCore {
         let mmr_fr = to_fr(mmr_root);
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
-        let provided_new_fr = to_fr(new_state);
+        // Interpret new_state as canonical field encoding if possible; otherwise map uniformly
+        let provided_new_fr = Fr::from_repr(*new_state).unwrap_or_else(|| to_fr(new_state));
 
-        // Compute the expected Poseidon digest that the circuit must expose as `new_state`
-        let expected_new_fr = compute_transition_poseidon(prev_fr, mmr_fr, nul_fr, anchor_fr);
+        // Compute the expected Poseidon digest via ragu path (matches circuit logic)
+        let [_, expected_new_fr, _, _, _] = ragu_compute_transition_public_inputs(prev_fr, mmr_fr, nul_fr, anchor_fr)?;
 
         // Optional consistency check: provided new_state must match expected
         if provided_new_fr != expected_new_fr {
@@ -564,11 +664,12 @@ impl PcdCore {
         };
 
         // Prepare instance columns (prev, new, mmr, nul, anchor)
-        let inst_prev = [prev_fr];
-        let inst_new = [provided_new_fr];
-        let inst_mmr = [mmr_fr];
-        let inst_nul = [nul_fr];
-        let inst_anchor = [anchor_fr];
+        let [inst_prev, inst_new, inst_mmr, inst_nul, inst_anchor] = [prev_fr, expected_new_fr, mmr_fr, nul_fr, anchor_fr];
+        let inst_prev = [inst_prev];
+        let inst_new = [inst_new];
+        let inst_mmr = [inst_mmr];
+        let inst_nul = [inst_nul];
+        let inst_anchor = [inst_anchor];
 
         // Build proof
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
@@ -611,12 +712,12 @@ impl PcdCore {
         }
 
         let prev_fr = to_fr(prev_state);
-        let new_fr = to_fr(new_state);
+        let new_fr = Fr::from_repr(*new_state).unwrap_or_else(|| to_fr(new_state));
         let mmr_fr = to_fr(mmr_root);
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
 
-        // Prepare instance columns: prev_state, new_state, mmr_root, nullifier_root, anchor (row 0 only)
+        // Prepare instance columns directly (prev, new, mmr, nul, anchor)
         let inst_prev = [prev_fr];
         let inst_new = [new_fr];
         let inst_mmr = [mmr_fr];
@@ -636,6 +737,138 @@ impl PcdCore {
         )
         .is_ok();
         Ok(ok)
+    }
+}
+
+/// Recursion proving/verification core for aggregating proof commitments
+#[derive(Clone)]
+pub struct RecursionCore {
+    /// Recursion circuit size
+    pub proving_k: u32,
+    /// KZG params
+    pub params: Params<G1Affine>,
+    /// Verifying key for recursion circuit
+    pub vk: VerifyingKey<G1Affine>,
+    /// Proving key for recursion circuit
+    pub pk: ProvingKey<G1Affine>,
+}
+
+impl RecursionCore {
+    /// Create a new recursion core with default k=12
+    pub fn new() -> Result<Self> { Self::with_k(12) }
+
+    /// Create with explicit k
+    pub fn with_k(k: u32) -> Result<Self> {
+        let params = Params::<G1Affine>::new(k);
+        // Empty circuit to derive keys
+        let empty = PcdRecursionCircuit {
+            prev_proof_commitment: Value::unknown(),
+            current_proof_commitment: Value::unknown(),
+            aggregated_commitment: Value::unknown(),
+            folding_factor: Value::unknown(),
+        };
+        let vk = keygen_vk(&params, &empty)?;
+        let pk = keygen_pk(&params, vk.clone(), &empty)?;
+        Ok(Self { proving_k: k, params, vk, pk })
+    }
+
+    /// Map arbitrary proof bytes to a field element deterministically
+    fn to_fr_from_bytes(bytes: &[u8]) -> Fr {
+        use blake3::Hasher;
+        use std::io::Read as _;
+        let mut hasher = Hasher::new();
+        hasher.update(b"pcd:rec:fr:uniform:v1");
+        hasher.update(bytes);
+        let mut xof = hasher.finalize_xof();
+        let mut wide = [0u8; 64];
+        xof.read_exact(&mut wide).unwrap();
+        Fr::from_uniform_bytes(&wide)
+    }
+
+    /// Compute a 32-byte commitment encoding for a proof
+    pub fn commit_proof_bytes(&self, proof: &[u8]) -> [u8; 32] {
+        let fr = Self::to_fr_from_bytes(proof);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(fr.to_repr().as_ref());
+        out
+    }
+
+    /// Prove one recursion step: aggregated = prev * folding + current
+    pub fn prove_aggregate_pair(
+        &self,
+        prev_commitment: &[u8; 32],
+        current_commitment: &[u8; 32],
+        folding_factor: u64,
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let prev_fr = Self::to_fr_from_bytes(prev_commitment);
+        let cur_fr = Self::to_fr_from_bytes(current_commitment);
+        let fold_fr = Fr::from(folding_factor);
+        let agg_fr = prev_fr * fold_fr + cur_fr;
+
+        let circuit = PcdRecursionCircuit::new(
+            Value::known(prev_fr),
+            Value::known(cur_fr),
+            Value::known(agg_fr),
+            Value::known(fold_fr),
+        );
+
+        let inst_agg = [agg_fr];
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
+        halo2_proofs::plonk::create_proof(
+            &self.params,
+            &self.pk,
+            &[circuit],
+            &[&[&inst_agg[..]]],
+            OsRng,
+            &mut transcript,
+        )?;
+        let proof_bytes = transcript.finalize();
+
+        let mut agg_bytes = [0u8; 32];
+        agg_bytes.copy_from_slice(agg_fr.to_repr().as_ref());
+        Ok((proof_bytes, agg_bytes))
+    }
+
+    /// Verify a recursion step proof for the provided aggregated commitment
+    pub fn verify_aggregate_pair(&self, proof: &[u8], aggregated_commitment: &[u8; 32]) -> Result<bool> {
+        let agg_fr = Self::to_fr_from_bytes(aggregated_commitment);
+        let inst_agg = [agg_fr];
+        let mut transcript = Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
+        let strategy = SingleVerifier::new(&self.params);
+        let ok = verify_proof(
+            &self.params,
+            &self.vk,
+            strategy,
+            &[&[&inst_agg[..]]],
+            &mut transcript,
+        )
+        .is_ok();
+        Ok(ok)
+    }
+
+    /// Aggregate many proof commitments by repeatedly folding with a fixed factor
+    /// Returns (last recursion proof, aggregated commitment bytes)
+    pub fn aggregate_many_commitments(&self, commitments: &[[u8; 32]], folding_factor: u64) -> Result<(Vec<u8>, [u8; 32])> {
+        if commitments.is_empty() {
+            return Ok((Vec::new(), [0u8; 32]));
+        }
+        let mut agg = commitments[0];
+        let mut last_proof: Vec<u8> = Vec::new();
+        for cur in commitments.iter().skip(1) {
+            let (proof, new_agg) = self.prove_aggregate_pair(&agg, cur, folding_factor)?;
+            last_proof = proof;
+            agg = new_agg;
+        }
+        Ok((last_proof, agg))
+    }
+
+    /// Convenience: aggregate many raw proofs by first committing them then folding
+    pub fn aggregate_many_proofs(&self, proofs: &[Vec<u8>], folding_factor: u64) -> Result<(Vec<u8>, [u8; 32])> {
+        let mut commitments: Vec<[u8; 32]> = Vec::with_capacity(proofs.len());
+        for p in proofs {
+            commitments.push(self.commit_proof_bytes(p));
+        }
+        self.aggregate_many_commitments(&commitments, folding_factor)
     }
 }
 

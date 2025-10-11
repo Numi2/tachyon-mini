@@ -62,6 +62,8 @@ pub struct ObliviousSyncService {
     rate_limiter: Arc<RwLock<RateLimiter>>,
     /// Recently published blob tickets for clients
     published: Arc<RwLock<Vec<PublishedBlobInfo>>>,
+    /// Persisted manifests dir
+    manifests_dir: std::path::PathBuf,
     /// Access tokens (very simple in-memory for now)
     access_tokens: Arc<RwLock<HashMap<String, AccessToken>>>,
     /// Background sync task
@@ -194,6 +196,8 @@ impl ObliviousSyncService {
     pub async fn new(config: OssConfig, data_dir: &Path) -> Result<Self> {
         let network = Arc::new(TachyonNetwork::new(data_dir).await?);
         let blob_store = Arc::new(TachyonBlobStore::new(data_dir).await?);
+        let manifests_dir = data_dir.join("manifests");
+        std::fs::create_dir_all(&manifests_dir)?;
 
         Ok(Self {
             config: config.clone(),
@@ -208,6 +212,7 @@ impl ObliviousSyncService {
             listener_task: None,
             shutdown_tx: None,
             listener_shutdown_tx: None,
+            manifests_dir,
         })
     }
 
@@ -356,6 +361,19 @@ impl ObliviousSyncService {
         let (_mf_cid, manifest_ticket) = network
             .publish_blob_with_ticket(BlobKind::Manifest, manifest_bytes.clone().into(), height_next)
             .await?;
+
+        // Persist manifest to disk for recovery
+        let fname = format!("manifest_{}.json", height_next);
+        // Prefer configured manifests_dir; fall back to env or ./manifests
+        let path = {
+            let default_dir = std::path::PathBuf::from("./manifests");
+            // We can't access self here; derive from any previously created dir via published not needed
+            std::env::var("TACHYON_MANIFEST_DIR").ok().map(std::path::PathBuf::from).unwrap_or(default_dir)
+        };
+        let path_file = path.join(&fname);
+        let tmp = path.join(format!("{}.tmp", &fname));
+        let _ = tokio::fs::write(&tmp, &manifest_bytes).await;
+        let _ = tokio::fs::rename(&tmp, &path_file).await;
 
         // Record tickets for client distribution
         {
@@ -733,13 +751,9 @@ impl BlobStore for TachyonBlobStore {
         let cid = *cid;
         let data = data.to_vec();
         Box::pin(async move {
-            // Store blob locally first
-            let _ = network.blob_store.put_blob(&cid, data.clone().into()).await;
-
-            // Publish to network
-            network
-                .publish_blob(BlobKind::Header, data.into(), 0)
-                .await?;
+            // Store blob locally (iroh FsStore)
+            let _ = network.blob_store.put(cid, bytes::Bytes::from(data.clone())).await;
+            // Publishing policy is handled by higher layers; do not republish from here
 
             Ok(())
         })

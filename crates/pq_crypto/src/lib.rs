@@ -363,6 +363,77 @@ pub fn derive_nf2(
     out
 }
 
+// =============================
+// Tachyon note and nullifier helpers (prototype)
+// =============================
+
+/// Derive a per-payment commitment key from a shared secret established out-of-band.
+/// This binds the note commitment to the shared secret while remaining unlinkable.
+pub fn derive_commitment_key(shared_secret: &[u8; KYBER_SHARED_SECRET_SIZE]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"tachyon:cmk:v1");
+    h.update(shared_secret);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// Derive a per-note nonce from the shared secret, payment key, and value.
+/// Including value ensures domain separation across values for the same payment key.
+pub fn derive_note_nonce(
+    shared_secret: &[u8; KYBER_SHARED_SECRET_SIZE],
+    payment_key: &[u8; 32],
+    value: u64,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"tachyon:note:nonce:v1");
+    h.update(shared_secret);
+    h.update(payment_key);
+    h.update(&value.to_le_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// Compute a note commitment from core note fields.
+/// commitment = H(tag || payment_key || value || nonce || commitment_key)
+pub fn compute_note_commitment(
+    payment_key: &[u8; 32],
+    value: u64,
+    nonce: &[u8; 32],
+    commitment_key: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"tachyon:note:cm:v1");
+    h.update(payment_key);
+    h.update(&value.to_le_bytes());
+    h.update(nonce);
+    h.update(commitment_key);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// Flavored nullifier derivation used by Tachyon prototype.
+/// NF = H(tag || cm || rho || PRF_t(snk, rho) || flavor)
+pub fn derive_tachyon_nullifier_flavored(
+    note_commitment: &[u8; 32],
+    rho: &[u8; 32],
+    spend_nullifier_key: &[u8; 32],
+    flavor: u8,
+) -> [u8; 32] {
+    let t = derive_trapdoor_t(spend_nullifier_key, rho);
+    let mut h = blake3::Hasher::new();
+    h.update(b"tachyon.nf:v1");
+    h.update(note_commitment);
+    h.update(rho);
+    h.update(&t);
+    h.update(&[flavor]);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
 /// Token for rate limiting and unlinkability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessToken {
@@ -874,5 +945,17 @@ mod tests {
         let mut digest_bad = digest;
         digest_bad[0] ^= 0x01;
         assert!(!SuiteB::verify_prehash(&pk, &digest_bad, &sig));
+    }
+
+    #[test]
+    fn test_kyber_decapsulate_negative() {
+        // Generate keypair and encapsulate
+        let (pk, sk) = SimpleKem::generate_keypair().unwrap();
+        let (mut ct, shared_secret) = SimpleKem::encapsulate(&pk).unwrap();
+        assert_eq!(shared_secret.len(), KYBER_SHARED_SECRET_SIZE);
+        // Corrupt one byte of ciphertext, ensure decap no longer matches
+        if let Some(first) = ct.bytes.first_mut() { *first ^= 0xFF; }
+        let dec = SimpleKem::decapsulate(&sk, &ct).unwrap();
+        assert_ne!(dec, shared_secret);
     }
 }

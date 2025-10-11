@@ -1,14 +1,53 @@
+#![forbid(unsafe_code)]
 //! # pcd_core
 //!
 //! Proof-carrying data (PCD) state management for Tachyon wallet.
 //! Provides state definitions, proof interfaces, and recursion management.
 
 use accum_mmr::{MmrAccumulator, MmrDelta};
-use accum_set::{SetAccumulator, SetDelta};
+use accum_set::{Smt16Accumulator, Smt16Delta};
 use anyhow::{anyhow, Result};
 use circuits::PcdCore as Halo2PcdCore;
-use circuits::{aggregate_orchard_actions, compute_transition_digest_bytes};
+use circuits::{aggregate_orchard_actions, compute_transition_digest_bytes, RecursionCore};
+use ragu as _; // ensure ragu is linked via pcd_core when used downstream
 use serde::{Deserialize, Serialize};
+type PersistenceCallback = Box<dyn Fn(&PcdState) -> Result<()> + Send + Sync>;
+
+/// Unified 32-byte object used at consensus: commitments and nullifiers share this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Tachygram(pub [u8; 32]);
+
+impl Tachygram {
+    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+}
+
+/// Proof-carrying data artifact output by transactions/blocks.
+/// Carries an anchor, a list of tachygrams, and a recursion-friendly proof blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tachystamp {
+    /// Anchor height the proof/state binds to
+    pub anchor_height: u64,
+    /// Aggregated proof bytes (recursion-friendly)
+    pub aggregated_proof: Vec<u8>,
+    /// Aggregated commitment for quick verification (32 bytes)
+    pub aggregated_commitment: [u8; 32],
+    /// Tachygrams revealed/emitted by this action bundle (order-preserving)
+    pub tachygrams: Vec<Tachygram>,
+}
+
+impl Tachystamp {
+    /// Deterministically compute a hash for the stamp (not a SNARK check)
+    pub fn hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"tachystamp:v1");
+        h.update(&self.anchor_height.to_le_bytes());
+        h.update(&self.aggregated_commitment);
+        for tg in &self.tachygrams { h.update(&tg.0); }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    }
+}
 
 /// Size of PCD state commitment (BLAKE3 hash)
 pub const PCD_STATE_COMMITMENT_SIZE: usize = 32;
@@ -71,7 +110,7 @@ pub struct PcdState {
     pub state_data: Vec<u8>,
     /// Optional serialized MMR accumulator state
     pub mmr_bytes: Vec<u8>,
-    /// Optional serialized nullifier set state
+    /// Optional serialized nullifier SMT state
     pub nullifier_bytes: Vec<u8>,
 }
 
@@ -324,22 +363,22 @@ impl PcdStateMachine {
             new_state.mmr_bytes = bincode::serialize(&mmr).unwrap_or_default();
         }
 
-        // Apply nullifier deltas using accum_set (supports batch operations)
+        // Apply nullifier deltas using SMT-16 (insert-only)
         if !transition.nullifier_delta.is_empty() {
             // Deserialize accumulator or initialize
-            let mut nullset: SetAccumulator = if new_state.nullifier_bytes.is_empty() {
-                SetAccumulator::new()
+            let mut nullset: Smt16Accumulator = if new_state.nullifier_bytes.is_empty() {
+                Smt16Accumulator::new()
             } else {
                 bincode::deserialize(&new_state.nullifier_bytes)
-                    .unwrap_or_else(|_| SetAccumulator::new())
+                    .unwrap_or_else(|_| Smt16Accumulator::new())
             };
 
-            // Support either a single SetDelta or Vec<SetDelta>
-            let deltas: Vec<SetDelta> = match bincode::deserialize::<Vec<SetDelta>>(
+            // Support either a single Smt16Delta or Vec<Smt16Delta>
+            let deltas: Vec<Smt16Delta> = match bincode::deserialize::<Vec<Smt16Delta>>(
                 &transition.nullifier_delta,
             ) {
                 Ok(v) => v,
-                Err(_) => bincode::deserialize::<SetDelta>(&transition.nullifier_delta)
+                Err(_) => bincode::deserialize::<Smt16Delta>(&transition.nullifier_delta)
                     .map(|d| vec![d])
                     .unwrap_or_default(),
             };
@@ -566,7 +605,7 @@ pub struct PcdStateManager<V: PcdProofVerifier> {
     /// Proof verifier
     verifier: V,
     /// State persistence callback
-    persistence_callback: Option<Box<dyn Fn(&PcdState) -> Result<()> + Send + Sync>>,
+    persistence_callback: Option<PersistenceCallback>,
 }
 
 impl<V: PcdProofVerifier> PcdStateManager<V> {
@@ -653,6 +692,98 @@ pub mod aggregation {
     /// Aggregate multiple Orchard-like action proofs into one proof blob
     pub fn aggregate_action_proofs(action_proofs: &[Vec<u8>]) -> Result<Vec<u8>> {
         aggregate_orchard_actions(action_proofs)
+    }
+
+    /// Aggregate action proofs using Halo2 recursion circuit.
+    /// Returns (recursion_proof_bytes, aggregated_commitment_bytes32).
+    pub fn aggregate_action_proofs_recursive(action_proofs: &[Vec<u8>]) -> Result<(Vec<u8>, [u8; 32])> {
+        let core = RecursionCore::new()?;
+        // Choose a small non-zero folding factor; can be protocol-parameterized later.
+        let folding_factor: u64 = 7;
+        core.aggregate_many_proofs(action_proofs, folding_factor)
+    }
+}
+
+/// Tachyon-style types: tachygrams, anchor, actions, and tachystamps (aggregate proofs)
+pub mod tachyon {
+    use anyhow::Result;
+    use serde::{Deserialize, Serialize};
+    use circuits::RecursionCore;
+
+    /// Default folding factor used when aggregating proofs for a Tachystamp
+    pub const TACHY_FOLDING_FACTOR: u64 = 7;
+
+    /// Indistinguishable 32-byte blob representing either a commitment or a nullifier
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Tachygram(pub [u8; 32]);
+
+    /// Anchor binding for a Tachystamp; conveys the roots and height used in the proof
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct TachyAnchor {
+        pub height: u64,
+        pub mmr_root: [u8; 32],
+        pub nullifier_root: [u8; 32],
+    }
+
+    /// Operation kind for a Tachyaction (placeholder for richer semantics)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum TachyOpKind {
+        /// Action binds two tachygrams without specifying semantics
+        Bind,
+    }
+
+    /// Tachyaction: replaces Orchard actions with a pair of tachygrams and an authorization binding
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Tachyaction {
+        /// First tachygram in the pair
+        pub left: Tachygram,
+        /// Second tachygram in the pair
+        pub right: Tachygram,
+        /// Operation kind
+        pub op: TachyOpKind,
+        /// Binding digest (domain-separated prehash over randomness and commitments)
+        pub binding_digest: [u8; 32],
+        /// Authorization signature bytes (placeholder; e.g., RedPallas in production)
+        pub auth_signature: Vec<u8>,
+    }
+
+    /// Tachystamp: aggregate proof object for a transaction or block
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Tachystamp {
+        /// Anchor used for validation
+        pub anchor: TachyAnchor,
+        /// Set of tachygrams emitted (commitments and nullifiers)
+        pub tachygrams: Vec<Tachygram>,
+        /// Optional tachyactions included (can be empty)
+        pub actions: Vec<Tachyaction>,
+        /// Aggregated recursion proof bytes
+        pub aggregated_proof: Vec<u8>,
+        /// Aggregated commitment (32 bytes) for quick verification/pipelining
+        pub aggregated_commitment: [u8; 32],
+    }
+
+    impl Tachystamp {
+        /// Construct a Tachystamp by aggregating one or more underlying proofs using recursion
+        pub fn new(
+            anchor: TachyAnchor,
+            tachygrams: Vec<Tachygram>,
+            actions: Vec<Tachyaction>,
+            proofs: &[Vec<u8>],
+        ) -> Result<Self> {
+            let core = RecursionCore::new()?;
+            let (agg_proof, agg_commit) = if proofs.is_empty() {
+                (Vec::new(), [0u8; 32])
+            } else {
+                core.aggregate_many_proofs(proofs, TACHY_FOLDING_FACTOR)?
+            };
+            Ok(Self {
+                anchor,
+                tachygrams,
+                actions,
+                aggregated_proof: agg_proof,
+                aggregated_commitment: agg_commit,
+            })
+        }
     }
 }
 
@@ -818,12 +949,12 @@ impl<C: PcdSyncClient, V: PcdProofVerifier> PcdSyncManager<C, V> {
             }
             let mmr_delta_bytes = bincode::serialize(&mmr_ops)?;
 
-            // Aggregate nullifier deltas into a single Vec<SetDelta>
-            let mut nf_ops: Vec<SetDelta> = Vec::new();
+            // Aggregate nullifier deltas into a single Vec<Smt16Delta>
+            let mut nf_ops: Vec<Smt16Delta> = Vec::new();
             for seg in &delta_bundle.nullifier_deltas {
-                if let Ok(mut ops) = bincode::deserialize::<Vec<SetDelta>>(seg) {
+                if let Ok(mut ops) = bincode::deserialize::<Vec<Smt16Delta>>(seg) {
                     nf_ops.append(&mut ops);
-                } else if let Ok(op) = bincode::deserialize::<SetDelta>(seg) {
+                } else if let Ok(op) = bincode::deserialize::<Smt16Delta>(seg) {
                     nf_ops.push(op);
                 }
             }
@@ -956,6 +1087,7 @@ impl<C: PcdSyncClient, V: PcdProofVerifier> PcdSyncManager<C, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tachyon::*;
 
     #[test]
     fn test_pcd_state_creation() {
@@ -1220,5 +1352,33 @@ mod tests {
         assert!(state_manager.current_state().is_some());
 
         state_manager.verify_current_state().unwrap();
+    }
+
+    #[test]
+    fn test_tachyon_primitives_roundtrip_and_verify() {
+        use crate::tachyon::{TachyAnchor, Tachygram, Tachyaction, TachyOpKind, Tachystamp};
+        let anchor = TachyAnchor {
+            height: 123,
+            mmr_root: [1u8; 32],
+            nullifier_root: [2u8; 32],
+        };
+
+        let grams = vec![Tachygram([9u8; 32]), Tachygram([8u8; 32])];
+        let action = Tachyaction {
+            left: grams[0],
+            right: grams[1],
+            op: TachyOpKind::Bind,
+            binding_digest: [7u8; 32],
+            auth_signature: vec![5u8; 64],
+        };
+
+        let stamp = Tachystamp::new(anchor, grams.clone(), vec![action.clone()], &[action.auth_signature.clone()]).unwrap();
+        // Basic structural integrity: aggregated commitment is 32 bytes, proof may be empty
+        assert_eq!(stamp.aggregated_commitment.len(), 32);
+
+        // serde roundtrip
+        let bytes = bincode::serialize(&stamp).unwrap();
+        let dec: Tachystamp = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(dec.aggregated_commitment, stamp.aggregated_commitment);
     }
 }

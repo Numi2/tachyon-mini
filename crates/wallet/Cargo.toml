@@ -21,8 +21,10 @@ bincode.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 hex = "0.4"
 accum_mmr = { path = "../accum_mmr", optional = true }
+accum_set = { path = "../accum_set", optional = true }
 dex = { path = "../dex", optional = true }
 rand = { version = "0.8", optional = true }
+circuits = { path = "../circuits", optional = true }
 ## Zcash dependencies temporarily removed to resolve dependency conflicts
 ## bip0039 removed to avoid pbkdf2/subtle conflicts
 
@@ -43,5 +45,7 @@ pcd = [
     "node_ext",
     "reqwest",
     "accum_mmr",
+    "accum_set",
     "dex",
+    "circuits",
 ]

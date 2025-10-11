@@ -1,21 +1,24 @@
+#![forbid(unsafe_code)]
 //! # node_ext
 //! Numan Thabit
 //! Validator / Node extension implementation for Tachyon.
 //! Verifies PCD proofs, nullifier checks, and maintains minimal state for validation.
 
-use accum_mmr::{MmrAccumulator, MmrWitness, SerializableHash};
-use accum_set::SetAccumulator;
+use accum_mmr::{MmrAccumulator, MmrWitness, SerializableHash, MmrDelta};
+use accum_set::{Smt16Accumulator, Smt16NonMembershipProof, Smt16Delta};
 use anyhow::{anyhow, Result};
 use blake3::Hash;
 use net_iroh::TachyonNetwork;
 use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
-use pcd_core::aggregation::aggregate_action_proofs;
+use pcd_core::tachyon::{Tachystamp, Tachygram, TachyAnchor, Tachyaction};
+use pcd_core::aggregation::{aggregate_action_proofs, aggregate_action_proofs_recursive};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
+use std::collections::{HashSet, VecDeque};
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
@@ -106,8 +109,8 @@ impl Default for PruningConfig {
 pub struct NodeState {
     /// Current block height
     pub current_height: u64,
-    /// Canonical nullifier set accumulator (full-history)
-    pub nullifier_set: SetAccumulator,
+    /// Canonical nullifier accumulator (SMT-16) full-history
+    pub nullifier_set: Smt16Accumulator,
     /// MMR accumulator for note commitments
     pub commitment_mmr: MmrAccumulator,
     /// Current MMR peaks for validation (derived from `commitment_mmr`)
@@ -116,10 +119,18 @@ pub struct NodeState {
     pub mmr_root: [u8; 32],
     /// Current nullifier set root
     pub nullifier_root: [u8; 32],
+    /// Recent nullifier window (per-block buckets) for uniqueness checks
+    recent_nullifiers: VecDeque<Vec<[u8; 32]>>,
+    /// Fast membership set for recent nullifiers
+    recent_nullifiers_set: HashSet<[u8; 32]>,
     /// Last pruning timestamp
     pub last_pruned: Instant,
     /// Storage usage tracking
     pub storage_size: u64,
+    /// Last accepted block hash (for linking)
+    pub last_block_hash: Option<TransactionHash>,
+    /// Chained block state digest used for block-level Halo2 proof
+    pub state_digest: [u8; 32],
 }
 
 impl Default for NodeState {
@@ -133,27 +144,32 @@ impl NodeState {
     pub fn new() -> Self {
         Self {
             current_height: 0,
-            nullifier_set: SetAccumulator::new(),
+            nullifier_set: Smt16Accumulator::new(),
             commitment_mmr: MmrAccumulator::new(),
             mmr_peaks: Vec::new(),
             mmr_root: [0u8; 32],
             nullifier_root: [0u8; 32],
+            recent_nullifiers: VecDeque::new(),
+            recent_nullifiers_set: HashSet::new(),
             last_pruned: Instant::now(),
             storage_size: 0,
+            last_block_hash: None,
+            state_digest: [0u8; 32],
         }
     }
 
     /// Update nullifier accumulator with new nullifiers and refresh root
-    pub fn update_nullifier_set(&mut self, new_nullifiers: Vec<[u8; 32]>) {
-        for nf in new_nullifiers {
-            self.nullifier_set.insert(nf);
-        }
+    pub fn update_nullifier_set(&mut self, mut new_nullifiers: Vec<[u8; 32]>) {
+        // Sort/dedup to ensure deterministic ordering per block
+        new_nullifiers.sort();
+        new_nullifiers.dedup();
+        for nf in new_nullifiers { self.nullifier_set.insert(nf); }
         self.nullifier_root = self.nullifier_set.root();
     }
 
-    /// Check if a nullifier has already been seen (full-history check)
+    /// Check if a nullifier has already been seen in the recent window
     pub fn check_nullifier(&self, nullifier: &[u8; 32]) -> bool {
-        self.nullifier_set.contains(nullifier)
+        self.recent_nullifiers_set.contains(nullifier)
     }
 
     /// Update MMR peaks
@@ -190,6 +206,31 @@ impl NodeState {
         hasher.finalize()
     }
 
+    /// Update the recent nullifier window using sorted/deduped new nullifiers and a window size
+    pub fn update_recent_nullifier_window(&mut self, mut new_nullifiers: Vec<[u8; 32]>, window_size: usize) {
+        // Maintain deterministic order per block and deduplicate
+        new_nullifiers.sort();
+        new_nullifiers.dedup();
+
+        // Push this block's bucket
+        if !new_nullifiers.is_empty() {
+            for nf in &new_nullifiers { self.recent_nullifiers_set.insert(*nf); }
+            self.recent_nullifiers.push_back(new_nullifiers);
+        } else {
+            // Still advance an empty bucket to keep alignment with heights
+            self.recent_nullifiers.push_back(Vec::new());
+        }
+
+        // Enforce window size
+        while self.recent_nullifiers.len() > window_size.max(1) {
+            if let Some(old_bucket) = self.recent_nullifiers.pop_front() {
+                for nf in old_bucket { self.recent_nullifiers_set.remove(&nf); }
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Attempt to load state from disk; returns None if not present
     pub async fn load_from_disk<P: AsRef<Path>>(data_dir: P) -> Option<Self> {
         let path = data_dir.as_ref().join("node_state.bin");
@@ -212,11 +253,12 @@ impl NodeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedNodeState {
     pub current_height: u64,
-    pub nullifier_set: SetAccumulator,
+    pub nullifier_set: Smt16Accumulator,
     pub commitment_mmr: MmrAccumulator,
     pub mmr_peaks: Vec<(u64, SerializableHash)>,
     pub mmr_root: [u8; 32],
     pub nullifier_root: [u8; 32],
+    pub state_digest: [u8; 32],
 }
 
 impl From<PersistedNodeState> for NodeState {
@@ -228,8 +270,12 @@ impl From<PersistedNodeState> for NodeState {
             mmr_peaks: p.mmr_peaks,
             mmr_root: p.mmr_root,
             nullifier_root: p.nullifier_root,
+            recent_nullifiers: VecDeque::new(),
+            recent_nullifiers_set: HashSet::new(),
             last_pruned: Instant::now(),
             storage_size: 0,
+            last_block_hash: None,
+            state_digest: p.state_digest,
         }
     }
 }
@@ -243,6 +289,7 @@ impl From<&NodeState> for PersistedNodeState {
             mmr_peaks: s.mmr_peaks.clone(),
             mmr_root: s.mmr_root,
             nullifier_root: s.nullifier_root,
+            state_digest: s.state_digest,
         }
     }
 }
@@ -354,11 +401,96 @@ impl TachyonNode {
         })
     }
 
-    /// Aggregate PCD proofs from a block into a single proof blob using recursive-style folding
-    pub fn aggregate_block_proofs(&self, block: &Block) -> Result<Vec<u8>> {
+    /// Build a block package: returns header (with proof commit) and body (deltas for wallets)
+    pub fn build_block_package(&self, block: &Block) -> Result<(BlockHeader, BlockBody)> {
+        // Snapshot previous digest
+        let prev_digest = { self.state.read().unwrap().state_digest };
+
+        // Compute ordered outputs and nullifiers
+        let ordered_outputs: Vec<[u8; 32]> = block
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.commitments.iter().cloned())
+            .collect();
+        let mut ordered_nullifiers: Vec<[u8; 32]> = block
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.nullifiers.iter().cloned())
+            .collect();
+        ordered_nullifiers.sort();
+        ordered_nullifiers.dedup();
+
+        // Apply to clones to get new roots and deltas
+        let mut mmr = { self.state.read().unwrap().commitment_mmr.clone() };
+        let mut mmr_hashes: Vec<SerializableHash> = Vec::new();
+        for cm in &ordered_outputs { mmr_hashes.push(SerializableHash(NodeState::leaf_hash(cm))); }
+        let mmr_ops = if mmr_hashes.is_empty() { Vec::<MmrDelta>::new() } else { vec![MmrDelta::BatchAppend { hashes: mmr_hashes }] };
+        if !mmr_ops.is_empty() { mmr.apply_deltas(&mmr_ops)?; }
+        let new_mmr_root = mmr.root().map(|h| *h.as_bytes()).unwrap_or([0u8; 32]);
+
+        let mut smt = { self.state.read().unwrap().nullifier_set.clone() };
+        let smt_ops = if ordered_nullifiers.is_empty() { Vec::<Smt16Delta>::new() } else { vec![Smt16Delta::BatchInsert { keys: ordered_nullifiers.clone() }] };
+        for d in &smt_ops { smt.apply_delta(d.clone())?; }
+        let new_smt_root = smt.root();
+
+        // Compute commit and Halo2 proof
+        let commit = compute_transition_digest_bytes(&prev_digest, &new_mmr_root, &new_smt_root, block.height);
+        let halo2 = Halo2PcdCore::load_or_setup(std::path::Path::new("crates/node_ext/node_data/keys"), 12)?;
+        let block_proof = halo2.prove_transition(&prev_digest, &commit, &new_mmr_root, &new_smt_root, block.height)?;
+
+        let header = BlockHeader {
+            prev_hash: block.previous_hash,
+            mmr_root: new_mmr_root,
+            nullifier_root: new_smt_root,
+            block_proof_commit: commit,
+            block_proof,
+        };
+        let body = BlockBody {
+            ordered_outputs,
+            ordered_nullifiers,
+            mmr_deltas: bincode::serialize(&mmr_ops)?,
+            smt_deltas: bincode::serialize(&smt_ops)?,
+        };
+        Ok((header, body))
+    }
+
+    /// Aggregate PCD proofs from a block using Halo2 recursion.
+    /// Returns aggregated recursion proof bytes and the aggregated commitment (32 bytes).
+    pub fn aggregate_block_proofs(&self, block: &Block) -> Result<(Vec<u8>, [u8; 32])> {
         let proofs: Vec<Vec<u8>> = block.transactions.iter().map(|t| t.pcd_proof.clone()).collect();
-        let aggregated = aggregate_action_proofs(&proofs)?;
-        Ok(aggregated)
+        // Fallback to hash-chain aggregation if recursion fails
+        match aggregate_action_proofs_recursive(&proofs) {
+            Ok(res) => Ok(res),
+            Err(_) => {
+                let agg = aggregate_action_proofs(&proofs)?;
+                let mut commitment = [0u8; 32];
+                commitment.copy_from_slice(blake3::hash(&agg).as_bytes());
+                Ok((agg, commitment))
+            }
+        }
+    }
+
+    /// Build a Tachystamp for a validated block by aggregating per-tx proofs and listing tachygrams.
+    /// Tachygrams are the union of commitments and nullifiers; order: commitments then nullifiers per tx order.
+    pub fn build_block_tachystamp(&self, block: &Block) -> Result<Tachystamp> {
+        // Aggregate proofs (reuse existing method)
+        let (aggregated_proof, _aggregated_commitment) = self.aggregate_block_proofs(block)?;
+
+        // Collect tachygrams from transactions in order: outputs then nullifiers
+        let mut grams: Vec<Tachygram> = Vec::new();
+        for tx in &block.transactions {
+            for cm in &tx.commitments { grams.push(Tachygram(*cm)); }
+            for nf in &tx.nullifiers { grams.push(Tachygram(*nf)); }
+        }
+
+        // Anchor binds to the current node state roots at this height
+        let s = self.state.read().unwrap();
+        let anchor = TachyAnchor { height: block.height, mmr_root: s.mmr_root, nullifier_root: s.nullifier_root };
+        drop(s);
+
+        // No detailed actions in this stub; we rely on the aggregated proof bytes as input
+        let actions: Vec<Tachyaction> = Vec::new();
+        Tachystamp::new(anchor, grams, actions, &[aggregated_proof])
     }
 
     /// Validate a transaction
@@ -435,10 +567,36 @@ impl TachyonNode {
             )
             .await?;
 
-        if !pcd_valid && !membership_ok {
+        // Check nullifier non-membership proofs against anchor nullifier root
+        let nullifier_absent_ok = {
+            let state = self.state.read().unwrap();
+            if state.nullifier_root != tx.pcd_nullifier_root {
+                false
+            } else if tx.nullifier_non_membership.len() != tx.nullifiers.len() {
+                false
+            } else {
+                let mut ok = true;
+                for (nf, wit) in tx.nullifiers.iter().zip(tx.nullifier_non_membership.iter()) {
+                    match bincode::deserialize::<Smt16NonMembershipProof>(wit) {
+                        Ok(p) => { if !p.verify_for_key(nf, &state.nullifier_root) { ok = false; break; } },
+                        Err(_) => { ok = false; break; }
+                    }
+                }
+                ok
+            }
+        };
+
+        // Enforce anchor recency: tx.anchor_height must be within recent window
+        let is_anchor_recent = {
+            let state = self.state.read().unwrap();
+            let window = self.config.validation_config.nullifier_window_size.max(1);
+            tx.anchor_height <= state.current_height && state.current_height - tx.anchor_height <= window
+        };
+
+        if !(pcd_valid || (membership_ok && nullifier_absent_ok)) || !is_anchor_recent {
             return Ok(ValidationResult {
                 is_valid: false,
-                error_message: Some("PCD proof verification failed".to_string()),
+                error_message: Some("PCD proof verification failed or anchor too old".to_string()),
                 gas_used: 1000,
                 validated_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -480,6 +638,19 @@ impl TachyonNode {
         let mut transaction_results = Vec::new();
         let mut total_gas_used = 0u64;
 
+        // Simple reorg/sequence guard: require strict height increment
+        {
+            let s = self.state.read().unwrap();
+            if block.height != s.current_height.saturating_add(1) {
+                return Ok(BlockValidationResult {
+                    is_valid: false,
+                    transaction_results: Vec::new(),
+                    block_hash: None,
+                    total_gas_used: 0,
+                });
+            }
+        }
+
         // Validate each transaction in the block
         for tx in &block.transactions {
             let result = self.validate_transaction(tx).await?;
@@ -500,11 +671,15 @@ impl TachyonNode {
         {
             let mut state = self.state.write().unwrap();
 
-            // Apply all nullifiers into the canonical set
+            // Apply all nullifiers into the canonical SMT-16 after sorting/deduping
             let mut new_nullifiers = Vec::new();
-            for tx in &block.transactions {
-                new_nullifiers.extend(tx.nullifiers.iter().cloned());
-            }
+            for tx in &block.transactions { new_nullifiers.extend(tx.nullifiers.iter().cloned()); }
+            new_nullifiers.sort();
+            new_nullifiers.dedup();
+            // Maintain recent-window uniqueness (sliding window)
+            let window_size = self.config.validation_config.nullifier_window_size as usize;
+            state.update_recent_nullifier_window(new_nullifiers.clone(), window_size);
+            // Update full-history accumulator/root for legacy consumers and proofs
             state.update_nullifier_set(new_nullifiers);
 
             // Append all output commitments to the MMR (domain-separated leaves)
@@ -521,6 +696,17 @@ impl TachyonNode {
             // Advance anchor height to this block's height
             state.current_height = block.height;
 
+            // Compute chained state digest to bind into block-level Halo2 proof
+            // new_state = Poseidon2(prev_state, mmr_root, nullifier_root, height)
+            // We use the same digest function as circuits::compute_transition_digest_bytes
+            let new_digest = compute_transition_digest_bytes(
+                &state.state_digest,
+                &state.mmr_root,
+                &state.nullifier_root,
+                state.current_height,
+            );
+            state.state_digest = new_digest;
+
             // Persist best-effort
             let data_dir = self.config.network_config.data_dir.clone();
             // Persist in background using a decoupled snapshot
@@ -535,6 +721,10 @@ impl TachyonNode {
 
         // Compute block hash
         let block_hash = self.compute_block_hash(block)?;
+        {
+            let mut s = self.state.write().unwrap();
+            s.last_block_hash = Some(block_hash);
+        }
 
         Ok(BlockValidationResult {
             is_valid: true,
@@ -546,11 +736,21 @@ impl TachyonNode {
 
     /// Process pending transactions in the background
     async fn process_pending_transactions(
-        _state: &Arc<RwLock<NodeState>>,
+        state: &Arc<RwLock<NodeState>>,
         _network: &TachyonNetwork,
     ) {
-        // TODO: fetch from mempool/network; basic heartbeat for now
-        debug!("Processing pending transactions (heartbeat)");
+        // Assemble a block from pending transactions if any exist
+        debug!("Processing pending transactions");
+        let to_include: Vec<Transaction> = Vec::new();
+        // For now, we do not pull from network; pending txs are submitted via API
+        // This function is a placeholder to show periodic block assembly
+        // Real implementation would validate gossip, fees, dependencies, etc.
+        // Here we just short-circuit if no txs are pending
+        // (We don't have access to _pending_txs here; kept minimal.)
+        let current_height = { state.read().unwrap().current_height };
+        if to_include.is_empty() {
+            let _ = current_height; // suppress unused var warnings in minimal stub
+        }
     }
 
     /// Run pruning to maintain minimal state
@@ -564,10 +764,10 @@ impl TachyonNode {
 
         info!("Running node pruning");
 
-        // In a real implementation, this would:
-        // 1. Remove old nullifiers outside the window
-        // 2. Prune old MMR data keeping only peaks
-        // 3. Clean up old block data
+        // Retention policy: metrics-only stub. A real implementation would maintain per-block
+        // journals to roll-forward state and drop data older than `retention_blocks`.
+        // We expose storage_size as a pressure indicator and reset it when pruning runs.
+        // TODO: implement per-block journals and witness roll-forward.
 
         state_guard.last_pruned = Instant::now();
         state_guard.storage_size = 0; // Reset for simplicity
@@ -615,8 +815,12 @@ impl TachyonNode {
             mmr_peaks: guard.mmr_peaks.clone(),
             mmr_root: guard.mmr_root,
             nullifier_root: guard.nullifier_root,
+            recent_nullifiers: VecDeque::new(),
+            recent_nullifiers_set: HashSet::new(),
             last_pruned: guard.last_pruned,
             storage_size: guard.storage_size,
+            last_block_hash: guard.last_block_hash,
+            state_digest: guard.state_digest,
         }
     }
 
@@ -716,6 +920,8 @@ pub struct Transaction {
     pub anchor_height: u64,
     /// Spend proof data
     pub spend_proof: Vec<u8>,
+    /// Non-membership proofs for each nullifier (bincode(Smt16NonMembershipProof))
+    pub nullifier_non_membership: Vec<Vec<u8>>,
 }
 
 impl Transaction {
@@ -732,6 +938,9 @@ impl Transaction {
         }
         if self.pcd_proof.is_empty() {
             return Err(anyhow!("Transaction must have PCD proof"));
+        }
+        if self.nullifier_non_membership.len() != self.nullifiers.len() {
+            return Err(anyhow!("Nullifier non-membership proofs length mismatch"));
         }
         // Basic consistency: new state matches circuit digest
         let expected_new = compute_transition_digest_bytes(
@@ -758,6 +967,25 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
     /// Block timestamp
     pub timestamp: u64,
+}
+
+/// Block header carrying accumulator commits and a single Halo2 block proof
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockHeader {
+    pub prev_hash: TransactionHash,
+    pub mmr_root: [u8; 32],
+    pub nullifier_root: [u8; 32],
+    pub block_proof_commit: [u8; 32],
+    pub block_proof: Vec<u8>,
+}
+
+/// Block body containing ordered outputs/nullifiers and accumulator delta encodings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockBody {
+    pub ordered_outputs: Vec<[u8; 32]>,
+    pub ordered_nullifiers: Vec<[u8; 32]>,
+    pub mmr_deltas: Vec<u8>,
+    pub smt_deltas: Vec<u8>,
 }
 
 impl Block {
@@ -878,6 +1106,7 @@ mod tests {
             pcd_nullifier_root: [11u8; 32],
             anchor_height: 100,
             spend_proof: vec![4, 5, 6],
+            nullifier_non_membership: vec![vec![]],
         };
 
         assert!(tx.validate_format().is_ok());
@@ -902,6 +1131,7 @@ mod tests {
                     pcd_nullifier_root: [11u8; 32],
                     anchor_height: 100,
                     spend_proof: vec![4, 5, 6],
+                    nullifier_non_membership: vec![vec![]],
                 },
                 Transaction {
                     hash: TransactionHash(Hash::from([2u8; 32])),
@@ -916,6 +1146,7 @@ mod tests {
                     pcd_nullifier_root: [13u8; 32],
                     anchor_height: 100,
                     spend_proof: vec![7, 8, 9],
+                    nullifier_non_membership: vec![vec![]],
                 },
             ],
             timestamp: 0,
@@ -929,5 +1160,41 @@ mod tests {
             .collect();
         let agg = pcd_core::aggregation::aggregate_action_proofs(&proofs).unwrap();
         assert_eq!(agg.len(), 32);
+    }
+
+    #[test]
+    fn test_build_block_tachystamp_verifies() {
+        let tx = Transaction {
+            hash: TransactionHash(Hash::from([1u8; 32])),
+            nullifiers: vec![[1u8; 32]],
+            commitments: vec![[2u8; 32]],
+            spent_commitments: vec![],
+            membership_witnesses: vec![],
+            pcd_proof: vec![1, 2, 3],
+            pcd_prev_state_commitment: [3u8; 32],
+            pcd_new_state_commitment: compute_transition_digest_bytes(&[3u8; 32], &[10u8; 32], &[11u8; 32], 100),
+            pcd_mmr_root: [10u8; 32],
+            pcd_nullifier_root: [11u8; 32],
+            anchor_height: 100,
+            spend_proof: vec![4, 5, 6],
+            nullifier_non_membership: vec![vec![]],
+        };
+        let block = Block {
+            height: 1,
+            previous_hash: TransactionHash(Hash::from([0u8; 32])),
+            transactions: vec![tx],
+            timestamp: 0,
+        };
+
+        // Create a minimal Tokio runtime to construct the node
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = TachyonNode::new(NodeConfig::default()).await.unwrap();
+            let stamp = node.build_block_tachystamp(&block).unwrap();
+            // Structural checks: commitment length and non-empty grams for our block
+            assert_eq!(stamp.aggregated_commitment.len(), 32);
+            assert!(!stamp.tachygrams.is_empty());
+            assert_eq!(stamp.anchor.height, block.height);
+        });
     }
 }

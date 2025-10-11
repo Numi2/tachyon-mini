@@ -16,6 +16,7 @@ members = [
     "crates/qerkle",
     "crates/dex",
     "crates/onramp_stripe",
+    "crates/ragu",
 ]
 resolver = "2"
 
@@ -89,6 +90,7 @@ net_iroh = { path = "crates/net_iroh" }
 pcd_core = { path = "crates/pcd_core" }
 accum_mmr = { path = "crates/accum_mmr" }
 circuits = { path = "crates/circuits" }
+ragu = { path = "crates/ragu" }
 wallet = { path = "crates/wallet" }
 oss_service = { path = "crates/oss_service" }
 node_ext = { path = "crates/node_ext" }
@@ -107,4 +109,18 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Tachyon Team"]
 license = "MIT OR Apache-2.0"
+
+[profile.release]
+# Optimized for production: single codegen unit for better inlining, full LTO, abort on panic
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = true
+
+[profile.dev]
+# Keep dev builds reasonably fast, but catch overflows and keep debug info
+debug = true
+overflow-checks = true
+incremental = true
 

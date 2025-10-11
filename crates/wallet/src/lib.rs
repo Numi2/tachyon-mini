@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! # wallet
 //!
 //! Tachyon wallet implementation providing secure note management,
@@ -12,6 +13,8 @@ use node_ext as _node_ext_dep_check;
 use pcd_core::{
     PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier, PcdTransition,
 };
+#[cfg(feature = "pcd")]
+use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
 #[cfg(feature = "pcd")]
 use pq_crypto::{
     derive_nf2, derive_spend_nullifier_key, KyberPublicKey, KyberSecretKey,
@@ -28,6 +31,7 @@ use tokio::{
 use reqwest::Client as HttpClient;
 #[cfg(feature = "pcd")]
 use accum_mmr::{MmrAccumulator, MmrWitness};
+use pcd_core::tachyon::{Tachystamp, Tachygram, Tachyaction, TachyAnchor, TachyOpKind};
 #[cfg(feature = "pcd")]
 use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, OwnerId as DexOwnerId, OrderId as DexOrderId, OrderBookSnapshot as DexSnapshot, Trade as DexTrade};
 
@@ -616,6 +620,52 @@ impl TachyonWallet {
             #[cfg(feature = "zcash")]
             zcash: None,
         })
+    }
+
+    /// Build a Tachystamp for a wallet-originated transaction: wraps tx proofs and outputs
+    #[cfg(feature = "pcd")]
+    pub async fn build_tachystamp(
+        &self,
+        outputs: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
+        nullifiers: Vec<[u8; 32]>,
+        action_pairs: Vec<([u8; 32], [u8; 32])>,
+        action_bindings: Vec<[u8; 32]>,
+        action_sigs: Vec<Vec<u8>>,
+        proofs: Vec<Vec<u8>>,
+    ) -> Result<Tachystamp> {
+        let state = self
+            .pcd_manager
+            .read()
+            .await
+            .current_state()
+            .cloned()
+            .ok_or_else(|| anyhow!("No current PCD state"))?;
+
+        // Collect tachygrams (commitments first, then nullifiers)
+        let mut grams: Vec<Tachygram> = Vec::new();
+        for cm in outputs { grams.push(Tachygram(cm)); }
+        for nf in nullifiers { grams.push(Tachygram(nf)); }
+
+        // Build actions from provided pairs and bindings/signatures
+        let mut actions: Vec<Tachyaction> = Vec::new();
+        for (idx, (l, r)) in action_pairs.into_iter().enumerate() {
+            let binding = action_bindings.get(idx).cloned().unwrap_or([0u8; 32]);
+            let sig = action_sigs.get(idx).cloned().unwrap_or_default();
+            actions.push(Tachyaction {
+                left: Tachygram(l),
+                right: Tachygram(r),
+                op: TachyOpKind::Bind,
+                binding_digest: binding,
+                auth_signature: sig,
+            });
+        }
+
+        // Anchor is the current state roots/height
+        let anchor = TachyAnchor { height: state.anchor_height, mmr_root: state.mmr_root, nullifier_root: state.nullifier_root };
+
+        // Aggregate provided proofs into a Tachystamp
+        let stamp = Tachystamp::new(anchor, grams, actions, &proofs)?;
+        Ok(stamp)
     }
 
     /// Initialize wallet with genesis state
@@ -1413,6 +1463,28 @@ impl TachyonWallet {
             })
             .collect();
 
+        // Generate SMT-16 non-membership proofs from embedded nullifier SMT in the PCD state if present
+        let mut nullifier_non_membership: Vec<Vec<u8>> = Vec::new();
+        if !state.nullifier_raw().is_empty() {
+            if let Ok(smt) = bincode::deserialize::<accum_set::Smt16Accumulator>(state.nullifier_raw()) {
+                for nf in &nullifiers {
+                    if let Ok(proof) = smt.create_non_membership_witness(nf) {
+                        if proof.verify_for_key(nf, &state.nullifier_root) {
+                            if let Ok(bytes) = bincode::serialize(&proof) {
+                                nullifier_non_membership.push(bytes);
+                                continue;
+                            }
+                        }
+                    }
+                    nullifier_non_membership.push(Vec::new());
+                }
+            } else {
+                nullifier_non_membership = vec![Vec::new(); nullifiers.len()];
+            }
+        } else {
+            nullifier_non_membership = vec![Vec::new(); nullifiers.len()];
+        }
+
         // Bind spend proof
         let mut spend_hasher = blake3::Hasher::new();
         spend_hasher.update(b"spend_proof_binding:v1");
@@ -1421,26 +1493,41 @@ impl TachyonWallet {
         for c in &output_commitments { spend_hasher.update(c); }
         let spend_proof = spend_hasher.finalize().as_bytes().to_vec();
 
-        // Compose PCD binding proof
-        let mut pcd_hasher = blake3::Hasher::new();
-        pcd_hasher.update(b"tx_pcd_binding");
-        pcd_hasher.update(&state.anchor_height.to_le_bytes());
-        for n in &nullifiers { pcd_hasher.update(n); }
-        let pcd_proof = pcd_hasher.finalize().as_bytes().to_vec();
+        // Compute PCD transition digest for new_state and generate Halo2 proof bound to current roots
+        let prev_state = state.state_commitment;
+        let new_state = compute_transition_digest_bytes(
+            &prev_state,
+            &state.mmr_root,
+            &state.nullifier_root,
+            state.anchor_height,
+        );
+        let halo2 = Halo2PcdCore::load_or_setup(
+            std::path::Path::new("crates/node_ext/node_data/keys"),
+            12,
+        )?;
+        let pcd_proof = halo2.prove_transition(
+            &prev_state,
+            &new_state,
+            &state.mmr_root,
+            &state.nullifier_root,
+            state.anchor_height,
+        )?;
 
+        let num_spent = spent_inputs.len();
         let tx = _node_ext_dep_check::Transaction {
             hash: _node_ext_dep_check::TransactionHash(blake3::hash(b"wallet-tx")),
             nullifiers,
             commitments: output_commitments,
-            spent_commitments: spent_inputs,
+            spent_commitments: spent_inputs.clone(),
             membership_witnesses: witnesses,
             pcd_proof,
-            pcd_prev_state_commitment: state.state_commitment,
-            pcd_new_state_commitment: state.state_commitment,
+            pcd_prev_state_commitment: prev_state,
+            pcd_new_state_commitment: new_state,
             pcd_mmr_root: state.mmr_root,
             pcd_nullifier_root: state.nullifier_root,
             anchor_height: state.anchor_height,
             spend_proof,
+            nullifier_non_membership,
         };
 
         Ok(tx)

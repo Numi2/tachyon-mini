@@ -705,6 +705,8 @@ pub async fn run() -> Result<()> {
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            // Allow insecure defaults for zcash tooling only in debug/test builds
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let mut wallet = TachyonWallet::new(cfg).await?;
             let ufvk = wallet.zcash_export_ufvk(account).await?;
@@ -716,6 +718,7 @@ pub async fn run() -> Result<()> {
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let mut wallet = TachyonWallet::new(cfg).await?;
             let usk = wallet.zcash_export_usk(account).await?;
@@ -727,6 +730,7 @@ pub async fn run() -> Result<()> {
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let mut wallet = TachyonWallet::new(cfg).await?;
             let uri = wallet.zcash_generate_payment_uri(&to, amount, memo).await?;
@@ -738,6 +742,7 @@ pub async fn run() -> Result<()> {
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let mut wallet = TachyonWallet::new(cfg).await?;
             let (ua, amount, memo) = wallet.zcash_parse_payment_uri(&uri).await?;
@@ -765,6 +770,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let wallet = TachyonWallet::new(cfg).await?;
             let pk = wallet.get_oob_public_key().await;
@@ -786,6 +792,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let wallet = TachyonWallet::new(cfg).await?;
 
@@ -850,6 +857,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let wallet = TachyonWallet::new(cfg).await?;
             let payment: pq_crypto::OutOfBandPayment = serde_json::from_str(&json)?;
@@ -877,6 +885,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
             // Allow insecure defaults for CLI bootstrap only
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
 
             let mut wallet = TachyonWallet::new(cfg).await?;
@@ -893,6 +902,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             let mut cfg = WalletConfig::from_env();
             cfg.db_path = db_path.clone();
             cfg.master_password = password.clone();
+            #[cfg(debug_assertions)]
             std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
             let wallet = TachyonWallet::new(cfg).await?;
             let pk = wallet.get_oob_public_key().await;

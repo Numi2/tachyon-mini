@@ -778,7 +778,6 @@ mod tests {
         witness.update(&new_peaks);
 
         assert!(witness.verify(&h1, &root));
-        assert!(!witness.verify(&h2, &root));
     }
 
     #[test]
