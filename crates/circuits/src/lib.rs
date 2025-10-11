@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use blake3::Hasher as Blake3Hasher;
-use ff::{PrimeField, FromUniformBytes, Field};
+use ff::{PrimeField, FromUniformBytes};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
@@ -26,8 +26,8 @@ use std::io::Cursor;
 use std::path::Path;
 use std::{fs, fs::File};
 use ragu::circuit as ragu_circuit;
-use ragu::circuit::{Circuit as _, Sink as _};
-use ragu::drivers::{PublicInput, PublicInputDriver};
+use ragu::circuit::Sink;
+use ragu::drivers::compute_public_inputs;
 use ragu::maybe as ragu_maybe;
 use ragu::maybe::Maybe as _;
 
@@ -56,7 +56,7 @@ fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr,
 // -----------------------------
 
 // Use ragu's concrete production driver for public input extraction
-type HostProverDriver = PublicInputDriver<Fr>;
+// Using ragu's production drivers via `compute_public_inputs`
 
 #[derive(Clone, Copy)]
 struct TransitionInput {
@@ -131,17 +131,9 @@ impl ragu_circuit::Circuit<Fr> for TransitionRagu {
 }
 
 fn ragu_compute_transition_public_inputs(prev: Fr, mmr: Fr, nul: Fr, anchor: Fr) -> Result<[Fr; 5], anyhow::Error> {
-    let circuit = TransitionRagu;
-    let mut dr = HostProverDriver::default();
-    let input = ragu_maybe::Always(TransitionInput { prev_state: prev, mmr_root: mmr, nullifier_root: nul, anchor_height: anchor });
-    let io = circuit.input(&mut dr, input)?;
-    let mut sink: PublicInput<Fr> = PublicInput { values: Vec::with_capacity(5) };
-    circuit.output(&mut dr, io, &mut sink)?;
-    // Order: prev, new, mmr, nul, anchor
-    if sink.values.len() != 5 {
-        return Err(anyhow::anyhow!("unexpected public input count"));
-    }
-    Ok([sink.values[0], sink.values[1], sink.values[2], sink.values[3], sink.values[4]])
+    let vals = compute_public_inputs(&TransitionRagu, TransitionInput { prev_state: prev, mmr_root: mmr, nullifier_root: nul, anchor_height: anchor })?;
+    if vals.len() != 5 { return Err(anyhow::anyhow!("unexpected public input count")); }
+    Ok([vals[0], vals[1], vals[2], vals[3], vals[4]])
 }
 
 /// Compute the transition Poseidon digest and return canonical 32-byte encoding

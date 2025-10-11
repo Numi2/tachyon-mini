@@ -159,7 +159,8 @@ pub mod circuit {
 
 pub mod drivers {
     use ff::Field;
-    use crate::circuit::{Driver, Sink};
+    use crate::circuit::{Circuit, Driver, Sink};
+    use crate::maybe::{Always};
 
     /// Sink that collects public inputs/outputs as field elements
     #[derive(Default)]
@@ -217,6 +218,22 @@ pub mod drivers {
 
         fn from_field(&mut self, value: Self::F) -> Self::W { value }
     }
+
+    /// Convenience: compute public inputs for a circuit using the public-input driver
+    pub fn compute_public_inputs<F: Field, C: Circuit<F>>(
+        circuit: &C,
+        instance: C::Instance<'_>,
+    ) -> Result<Vec<F>, anyhow::Error> {
+        let mut dr = PublicInputDriver::<F>::default();
+        let io = circuit.input(&mut dr, Always(instance))?;
+        let mut sink: PublicInput<F> = PublicInput { values: Vec::new() };
+        circuit.output(&mut dr, io, &mut sink)?;
+        Ok(sink.values)
+    }
+
+    /// Aliases for clarity in production code
+    pub type ProvingDriver<F> = PublicInputDriver<F>;
+    pub type VerificationDriver<F> = PublicInputDriver<F>;
 }
 
 

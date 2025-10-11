@@ -58,6 +58,28 @@ Workspace layout
 - `qerkle`: dynamic-hash Merkle tree (BLAKE3 + Poseidon) with Kyber-encrypted metadata and inclusion proofs.
 
 
+Tachygrams and Tachystamps (Prototype)
+--------------------------------------
+Tachyon-style shielded flows collapse commitments and nullifiers into indistinguishable 32-byte blobs called tachygrams and produce a single aggregated proof per transaction or block, called a tachystamp.
+
+- Tachygram: `pcd_core::tachyon::Tachygram([u8; 32])`
+  - Represents either a note commitment or a nullifier; indistinguishable to third parties.
+- Anchor: `pcd_core::tachyon::TachyAnchor { height, mmr_root, nullifier_root }`
+  - Binds proofs to the current chain accumulator roots and a recent height.
+- Tachyaction: pair of tachygrams plus an authorization binding/signature.
+  - Replaces Orchard actions in this prototype; signatures are stubs.
+- Tachystamp: aggregated recursion proof over one-or-more action proofs.
+  - Built via `pcd_core::tachyon::Tachystamp::new(anchor, grams, actions, proofs)` using Halo2 recursion.
+  - Node verifies the aggregated proof and that anchor roots/height match the canonical state.
+
+Wallet
+- Provides `wallet::TachyonWallet::build_tachystamp(...)` to package outputs/nullifiers into tachygrams, attach optional tachyactions, and aggregate provided proofs into a tachystamp bound to the current anchor.
+
+Node
+- Builds a block-level tachystamp by aggregating all tx proofs and collecting per-tx tachygrams; see `node_ext::TachyonNode::build_block_tachystamp`.
+- Enforces anchor recency and validates the aggregated recursion proof in `validate_tachystamp` during block acceptance.
+
+
 Data model
 ----------
 - `PcdState { anchor_height, state_commitment, mmr_root, nullifier_root, block_hash, proof, ... }`

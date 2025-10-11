@@ -401,6 +401,33 @@ impl TachyonNode {
         })
     }
 
+    /// Validate a Tachystamp against current node state.
+    /// - Anchor must match current height and roots
+    /// - Aggregated proof must verify against aggregated_commitment (recursion verifier)
+    /// - All tachygrams must be well-formed (just size/type in this prototype)
+    pub fn validate_tachystamp(&self, stamp: &Tachystamp) -> Result<bool> {
+        let state = self.state.read().unwrap();
+        // Anchor checks: current roots and height
+        if stamp.anchor.height != state.current_height
+            || stamp.anchor.mmr_root != state.mmr_root
+            || stamp.anchor.nullifier_root != state.nullifier_root
+        {
+            return Ok(false);
+        }
+
+        // Recursion verification for aggregated commitment
+        let core = circuits::RecursionCore::new()?;
+        let ok = core.verify_aggregate_pair(&stamp.aggregated_proof, &stamp.aggregated_commitment)?;
+        if !ok { return Ok(false); }
+
+        // Basic tachygram sanity
+        for Tachygram(bytes32) in &stamp.tachygrams {
+            // In this prototype they are arbitrary 32-byte blobs
+            if bytes32.len() != 32 { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// Build a block package: returns header (with proof commit) and body (deltas for wallets)
     pub fn build_block_package(&self, block: &Block) -> Result<(BlockHeader, BlockBody)> {
         // Snapshot previous digest
@@ -716,6 +743,17 @@ impl TachyonNode {
                 if let Ok(bytes) = bincode::serialize(&snapshot) {
                     let _ = async_fs::write(&path, &bytes).await;
                 }
+            });
+        }
+
+        // Build and validate a Tachystamp for the block (aggregated)
+        let stamp = self.build_block_tachystamp(block)?;
+        if !self.validate_tachystamp(&stamp)? {
+            return Ok(BlockValidationResult {
+                is_valid: false,
+                transaction_results,
+                block_hash: None,
+                total_gas_used,
             });
         }
 
