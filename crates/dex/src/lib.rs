@@ -50,7 +50,7 @@ pub struct Trade {
 }
 
 /// Simple price-time priority orderbook using two maps of price levels.
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct OrderBook {
     bids: BTreeMap<u64, VecDeque<Order>>, // key = price, max-best at end iterator via rev()
     asks: BTreeMap<u64, VecDeque<Order>>, // key = price, min-best at start iterator
@@ -214,14 +214,14 @@ impl OrderBook {
     }
 
     pub fn snapshot(&self, depth: usize) -> OrderBookSnapshot {
-        let mut bids: Vec<(Price, u64)> = self
+        let bids: Vec<(Price, u64)> = self
             .bids
             .iter()
             .rev()
             .take(depth)
             .map(|(p, q)| (Price(*p), q.iter().map(|o| o.remaining.0).sum()))
             .collect();
-        let mut asks: Vec<(Price, u64)> = self
+        let asks: Vec<(Price, u64)> = self
             .asks
             .iter()
             .take(depth)
@@ -287,6 +287,10 @@ impl InMemoryEngine {
         }
         Ok(())
     }
+}
+
+impl Default for InMemoryEngine {
+    fn default() -> Self { Self::new() }
 }
 
 impl OrderBookEngine for InMemoryEngine {
@@ -379,6 +383,133 @@ impl DexService {
     pub fn get_order(&self, id: OrderId) -> Option<Order> { self.engine.get_order(id) }
 }
 
+impl Default for DexService {
+    fn default() -> Self { Self::new() }
+}
+
+/// Sled-backed persistent engine implementing OrderBookEngine
+pub struct SledEngine {
+    db: sled::Db,
+    book: Arc<RwLock<OrderBook>>,
+    trades: Arc<RwLock<VecDeque<Trade>>>,
+    max_trades: usize,
+}
+
+const SLED_KEY_BOOK: &str = "book";
+const SLED_KEY_TRADES: &str = "trades";
+
+impl SledEngine {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(dir) = path.parent() { let _ = fs::create_dir_all(dir); }
+        let db = sled::open(path).map_err(|e| anyhow!("sled open: {}", e))?;
+        let book = if let Ok(Some(val)) = db.get(SLED_KEY_BOOK) {
+            bincode::deserialize::<OrderBook>(&val).unwrap_or_else(|_| OrderBook::new())
+        } else { OrderBook::new() };
+        let trades = if let Ok(Some(val)) = db.get(SLED_KEY_TRADES) {
+            bincode::deserialize::<VecDeque<Trade>>(&val).unwrap_or_else(|_| VecDeque::with_capacity(1024))
+        } else { VecDeque::with_capacity(1024) };
+        Ok(Self {
+            db,
+            book: Arc::new(RwLock::new(book)),
+            trades: Arc::new(RwLock::new(trades)),
+            max_trades: 1024,
+        })
+    }
+
+    fn persist(&self) -> Result<()> {
+        let book = self.book.read();
+        let trades = self.trades.read();
+        let book_bytes = bincode::serialize(&*book)?;
+        let trades_bytes = bincode::serialize(&*trades)?;
+        self.db.insert(SLED_KEY_BOOK, book_bytes).map_err(|e| anyhow!("sled put book: {}", e))?;
+        self.db.insert(SLED_KEY_TRADES, trades_bytes).map_err(|e| anyhow!("sled put trades: {}", e))?;
+        self.db.flush().map_err(|e| anyhow!("sled flush: {}", e))?;
+        Ok(())
+    }
+}
+
+impl OrderBookEngine for SledEngine {
+    fn place_limit(&self, owner: OwnerId, side: Side, price: Price, qty: Quantity) -> Result<(OrderId, Vec<Trade>)> {
+        let mut book = self.book.write();
+        let (id, trades) = book.place_limit(owner, side, price, qty);
+        if !trades.is_empty() {
+            let mut log = self.trades.write();
+            for t in &trades {
+                log.push_back(t.clone());
+                if log.len() > self.max_trades { log.pop_front(); }
+            }
+        }
+        drop(book);
+        self.persist()?;
+        Ok((id, trades))
+    }
+
+    fn place_market(&self, owner: OwnerId, side: Side, qty: Quantity) -> Result<(OrderId, Vec<Trade>)> {
+        let mut book = self.book.write();
+        let (id, trades) = book.place_market(owner, side, qty);
+        if !trades.is_empty() {
+            let mut log = self.trades.write();
+            for t in &trades {
+                log.push_back(t.clone());
+                if log.len() > self.max_trades { log.pop_front(); }
+            }
+        }
+        drop(book);
+        self.persist()?;
+        Ok((id, trades))
+    }
+
+    fn cancel(&self, id: OrderId) -> Result<bool> {
+        let mut book = self.book.write();
+        let ok = book.cancel(id);
+        drop(book);
+        self.persist()?;
+        Ok(ok)
+    }
+
+    fn snapshot(&self, depth: usize) -> OrderBookSnapshot { self.book.read().snapshot(depth) }
+    fn recent_trades(&self, limit: usize) -> Vec<Trade> {
+        let log = self.trades.read();
+        let n = limit.min(log.len());
+        log.iter().rev().take(n).cloned().collect()
+    }
+    fn estimate_market_cost(&self, side: Side, qty: Quantity) -> (u64, u64) {
+        let book = self.book.read();
+        // reuse same logic as InMemoryEngine by snapshotting
+        let mut remaining = qty.0;
+        let mut filled = 0u64;
+        let mut cost = 0u64;
+        match side {
+            Side::Bid => {
+                for (p, level) in book.asks.iter() {
+                    if remaining == 0 { break; }
+                    let level_qty: u64 = level.iter().map(|o| o.remaining.0).sum();
+                    let take = remaining.min(level_qty);
+                    filled += take;
+                    cost = cost.saturating_add(take.saturating_mul(*p));
+                    remaining -= take;
+                }
+            }
+            Side::Ask => {
+                let mut keys: Vec<u64> = book.bids.keys().cloned().collect();
+                keys.sort_unstable_by(|a, b| b.cmp(a));
+                for p in keys {
+                    if remaining == 0 { break; }
+                    if let Some(level) = book.bids.get(&p) {
+                        let level_qty: u64 = level.iter().map(|o| o.remaining.0).sum();
+                        let take = remaining.min(level_qty);
+                        filled += take;
+                        cost = cost.saturating_add(take.saturating_mul(p));
+                        remaining -= take;
+                    }
+                }
+            }
+        }
+        (filled, cost)
+    }
+    fn get_order(&self, id: OrderId) -> Option<Order> { self.book.read().find_order(id) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +528,35 @@ mod tests {
         assert_eq!(t2.iter().map(|t| t.quantity.0).sum::<u64>(), 3);
         let snap2 = dex.orderbook(10);
         assert_eq!(snap2.bids.iter().map(|x| x.1).sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn persists_across_reopen() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("dex_sled");
+
+        // open persistent engine
+        let engine = SledEngine::open(&db_path).unwrap();
+        let dex = DexService::with_engine(Arc::new(engine));
+
+        // place some orders
+        let (_b1, _t0) = dex.place_limit(OwnerId(1), Side::Bid, Price(100), Quantity(5)).unwrap();
+        let (_a1, _t1) = dex.place_limit(OwnerId(2), Side::Ask, Price(120), Quantity(3)).unwrap();
+
+        // snapshot has both sides
+        let snap = dex.orderbook(10);
+        assert_eq!(snap.bids.iter().map(|x| x.1).sum::<u64>(), 5);
+        assert_eq!(snap.asks.iter().map(|x| x.1).sum::<u64>(), 3);
+
+        // reopen engine
+        drop(dex);
+        let engine2 = SledEngine::open(&db_path).unwrap();
+        let dex2 = DexService::with_engine(Arc::new(engine2));
+
+        // snapshot should be identical after reopen
+        let snap2 = dex2.orderbook(10);
+        assert_eq!(snap2.bids.iter().map(|x| x.1).sum::<u64>(), 5);
+        assert_eq!(snap2.asks.iter().map(|x| x.1).sum::<u64>(), 3);
     }
 }
 

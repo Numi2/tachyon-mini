@@ -24,10 +24,10 @@ use tokio::{
 use tracing::{debug, info};
 use std::path::Path;
 use tokio::fs as async_fs;
-use bincode;
 
 /// Configuration for the node extension
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct NodeConfig {
     /// Network configuration
     pub network_config: NetworkConfig,
@@ -37,15 +37,6 @@ pub struct NodeConfig {
     pub pruning_config: PruningConfig,
 }
 
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            network_config: NetworkConfig::default(),
-            validation_config: ValidationConfig::default(),
-            pruning_config: PruningConfig::default(),
-        }
-    }
-}
 
 /// Network configuration for node
 #[derive(Debug, Clone)]
@@ -131,6 +122,12 @@ pub struct NodeState {
     pub storage_size: u64,
 }
 
+impl Default for NodeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodeState {
     /// Create new node state
     pub fn new() -> Self {
@@ -199,10 +196,7 @@ impl NodeState {
         if !path.exists() {
             return None;
         }
-        match async_fs::read(&path).await.ok().and_then(|bytes| bincode::deserialize::<PersistedNodeState>(&bytes).ok()) {
-            Some(p) => Some(Self::from(p)),
-            None => None,
-        }
+        async_fs::read(&path).await.ok().and_then(|bytes| bincode::deserialize::<PersistedNodeState>(&bytes).ok()).map(Self::from)
     }
 
     /// Persist state to disk (best-effort)
@@ -303,11 +297,11 @@ impl TachyonNode {
     /// Create a new Tachyon node
     pub async fn new(config: NodeConfig) -> Result<Self> {
         let network = Arc::new(
-            TachyonNetwork::new(&std::path::Path::new(&config.network_config.data_dir)).await?,
+            TachyonNetwork::new(std::path::Path::new(&config.network_config.data_dir)).await?,
         );
         // Load persisted state if available
         let loaded = NodeState::load_from_disk(&config.network_config.data_dir).await;
-        let initial_state = loaded.unwrap_or_else(|| NodeState::new());
+        let initial_state = loaded.unwrap_or_else(NodeState::new);
         let state = Arc::new(RwLock::new(initial_state));
         let pcd_verifier = Arc::new(SimplePcdVerifier::new());
 
@@ -531,7 +525,7 @@ impl TachyonNode {
             let data_dir = self.config.network_config.data_dir.clone();
             // Persist in background using a decoupled snapshot
             let snapshot = PersistedNodeState::from(&*state);
-            let _ = tokio::spawn(async move {
+            tokio::spawn(async move {
                 let path = std::path::Path::new(&data_dir).join("node_state.bin");
                 if let Ok(bytes) = bincode::serialize(&snapshot) {
                     let _ = async_fs::write(&path, &bytes).await;
@@ -775,7 +769,7 @@ impl Block {
     ) -> Self {
         Self {
             height,
-            previous_hash: previous_hash.into(),
+            previous_hash,
             transactions,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -789,6 +783,12 @@ impl Block {
 pub struct SimplePcdVerifier {
     /// Verification cache to avoid recomputing
     _cache: Arc<RwLock<HashMap<[u8; 32], bool>>>,
+}
+
+impl Default for SimplePcdVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimplePcdVerifier {

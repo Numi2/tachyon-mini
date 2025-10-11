@@ -9,6 +9,8 @@ use anyhow::{anyhow, Result};
 use circuits::PcdCore as Halo2PcdCore;
 use circuits::{aggregate_orchard_actions, compute_transition_digest_bytes};
 use serde::{Deserialize, Serialize};
+/// Type alias to reduce clippy-reported type complexity for persistence callback
+pub type PersistenceCallback = Box<dyn Fn(&PcdState) -> Result<()> + Send + Sync>;
 
 /// Size of PCD state commitment (BLAKE3 hash)
 pub const PCD_STATE_COMMITMENT_SIZE: usize = 32;
@@ -566,7 +568,7 @@ pub struct PcdStateManager<V: PcdProofVerifier> {
     /// Proof verifier
     verifier: V,
     /// State persistence callback
-    persistence_callback: Option<Box<dyn Fn(&PcdState) -> Result<()> + Send + Sync>>,
+    persistence_callback: Option<PersistenceCallback>,
 }
 
 impl<V: PcdProofVerifier> PcdStateManager<V> {
@@ -781,6 +783,19 @@ impl<C: PcdSyncClient, V: PcdProofVerifier> PcdSyncManager<C, V> {
             client,
             state_manager: PcdStateManager::new(verifier),
         }
+    }
+
+    /// Initialize the internal state manager with an existing state (e.g., from storage)
+    pub fn initialize_with_state(&mut self, state: PcdState) -> Result<()> {
+        self.state_manager.initialize_genesis(state)
+    }
+
+    /// Set a persistence callback invoked whenever the internal state changes
+    pub fn set_persistence_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&PcdState) -> Result<()> + Send + Sync + 'static,
+    {
+        self.state_manager.set_persistence_callback(callback);
     }
 
     /// Sync to a target height

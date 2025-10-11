@@ -12,7 +12,6 @@ use pcd_core::{PcdDeltaBundle, PcdState, PcdTransition};
 use accum_mmr::{MmrDelta, SerializableHash};
 use accum_set::SetDelta;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::{
     collections::HashMap,
     path::Path,
@@ -488,13 +487,13 @@ impl ObliviousSyncService {
             transition_proof.clone(),
         )?;
 
-        Ok(PcdTransition::new(
+        PcdTransition::new(
             current_state,
             &new_state,
             delta_bundle.mmr_deltas.concat(),
             delta_bundle.nullifier_deltas.concat(),
             transition_proof,
-        )?)
+        )
     }
 
     /// Start network listener for wallet connections
@@ -752,7 +751,7 @@ impl BlobStore for TachyonBlobStore {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bytes::Bytes>> + Send + 'a>>
     {
         let network = self.network.clone();
-        Box::pin(async move { network.blob_store.fetch_blob(&cid).await })
+        Box::pin(async move { network.blob_store.fetch_blob(cid).await })
     }
 
     fn has_blob<'a>(
@@ -760,7 +759,7 @@ impl BlobStore for TachyonBlobStore {
         cid: &'a Cid,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         let network = self.network.clone();
-        Box::pin(async move { network.blob_store.has_blob(&cid).await })
+        Box::pin(async move { network.blob_store.has_blob(cid).await })
     }
 }
 

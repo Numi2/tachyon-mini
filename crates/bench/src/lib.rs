@@ -1086,8 +1086,8 @@ impl BenchmarkReport {
     pub fn format(&self) -> String {
         let mut output = String::new();
 
-        output.push_str(&format!("=== Tachyon Benchmark Report ===\n"));
-        output.push_str(&format!("Configuration:\n"));
+        output.push_str("=== Tachyon Benchmark Report ===\n");
+        output.push_str("Configuration:\n");
         output.push_str(&format!("  Iterations: {}\n", self.config.iterations));
         output.push_str(&format!("  Timeout: {}s\n", self.config.timeout_secs));
         output.push_str(&format!(
@@ -1096,7 +1096,7 @@ impl BenchmarkReport {
         ));
         output.push_str(&format!("  Verbose: {}\n\n", self.config.verbose));
 
-        output.push_str(&format!("Summary:\n"));
+        output.push_str("Summary:\n");
         output.push_str(&format!(
             "  Total operations: {}\n",
             self.summary.total_operations
@@ -1121,7 +1121,7 @@ impl BenchmarkReport {
             ));
         }
 
-        output.push_str(&format!("\nDetailed Results:\n"));
+        output.push_str("\nDetailed Results:\n");
 
         for result in &self.results {
             output.push_str(&format!("  {}\n", result.format()));

@@ -22,7 +22,6 @@ use tokio::{
 };
 use reqwest::Client as HttpClient;
 use accum_mmr::{MmrAccumulator, MmrWitness};
-use bincode;
 use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, OwnerId as DexOwnerId, OrderId as DexOrderId, OrderBookSnapshot as DexSnapshot, Trade as DexTrade};
 
 /// Wallet configuration
@@ -76,7 +75,7 @@ impl WalletConfig {
                     .map(|s| s.trim().to_string())
                     .collect()
             })
-            .unwrap_or_else(|| Vec::new());
+            .unwrap_or_else(Vec::new);
 
         let oss_endpoints = get("TACHYON_OSS_ENDPOINTS")
             .map(|s| {
@@ -580,7 +579,7 @@ impl TachyonWallet {
             // During unit tests we keep defaults; in other contexts enforce unless env allows
             let running_tests = std::env::var("TACHYON_UNDER_TEST").unwrap_or_default() == "1";
             if !running_tests {
-                let _ = config.validate()?;
+                config.validate()?;
             }
         }
         // Initialize encrypted database
@@ -608,6 +607,16 @@ impl TachyonWallet {
             SimplePcdVerifier,
         ))));
 
+        // Default: enable persistent DEX engine under the wallet DB path.
+        let dex = {
+            let p = std::path::Path::new(&config.db_path).join("dex_sled");
+            if let Ok(engine) = dex::SledEngine::open(&p) {
+                DexService::with_engine(Arc::new(engine))
+            } else {
+                DexService::new()
+            }
+        };
+
         Ok(Self {
             config,
             database,
@@ -617,7 +626,7 @@ impl TachyonWallet {
             oob_handler,
             sync_task: None,
             shutdown_tx: None,
-            dex: Arc::new(DexService::new()),
+            dex: Arc::new(dex),
         })
     }
 
@@ -949,10 +958,10 @@ impl TachyonWallet {
                 match order.side {
                     DexSide::Bid => {
                         let remaining_cost = order.price.0.saturating_mul(order.remaining.0);
-                        let _ = self.database.unlock_usdc(remaining_cost).await?;
+                        self.database.unlock_usdc(remaining_cost).await?;
                     }
                     DexSide::Ask => {
-                        let _ = self.database.unlock_base(order.remaining.0).await?;
+                        self.database.unlock_base(order.remaining.0).await?;
                     }
                 }
             }
@@ -990,7 +999,7 @@ impl TachyonWallet {
                 .memo
                 .as_deref()
                 .map(|s| s.as_bytes().to_vec())
-                .unwrap_or_else(|| Vec::new());
+                .unwrap_or_else(Vec::new);
             let memo_len = (memo_bytes.len() as u16).to_le_bytes();
             note_data.extend_from_slice(&memo_len);
             note_data.extend_from_slice(&memo_bytes);
@@ -1029,6 +1038,23 @@ impl TachyonWallet {
             let (pk, _sk) = SimpleKem::generate_keypair().unwrap();
             pk
         }
+    }
+
+    /// Send an out-of-band payment over Iroh to a specific peer.
+    pub async fn send_oob_over_iroh(&self, peer: net_iroh::NodeId, payment: OutOfBandPayment) -> Result<[u8; 32]> {
+        payment.verify()?;
+        let h = blake3::hash(payment.encrypted_metadata.as_slice());
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(h.as_bytes());
+        // Serialize payment to bytes (JSON) for transport
+        let bytes = serde_json::to_vec(&payment)?;
+        self.network.send_oob_to_peer(peer, hash_bytes, bytes).await?;
+        Ok(hash_bytes)
+    }
+
+    /// Subscribe to incoming out-of-band payments.
+    pub fn subscribe_incoming_oob(&self) -> tokio::sync::broadcast::Receiver<([u8; 32], Vec<u8>, net_iroh::NodeId)> {
+        self.network.subscribe_oob_payments()
     }
 
     /// List wallet notes

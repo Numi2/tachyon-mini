@@ -769,7 +769,7 @@ pub struct TokenLedger {
 impl TokenLedger {
     fn set_meta(&mut self, token: String, meta: TokenMeta) { self.meta.insert(token, meta); }
     fn ensure_token(&mut self, token: &str) {
-        self.balances.entry(token.to_string()).or_insert_with(BalanceRecord::default);
+        self.balances.entry(token.to_string()).or_default();
     }
     fn set_balance(&mut self, token: &str, available: u64, locked: u64) {
         self.balances.insert(token.to_string(), BalanceRecord { available, locked });

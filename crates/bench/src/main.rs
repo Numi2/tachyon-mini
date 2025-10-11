@@ -8,7 +8,6 @@ use bench::{
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing_subscriber;
 
 #[derive(Parser)]
 #[command(name = "tachyon-bench")]

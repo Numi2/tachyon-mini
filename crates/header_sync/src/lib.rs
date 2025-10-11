@@ -163,7 +163,7 @@ impl HeaderChain {
 
         // Update MMR root if provided
         if let Some(mmr_root) = header.mmr_root {
-            self.mmr_roots.insert(height, mmr_root.into());
+            self.mmr_roots.insert(height, mmr_root);
         }
 
         Ok(())
@@ -278,7 +278,7 @@ fn compact_to_target(bits: u32) -> [u8; 32] {
     if exponent <= 3 {
         let shift = 3 - exponent;
         let val = mantissa >> (8 * shift);
-        let be = (val as u32).to_be_bytes();
+        let be = val.to_be_bytes();
         target[28..32].copy_from_slice(&be);
     } else {
         let byte_index = (exponent as usize) - 3;
@@ -566,7 +566,7 @@ impl HeaderSyncManager {
     /// Create a new header sync manager
     pub async fn new(config: HeaderSyncConfig) -> Result<Self> {
         let network = Arc::new(
-            TachyonNetwork::new(&std::path::Path::new(&config.network_config.data_dir)).await?,
+            TachyonNetwork::new(std::path::Path::new(&config.network_config.data_dir)).await?,
         );
 
         // Try to load existing chain or create genesis
@@ -600,9 +600,7 @@ impl HeaderSyncManager {
         let network_for_anns = network.clone();
         let announce_task = tokio::spawn(async move {
             let mut rx = network_for_anns.subscribe_announcements();
-            loop {
-                match rx.recv().await {
-                    Ok((kind, _cid, height, _size, ticket)) => {
+            while let Ok((kind, _cid, height, _size, ticket)) = rx.recv().await {
                         // Only process Header and Checkpoint kinds
                         match kind {
                             BlobKind::Header => {
@@ -614,11 +612,10 @@ impl HeaderSyncManager {
                                             let mut chain_guard = chain_for_anns.write().await;
                                             // Apply if next height
                                             let next_h = chain_guard.tip.unwrap_or(0).saturating_add(1);
-                                            if header.height == next_h {
-                                                if chain_guard.add_header(header.clone()).is_ok() {
+                                            if header.height == next_h
+                                                && chain_guard.add_header(header.clone()).is_ok() {
                                                     applied = true;
                                                 }
-                                            }
                                         }
                                         if !applied {
                                             let mut ss = sync_state_for_anns.write().await;
@@ -649,9 +646,6 @@ impl HeaderSyncManager {
                             }
                             _ => {}
                         }
-                    }
-                    Err(_) => break,
-                }
             }
         });
 

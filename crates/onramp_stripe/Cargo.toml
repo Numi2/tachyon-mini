@@ -21,8 +21,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 tower = "0.4"
 
 # For signature verification (placeholder; real Stripe SDK can be added externally)
-# Stripe SDK and webhook verification
-stripe = { version = "0.32", default-features = false, features = ["serde"] }
+# Webhook verification deps
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"

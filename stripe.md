@@ -21,7 +21,9 @@ Enable Tachyon wallet users to seamlessly acquire USDC via Stripe’s fiat-to-cr
 
 - Wallet (`crates/wallet`): encrypted DB, PCD sync, token ledger (generalized), DEX interactions.
 - Storage (`crates/storage`): encrypted storage and a generalized token ledger with available/locked balances for arbitrary tokens.
-- DEX (`crates/dex`): in-memory orderbook and a `OrderBookEngine` trait (pluggable engines), wrapped by `DexService`.
+- DEX (`crates/dex`): `OrderBookEngine` trait with:
+  - In-memory engine (default)
+  - Sled-backed persistent engine (enabled by default under `<wallet_db>/dex_sled`)
 - Onramp (`crates/onramp_stripe`): Stripe integration providing:
   - Create onramp session with destination address, network, and token.
   - Webhook server with signature verification and timestamp tolerance.
@@ -140,7 +142,16 @@ Credits USDC into the wallet’s token ledger and removes the pending entry.
   - Bids lock quote (USDC), Asks lock base.
   - On fills, atomic settlement moves from locked to counter-asset available (e.g., spend locked USDC → credit base).
   - On cancel or partial fill, residual locks are unlocked.
-- The engine is pluggable via `OrderBookEngine` and currently uses an in-memory implementation in `dex`.
+- The engine is pluggable via `OrderBookEngine`:
+  - Default: persistent sled engine stored under `<wallet_db>/dex_sled`; survives restarts automatically.
+
+### DEX Persistence Quickstart
+
+```bash
+cargo run -p cli -- dex place-limit --db-path <wallet> --password <pw> --side bid --price 100 --qty 5
+# restart CLI/process and verify orders persist
+cargo run -p cli -- dex order-book --db-path <wallet> --password <pw> --depth 10
+```
 
 ## Security Considerations
 
@@ -185,7 +196,9 @@ Credits USDC into the wallet’s token ledger and removes the pending entry.
   - In-memory engine (current)
   - Local persistent engine (e.g., RocksDB/sled)
   - Remote matching engine over gRPC/HTTP
-- Add snapshot/restore for orderbook state and durable trade logs.
+- Add snapshot/restore for orderbook state and durable trade logs (append-only journal + checkpoints).
+- Crash consistency: atomic multi-key updates (journaled writes) for place/cancel/fill sequences.
+- Idempotent reapplication of journal on startup; periodic compaction into checkpoints.
 - Introduce maker/taker fees (configurable) and fee accounting in ledger.
 - Add concurrency controls (per-market locks) and deterministic matching policy (price-time priority, partial fills, cancels).
 
@@ -202,6 +215,7 @@ Credits USDC into the wallet’s token ledger and removes the pending entry.
 - Deploy webhook behind HTTPS with WAF/rate-limit; health checks and logging.
 - Monitor webhook error rates and pending queue growth; alert on anomalies.
 - Backup `pending.json` and rotate to a DB table if needed (idempotent upserts by `session_id`).
+- If DEX persistence is enabled, back up `TACHYON_DEX_PERSIST_PATH` directory; consider snapshot + journal rotation schedule.
 - Periodically reconcile by scanning recent sessions via Stripe API for missed events.
 
 ## Open Questions

@@ -153,7 +153,6 @@ pub async fn create_onramp_session(cfg: &OnrampConfig, suggested_amount_minor: u
 pub async fn fetch_onramp_session_details(cfg: &OnrampConfig, session_id: &str) -> Result<(u64, String, String)> {
     #[derive(Deserialize)]
     struct SessionData {
-        id: String,
         destination: Option<serde_json::Value>,
         amount_total: Option<u64>,
         currency: Option<String>,
@@ -200,8 +199,9 @@ pub async fn start_webhook_server(addr: SocketAddr, store: FilePendingStore, web
         }
     }));
 
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| anyhow!("bind error: {}", e))?;
     info!("starting webhook server on {}", addr);
-    axum::Server::bind(&addr).serve(app.into_make_service()).await.map_err(|e| anyhow!("server error: {}", e))
+    axum::serve(listener, app).await.map_err(|e| anyhow!("server error: {}", e))
 }
 
 /// Verify signature (if secret provided), parse, and handle one webhook event.
@@ -209,17 +209,17 @@ async fn verify_and_handle_webhook(headers: HeaderMap, body: &str, webhook_secre
     if let Some(secret) = webhook_secret.as_ref() {
         verify_stripe_webhook_signature(headers.clone(), body, secret)?;
     }
-    let event: stripe::Event = serde_json::from_str(body)?;
+    let event: serde_json::Value = serde_json::from_str(body)?;
     handle_stripe_event(event, stripe_secret_key, store).await;
     Ok(())
 }
 
 /// Handle Stripe event and enqueue pending USDC topups when appropriate.
-async fn handle_stripe_event(event: stripe::Event, stripe_secret_key: Option<String>, store: FilePendingStore) {
-    let etype = event.type_.to_string();
+async fn handle_stripe_event(event: serde_json::Value, stripe_secret_key: Option<String>, store: FilePendingStore) {
+    let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
     // The specific event names for Onramp are subject to change; these are typical patterns.
     if etype == "onramp.session.succeeded" || etype == "checkout.session.completed" {
-        let session_id = event.data.object.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let session_id = event.get("data").and_then(|d| d.get("object")).and_then(|o| o.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         if !session_id.is_empty() {
             // Confirm with Stripe for authoritative amount/currency
             if let Some(sk) = stripe_secret_key.as_ref() {
@@ -242,54 +242,54 @@ fn verify_stripe_webhook_signature(headers: HeaderMap, payload: &str, secret: &s
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let sig_header = headers.get("Stripe-Signature").ok_or_else(|| anyhow!("missing Stripe-Signature"))?.to_str().map_err(|_| anyhow!("bad sig header"))?;
-    // Header format: t=timestamp,v1=signature
-    let mut timestamp = "";
-    let mut sig = "";
+    let sig_header = headers
+        .get("Stripe-Signature")
+        .ok_or_else(|| anyhow!("missing Stripe-Signature"))?
+        .to_str()
+        .map_err(|_| anyhow!("bad sig header"))?;
+
+    // Header format: t=timestamp,v1=signature[,v1=signature2,...]
+    let mut timestamp: Option<&str> = None;
+    let mut signatures_hex: Vec<&str> = Vec::new();
     for part in sig_header.split(',') {
         let mut kv = part.splitn(2, '=');
-        let k = kv.next().unwrap_or("");
-        let v = kv.next().unwrap_or("");
-        if k == "t" { timestamp = v; }
-        if k == "v1" { sig = v; }
+        let k = kv.next().unwrap_or("").trim();
+        let v = kv.next().unwrap_or("").trim();
+        match k {
+            "t" => timestamp = Some(v),
+            "v1" => signatures_hex.push(v),
+            _ => {}
+        }
     }
-    if timestamp.is_empty() || sig.is_empty() { return Err(anyhow!("invalid Stripe-Signature header")); }
+    let timestamp = timestamp.ok_or_else(|| anyhow!("invalid Stripe-Signature header: missing t"))?;
+    if signatures_hex.is_empty() { return Err(anyhow!("invalid Stripe-Signature header: missing v1")); }
+
     // Enforce timestamp tolerance (5 minutes)
-    let ts: i64 = timestamp.parse().unwrap_or(0);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let ts: i64 = timestamp.parse().map_err(|_| anyhow!("invalid signature timestamp"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
     if (now - ts).abs() > 300 { return Err(anyhow!("stale webhook signature")); }
+
+    // Compute expected signature bytes
     let signed_payload = format!("{}.{}", timestamp, payload);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| anyhow!("hmac init failed"))?;
     mac.update(signed_payload.as_bytes());
-    let calc = mac.finalize().into_bytes();
-    let expected = hex::encode(calc);
-    if !constant_time_eq::constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
-        return Err(anyhow!("invalid webhook signature"));
-    }
-    Ok(())
-}
-    // For MVP we interpret a generic "onramp.session_succeeded" style event
-    // and extract amount + session id. The actual Stripe event shape differs;
-    // adapt here when wiring real API payloads.
-    let event_type = event.r#type.to_lowercase();
-    if event_type.contains("session") && event_type.contains("succeed") {
-        let session_id = event
-            .data
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let usdc_amount = event
-            .data
-            .get("usdc_amount")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        if !session_id.is_empty() && usdc_amount > 0 {
-            let pending = PendingTopup { session_id: session_id.clone(), usdc_amount, target_db_path: None };
-            store.insert(pending).await;
-            info!("queued pending topup: {} amount={} USDC", session_id, usdc_amount);
+    let expected_bytes = mac.finalize().into_bytes();
+
+    // Compare against any provided v1 signature (hex) in constant time
+    let mut any_match = false;
+    for sig_hex in signatures_hex {
+        if let Ok(provided_bytes) = hex::decode(sig_hex) {
+            if constant_time_eq::constant_time_eq(&expected_bytes, &provided_bytes) {
+                any_match = true;
+                break;
+            }
         }
     }
+    if !any_match { return Err(anyhow!("invalid webhook signature")); }
+    Ok(())
 }
 
 /// Claim a pending topup by session id and credit to the wallet's USDC balance.

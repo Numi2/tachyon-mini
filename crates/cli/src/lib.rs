@@ -5,10 +5,10 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::Path;
-use tracing_subscriber;
 use wallet::{TachyonWallet, WalletConfig};
 use bytes::Bytes;
-use net_iroh::{BlobKind, TachyonNetwork};
+use net_iroh::{BlobKind, TachyonNetwork, NodeId};
+use std::str::FromStr;
 use node_ext::{NodeConfig, NetworkConfig};
 use header_sync::{HeaderSyncConfig as HsConfig, HeaderSyncManager};
 use onramp_stripe as onramp;
@@ -106,6 +106,10 @@ pub enum WalletCommands {
         /// Optional memo
         #[arg(long)]
         memo: Option<String>,
+
+        /// Optional Iroh peer NodeId (hex/base58 as supported by iroh) to send over network
+        #[arg(long)]
+        peer: Option<String>,
     },
     /// Claim an out-of-band payment from JSON blob
     ClaimOob {
@@ -232,12 +236,6 @@ pub enum WalletCommands {
 pub enum OnrampCommands {
     /// Create onramp session and print URL
     CreateSession {
-        /// Stripe secret key (or set STRIPE_SECRET_KEY)
-        #[arg(long)]
-        secret_key: Option<String>,
-        /// Webhook secret (optional; or set STRIPE_WEBHOOK_SECRET)
-        #[arg(long)]
-        webhook_secret: Option<String>,
         /// Destination address for USDC
         #[arg(long)]
         destination: String,
@@ -262,9 +260,6 @@ pub enum OnrampCommands {
         /// Webhook secret (or set STRIPE_WEBHOOK_SECRET)
         #[arg(long)]
         webhook_secret: Option<String>,
-        /// Stripe secret key (for session lookups)
-        #[arg(long)]
-        secret_key: Option<String>,
     },
     /// List pending topups
     Pending {
@@ -530,7 +525,7 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             );
             println!("{}", uri);
         }
-        WalletCommands::SendOob { from, password, to, value, memo } => {
+        WalletCommands::SendOob { from, password, to, value, memo, peer } => {
             let db_path = format!("{}/wallets/{}", data_dir, from);
             let wallet_path = Path::new(&db_path);
             if !wallet_path.exists() {
@@ -579,8 +574,22 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             let payment = wallet
                 .create_oob_payment(recipient_pk, meta, b"cli_payment".to_vec())
                 .await?;
-            let json = serde_json::to_string(&payment)?;
-            println!("{}", json);
+
+            if let Some(peer_str) = peer {
+                // Attempt to parse NodeId via iroh API
+                let parsed_node_id = match NodeId::from_str(&peer_str) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        println!("invalid peer NodeId");
+                        return Ok(());
+                    }
+                };
+                let hash = wallet.send_oob_over_iroh(parsed_node_id, payment).await?;
+                println!("sent-oob-over-iroh: hash=0x{}", hex::encode(hash));
+            } else {
+                let json = serde_json::to_string(&payment)?;
+                println!("{}", json);
+            }
         }
         WalletCommands::ClaimOob { name, password, json } => {
             let db_path = format!("{}/wallets/{}", data_dir, name);
@@ -1035,14 +1044,14 @@ async fn execute_network_command(command: NetworkCommands) -> Result<()> {
             // Ensure data dir exists
             std::fs::create_dir_all(&data_dir)?;
 
-            // Build node config
-            let mut net_cfg = NetworkConfig::default();
-            net_cfg.data_dir = data_dir.clone();
-            net_cfg.listen_addr = Some(listen_addr.clone());
-            net_cfg.bootstrap_nodes = bootstrap_list;
+            // Build node config without field reassigns after Default
+            let net_cfg = NetworkConfig {
+                data_dir: data_dir.clone(),
+                bootstrap_nodes: bootstrap_list,
+                listen_addr: Some(listen_addr.clone()),
+            };
 
-            let mut node_cfg = NodeConfig::default();
-            node_cfg.network_config = net_cfg;
+            let node_cfg = NodeConfig { network_config: net_cfg, ..Default::default() };
 
             // Start node
             let node = node_ext::TachyonNode::new(node_cfg).await?;
@@ -1128,16 +1137,16 @@ async fn execute_header_sync_command(command: HeaderSyncCommands) -> Result<()> 
 /// Execute onramp commands
 async fn execute_onramp_command(command: OnrampCommands) -> Result<()> {
     match command {
-        OnrampCommands::CreateSession { secret_key, webhook_secret: _, destination, network, currency, amount } => {
-            let key = secret_key.or_else(|| std::env::var("STRIPE_SECRET_KEY").ok()).ok_or_else(|| anyhow!("missing stripe secret key"))?;
-            let cfg = onramp::OnrampConfig { stripe_secret_key: key, webhook_secret: None, destination_address: destination, destination_network: network, destination_currency: currency };
+        OnrampCommands::CreateSession { destination, network, currency, amount } => {
+            let key = std::env::var("STRIPE_SECRET_KEY").map_err(|_| anyhow!("missing STRIPE_SECRET_KEY"))?;
+            let cfg = onramp::OnrampConfig { stripe_secret_key: key, webhook_secret: std::env::var("STRIPE_WEBHOOK_SECRET").ok(), destination_address: destination, destination_network: network, destination_currency: currency };
             let session = onramp::create_onramp_session(&cfg, amount).await?;
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({"id": session.session_id, "url": session.url}))?);
         }
-        OnrampCommands::Webhook { listen, pending_file, webhook_secret, secret_key } => {
+        OnrampCommands::Webhook { listen, pending_file, webhook_secret } => {
             let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
             let secret = webhook_secret.or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").ok());
-            let stripe_sk = secret_key.or_else(|| std::env::var("STRIPE_SECRET_KEY").ok());
+            let stripe_sk = std::env::var("STRIPE_SECRET_KEY").ok();
             let addr: std::net::SocketAddr = listen.parse().map_err(|_| anyhow!("invalid listen addr"))?;
             onramp::start_webhook_server(addr, store.clone(), secret, stripe_sk).await?;
         }

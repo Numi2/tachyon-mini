@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{protocol::{AcceptError, ProtocolHandler, Router}, Endpoint, NodeId, Watcher};
+use iroh::{protocol::{AcceptError, ProtocolHandler, Router}, Endpoint, Watcher};
 use iroh_blobs::{store::fs::FsStore, Hash};
 use iroh_blobs::{
     ticket::BlobTicket,
@@ -23,6 +23,7 @@ use std::{
 // Hardcoded configuration for simplicity and consistency
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
+use std::future::Future;
 // use tokio::io::AsyncReadExt; // not needed; RecvStream provides read_exact
 use tokio::{
     sync::{broadcast, mpsc},
@@ -30,6 +31,16 @@ use tokio::{
 };
 use tracing::{debug, info};
 use iroh::SecretKey;
+
+// Re-export NodeId so downstream crates can use `net_iroh::NodeId`
+pub use iroh::NodeId;
+
+// Reduce type complexity with local aliases
+type Published = Vec<(BlobKind, Vec<u8>, u64)>;
+type AnnounceRecord = (BlobKind, Cid, u64, usize, String);
+type AnnounceList = Vec<AnnounceRecord>;
+type HeaderList = Vec<(u64, Vec<u8>)>;
+type HeaderListFuture<'a> = Pin<Box<dyn Future<Output = HeaderList> + Send + 'a>>;
 
 // Integrity verification is provided by iroh-blobs via BLAKE3-verified streams.
 
@@ -115,6 +126,14 @@ pub enum ControlMessage {
     GetHeadersByHeight { start: u64, count: u32 },
     /// Response with headers for a requested height range; includes heights alongside bytes
     HeadersByHeight { start: u64, headers: Vec<(u64, Vec<u8>)> },
+    /// Deliver an out-of-band payment payload to a peer.
+    ///
+    /// The hash should be a 32-byte BLAKE3 digest that uniquely identifies the
+    /// payment for idempotence and acknowledgement correlation. Typically this
+    /// is computed over the encrypted metadata bytes of the payment.
+    OobPayment { hash: [u8; 32], payment: Vec<u8> },
+    /// Acknowledge receipt of an out-of-band payment.
+    OobAck { hash: [u8; 32] },
 }
 
 /// Tachyon blob store wrapper around iroh-blobs
@@ -224,11 +243,13 @@ pub struct TachyonNetwork {
     /// Router handle for graceful shutdown
     router: Router,
     /// Recently published blobs (kind, bytes, height) for local consumers
-    published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>>,
+    published: Arc<RwLock<Published>>,
     /// Recent announcements (kind, cid, height, size, ticket) from peers and self
-    recent_announcements: Arc<RwLock<Vec<(BlobKind, Cid, u64, usize, String)>>>,
+    recent_announcements: Arc<RwLock<AnnounceList>>,
     /// Optional header provider used to serve header bytes by height
     header_provider: Arc<RwLock<Option<Arc<dyn HeaderProvider>>>>,
+    /// Out-of-band payment events: (hash, payment bytes, sender NodeId)
+    oob_events: broadcast::Sender<([u8; 32], Vec<u8>, NodeId)>,
 }
 
 /// Blob store trait for dependency injection
@@ -254,7 +275,7 @@ pub trait HeaderProvider: Send + Sync + 'static {
         &'a self,
         start: u64,
         count: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u64, Vec<u8>)>> + Send + 'a>>;
+    ) -> HeaderListFuture<'a>;
 }
 
 impl BlobStore for TachyonBlobStore {
@@ -296,12 +317,13 @@ impl TachyonNetwork {
         // Create channels for communication
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let (announcements, _) = broadcast::channel(1000);
+        let (oob_events, _oob_rx) = broadcast::channel(1000);
         let announcements_tx = announcements.clone();
         let peers: Arc<RwLock<HashMap<NodeId, Connection>>> = Arc::new(RwLock::new(HashMap::new()));
-        let recent_announcements: Arc<RwLock<Vec<(BlobKind, Cid, u64, usize, String)>>> = Arc::new(RwLock::new(Vec::new()));
+        let recent_announcements: Arc<RwLock<AnnounceList>> = Arc::new(RwLock::new(Vec::new()));
 
         // Published blobs store for answering header requests
-        let published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>> = Arc::new(RwLock::new(Vec::new()));
+        let published: Arc<RwLock<Published>> = Arc::new(RwLock::new(Vec::new()));
 
         // Control protocol handler registered with router
         let control_proto = ControlProtocol {
@@ -336,6 +358,7 @@ impl TachyonNetwork {
         let endpoint_clone = endpoint.clone();
         let peers_clone = peers.clone();
         let recent_announcements_clone = recent_announcements.clone();
+        let oob_events_tx = oob_events.clone();
         let control_task = tokio::spawn(async move {
             while let Some((node_id, message)) = control_rx.recv().await {
                 // Record announce messages for later consumers
@@ -353,6 +376,7 @@ impl TachyonNetwork {
                     &endpoint_clone,
                     &announcements_tx,
                     &peers_clone,
+                    &oob_events_tx,
                 )
                 .await;
             }
@@ -369,6 +393,7 @@ impl TachyonNetwork {
             published,
             recent_announcements,
             header_provider: control_proto.header_provider.clone(),
+            oob_events,
         })
     }
 
@@ -456,11 +481,9 @@ impl TachyonNetwork {
         count: u32,
     ) -> Result<Vec<(u64, Vec<u8>)>> {
         let conn = {
-            let peers = self.peers.read().unwrap();
-            peers
-                .get(&peer_id)
-                .ok_or_else(|| anyhow!("not connected to requested peer"))?
-                .clone()
+            // Drop the lock before awaiting to satisfy clippy's await_holding_lock
+            let conn_opt = { self.peers.read().unwrap().get(&peer_id).cloned() };
+            conn_opt.ok_or_else(|| anyhow!("not connected to requested peer"))?
         };
 
         let (mut send, recv) = conn.open_bi().await?;
@@ -502,6 +525,50 @@ impl TachyonNetwork {
         &self,
     ) -> broadcast::Receiver<(BlobKind, Cid, u64, usize, String)> {
         self.announcements.subscribe()
+    }
+
+    /// Subscribe to incoming OOB payments as raw bytes.
+    pub fn subscribe_oob_payments(&self) -> broadcast::Receiver<([u8; 32], Vec<u8>, NodeId)> {
+        self.oob_events.subscribe()
+    }
+
+    /// Send an OOB payment to a specific peer and wait for OobAck
+    pub async fn send_oob_to_peer(&self, peer_id: NodeId, hash: [u8; 32], payment: Vec<u8>) -> Result<()> {
+        // First attempt to clone an existing connection without holding a lock across await
+        let existing_conn = {
+            let guard = self.peers.read().unwrap();
+            guard.get(&peer_id).cloned()
+        };
+        if let Some(existing) = existing_conn {
+            let (mut send, recv) = existing.open_bi().await?;
+            let req = ControlMessage::OobPayment { hash, payment };
+            let encoded = bincode::serialize(&req).map_err(|e| anyhow!(e))?;
+            write_framed(&mut send, &encoded).await?;
+            let buf = read_framed(recv).await?;
+            let resp: ControlMessage = bincode::deserialize(&buf).map_err(|e| anyhow!(e))?;
+            return match resp {
+                ControlMessage::OobAck { hash: ack } if ack == hash => Ok(()),
+                other => Err(anyhow!(format!("unexpected response to OOB: {:?}", other))),
+            };
+        }
+
+        // Not connected: connect without holding the lock, then store
+        let node_addr = iroh::NodeAddr::new(peer_id).with_relay_url(default_relay_url());
+        let conn = self.endpoint.connect(node_addr, CONTROL_ALPN).await?;
+        {
+            let mut guard = self.peers.write().unwrap();
+            guard.insert(peer_id, conn.clone());
+        }
+        let (mut send, recv) = conn.open_bi().await?;
+        let req = ControlMessage::OobPayment { hash, payment };
+        let encoded = bincode::serialize(&req).map_err(|e| anyhow!(e))?;
+        write_framed(&mut send, &encoded).await?;
+        let buf = read_framed(recv).await?;
+        let resp: ControlMessage = bincode::deserialize(&buf).map_err(|e| anyhow!(e))?;
+        match resp {
+            ControlMessage::OobAck { hash: ack } if ack == hash => Ok(()),
+            other => Err(anyhow!(format!("unexpected response to OOB: {:?}", other))),
+        }
     }
 
     /// Return a snapshot of recently published blobs (kind, bytes, height)
@@ -758,11 +825,12 @@ impl TachyonNetwork {
 
     /// Handle incoming control messages
     async fn handle_control_message(
-        _node_id: NodeId,
+        node_id: NodeId,
         message: ControlMessage,
         _endpoint: &Endpoint,
         announcements: &broadcast::Sender<(BlobKind, Cid, u64, usize, String)>,
         _peers: &Arc<RwLock<HashMap<NodeId, Connection>>>,
+        oob_events: &broadcast::Sender<([u8; 32], Vec<u8>, NodeId)>,
     ) {
         match message {
             ControlMessage::Announce {
@@ -781,6 +849,12 @@ impl TachyonNetwork {
             ControlMessage::Request { cid } => {
                 debug!("Received blob request for CID {}", cid);
                 // In local mode we don't serve remote requests yet
+            }
+            ControlMessage::OobPayment { hash, payment } => {
+                let _ = oob_events.send((hash, payment, node_id));
+            }
+            ControlMessage::OobAck { hash: _ } => {
+                // No-op at this layer
             }
             _ => {
                 debug!("Received other control message: {:?}", message);
@@ -819,7 +893,7 @@ struct ControlProtocol {
     peers: Arc<RwLock<HashMap<NodeId, Connection>>>,
     control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
     header_provider: Arc<RwLock<Option<Arc<dyn HeaderProvider>>>>,
-    published: Arc<RwLock<Vec<(BlobKind, Vec<u8>, u64)>>>,
+    published: Arc<RwLock<Published>>,
 }
 
 impl std::fmt::Debug for ControlProtocol {
@@ -879,6 +953,15 @@ impl ProtocolHandler for ControlProtocol {
                                         if let Ok(encoded) = bincode::serialize(&resp) {
                                             let _ = write_framed(&mut send, &encoded).await;
                                         }
+                                    }
+                                    ControlMessage::OobPayment { hash, payment } => {
+                                        // Immediately ACK on the same stream; processing happens in control task
+                                        let ack = ControlMessage::OobAck { hash };
+                                        if let Ok(encoded) = bincode::serialize(&ack) {
+                                            let _ = write_framed(&mut send, &encoded).await;
+                                        }
+                                        // Forward to control task for event broadcast
+                                        let _ = tx.send((node_id, ControlMessage::OobPayment { hash, payment }));
                                     }
                                     other => {
                                         // Forward other control messages to the control task
