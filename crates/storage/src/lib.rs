@@ -252,6 +252,12 @@ pub struct WalletDatabase {
     spend_secret_cache: Arc<RwLock<Option<SpendSecretRecord>>>,
     /// In-memory token ledger (generalized balances)
     token_ledger: Arc<RwLock<TokenLedger>>, 
+    /// In-memory Zcash seed cache (encrypted on disk)
+    zcash_seed_cache: Arc<RwLock<Option<ZcashSeedRecord>>>,
+    /// Persistent DEX owner id (wallet-scoped)
+    dex_owner_id: Arc<RwLock<Option<u64>>>,
+    /// Last chain nullifier scan height (persisted)
+    last_chain_nf_height: Arc<RwLock<u64>>,
 }
 
 impl WalletDatabase {
@@ -283,6 +289,9 @@ impl WalletDatabase {
             oob_keys_cache: Arc::new(RwLock::new(None)),
             spend_secret_cache: Arc::new(RwLock::new(None)),
             token_ledger: Arc::new(RwLock::new(TokenLedger::default())),
+            zcash_seed_cache: Arc::new(RwLock::new(None)),
+            dex_owner_id: Arc::new(RwLock::new(None)),
+            last_chain_nf_height: Arc::new(RwLock::new(0)),
         };
 
         // Load existing data from disk
@@ -373,6 +382,14 @@ impl WalletDatabase {
             *self.spend_secret_cache.write().unwrap() = Some(rec);
         }
 
+        // Load Zcash seed
+        let zcash_seed_path = self.db_path.join("zcash_seed.bin");
+        if zcash_seed_path.exists() {
+            let data = fs::read(&zcash_seed_path).await?;
+            let rec: ZcashSeedRecord = bincode::deserialize(&data)?;
+            *self.zcash_seed_cache.write().unwrap() = Some(rec);
+        }
+
         // Load token ledger v2 (preferred), or migrate legacy balances if present
         let ledger_v2_path = self.db_path.join("balances_v2.bin");
         if ledger_v2_path.exists() {
@@ -396,6 +413,24 @@ impl WalletDatabase {
                     fs::write(&tmp, &data).await?;
                     fs::rename(&tmp, &ledger_v2_path).await?;
                 }
+            }
+        }
+
+        // Load DEX owner id
+        let dex_owner_path = self.db_path.join("dex_owner_id.bin");
+        if dex_owner_path.exists() {
+            let data = fs::read(&dex_owner_path).await?;
+            if let Ok(id) = bincode::deserialize::<u64>(&data) {
+                *self.dex_owner_id.write().unwrap() = Some(id);
+            }
+        }
+
+        // Load last chain nullifier scan height
+        let nf_h_path = self.db_path.join("last_chain_nf_height.bin");
+        if nf_h_path.exists() {
+            let data = fs::read(&nf_h_path).await?;
+            if let Ok(h) = bincode::deserialize::<u64>(&data) {
+                *self.last_chain_nf_height.write().unwrap() = h;
             }
         }
 
@@ -456,6 +491,16 @@ impl WalletDatabase {
             fs::rename(&tmp, &spend_path).await?;
         }
 
+        // Save Zcash seed if present atomically
+        let zcash_seed_path = self.db_path.join("zcash_seed.bin");
+        let zcash_seed_opt = { self.zcash_seed_cache.read().unwrap().clone() };
+        if let Some(rec) = zcash_seed_opt {
+            let tmp = self.db_path.join("zcash_seed.bin.tmp");
+            let data = bincode::serialize(&rec)?;
+            fs::write(&tmp, &data).await?;
+            fs::rename(&tmp, &zcash_seed_path).await?;
+        }
+
         // Save token ledger v2 atomically
         let ledger_v2_path = self.db_path.join("balances_v2.bin");
         let ledger_tmp = self.db_path.join("balances_v2.bin.tmp");
@@ -466,7 +511,54 @@ impl WalletDatabase {
         fs::write(&ledger_tmp, &ledger_data).await?;
         fs::rename(&ledger_tmp, &ledger_v2_path).await?;
 
+        // Save DEX owner id if present atomically
+        let dex_owner_opt = { *self.dex_owner_id.read().unwrap() };
+        if let Some(id) = dex_owner_opt {
+            let dex_owner_path = self.db_path.join("dex_owner_id.bin");
+            let dex_owner_tmp = self.db_path.join("dex_owner_id.bin.tmp");
+            let data = bincode::serialize(&id)?;
+            fs::write(&dex_owner_tmp, &data).await?;
+            fs::rename(&dex_owner_tmp, &dex_owner_path).await?;
+        }
+
+        // Save last chain nullifier height atomically
+        let nf_h = { *self.last_chain_nf_height.read().unwrap() };
+        let nf_h_path = self.db_path.join("last_chain_nf_height.bin");
+        let nf_h_tmp = self.db_path.join("last_chain_nf_height.bin.tmp");
+        let data = bincode::serialize(&nf_h)?;
+        fs::write(&nf_h_tmp, &data).await?;
+        fs::rename(&nf_h_tmp, &nf_h_path).await?;
+
         Ok(())
+    }
+
+    /// Get or create a persistent DEX owner id for this wallet
+    pub async fn get_or_create_dex_owner_id(&self) -> Result<u64> {
+        if let Some(id) = *self.dex_owner_id.read().unwrap() {
+            return Ok(id);
+        }
+        let mut rng = rand::thread_rng();
+        let mut id: u64 = rng.next_u64();
+        if id == 0 { id = 1; }
+        {
+            *self.dex_owner_id.write().unwrap() = Some(id);
+        }
+        // Persist immediately
+        self.save_to_disk().await?;
+        Ok(id)
+    }
+
+    /// Read the last chain nullifier scan height
+    pub async fn get_chain_nf_last_height(&self) -> u64 {
+        *self.last_chain_nf_height.read().unwrap()
+    }
+
+    /// Set and persist the last chain nullifier scan height
+    pub async fn set_chain_nf_last_height(&self, height: u64) -> Result<()> {
+        {
+            *self.last_chain_nf_height.write().unwrap() = height;
+        }
+        self.save_to_disk().await
     }
 
     /// Flush in-memory state to disk
@@ -735,6 +827,34 @@ impl SpendSecretRecord {
     }
 }
 
+/// Persisted Zcash seed mnemonic (BIP-39) encrypted at rest, with birthday height
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZcashSeedRecord {
+    /// Encrypted mnemonic phrase bytes (UTF-8), nonce + ciphertext
+    pub encrypted_mnemonic: Vec<u8>,
+    /// Nonce used for encryption
+    pub nonce: [u8; AES_NONCE_SIZE],
+    /// Birthday height for light client scanning optimization
+    pub birthday_height: u64,
+}
+
+impl ZcashSeedRecord {
+    /// Create a new encrypted Zcash seed record
+    pub fn new(mnemonic: &str, birthday_height: u64, master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<Self> {
+        let nonce = SimpleAead::generate_nonce();
+        let encrypted_mnemonic = SimpleAead::encrypt(master_key, &nonce, mnemonic.as_bytes(), b"zcash_seed")?;
+        Ok(Self { encrypted_mnemonic, nonce, birthday_height })
+    }
+
+    /// Decrypt the mnemonic phrase
+    pub fn decrypt_mnemonic(&self, master_key: &[u8; DB_MASTER_KEY_SIZE]) -> Result<String> {
+        if self.encrypted_mnemonic.len() < AES_NONCE_SIZE { return Err(anyhow!("Ciphertext too short")); }
+        if self.encrypted_mnemonic[..AES_NONCE_SIZE] != self.nonce { return Err(anyhow!("Nonce mismatch for ZcashSeedRecord")); }
+        let bytes = SimpleAead::decrypt(master_key, &self.encrypted_mnemonic, b"zcash_seed")?;
+        String::from_utf8(bytes).map_err(|_| anyhow!("Decrypted mnemonic not valid UTF-8"))
+    }
+}
+
 impl Drop for WalletDatabase {
     fn drop(&mut self) {
         // Best-effort unlock; dropping the file will also release the lock
@@ -922,6 +1042,31 @@ impl WalletDatabase {
 
     pub async fn get_token_locked(&self, token: &str) -> u64 {
         self.token_ledger.read().unwrap().locked_of(token)
+    }
+
+    /// Persist Zcash mnemonic and birthday height (encrypted at rest)
+    pub async fn set_zcash_seed(&self, mnemonic: &str, birthday_height: u64) -> Result<()> {
+        let rec = ZcashSeedRecord::new(mnemonic, birthday_height, &self.master_key)?;
+        {
+            *self.zcash_seed_cache.write().unwrap() = Some(rec);
+        }
+        self.save_to_disk().await
+    }
+
+    /// Retrieve Zcash mnemonic and birthday height if present
+    pub async fn get_zcash_seed(&self) -> Option<(String, u64)> {
+        let rec_opt = { self.zcash_seed_cache.read().unwrap().clone() };
+        if let Some(rec) = rec_opt {
+            if let Ok(m) = rec.decrypt_mnemonic(&self.master_key) {
+                return Some((m, rec.birthday_height));
+            }
+        }
+        None
+    }
+
+    /// Check if a Zcash seed is stored
+    pub async fn has_zcash_seed(&self) -> bool {
+        self.zcash_seed_cache.read().unwrap().is_some()
     }
 }
 

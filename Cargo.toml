@@ -37,9 +37,8 @@ blake3 = "1.5"
 # HTTP client for checkpoint bootstrap
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# Iroh networking
-# Pin iroh to 0.91.x to match iroh-blobs' internal iroh dependency
-iroh = "0.91.2"
+# Iroh networking - pin to matching minor to avoid rustls-webpki mismatch
+iroh = "0.91.0"
 iroh-blobs = "0.92.0"
 
 ## Note: crate-specific optional deps (e.g., zebra-chain, equihash) are declared in their crates
@@ -83,6 +82,8 @@ serde_json = "1.0"
 # Bytes utility
 bytes = "1.0"
 
+
+
 # Local crate dependencies
 net_iroh = { path = "crates/net_iroh" }
 pcd_core = { path = "crates/pcd_core" }
@@ -106,3 +107,4 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Tachyon Team"]
 license = "MIT OR Apache-2.0"
+

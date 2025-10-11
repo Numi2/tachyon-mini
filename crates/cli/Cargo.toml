@@ -29,3 +29,10 @@ rpassword = "7"
 dirs-next = "2"
 onramp_stripe = { path = "../onramp_stripe" }
 dex = { path = "../dex" }
+
+[features]
+default = []
+# Enable Zcash-related CLI commands and forward feature to wallet crate
+zcash = ["wallet/zcash"]
+# Enable mnemonic support (for seed import) and forward to wallet crate
+zcash_mnemonic = ["zcash", "wallet/zcash_mnemonic"]

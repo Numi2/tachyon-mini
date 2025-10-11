@@ -10,18 +10,38 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-net_iroh = { path = "../net_iroh" }
-pcd_core = { path = "../pcd_core" }
-pq_crypto = { path = "../pq_crypto" }
+net_iroh = { path = "../net_iroh", optional = true }
+pcd_core = { path = "../pcd_core", optional = true }
+pq_crypto = { path = "../pq_crypto", optional = true }
 storage = { path = "../storage" }
-node_ext = { path = "../node_ext" }
+node_ext = { path = "../node_ext", optional = true }
 blake3.workspace = true
 tracing.workspace = true
 bincode.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 hex = "0.4"
-accum_mmr = { path = "../accum_mmr" }
-dex = { path = "../dex" }
+accum_mmr = { path = "../accum_mmr", optional = true }
+dex = { path = "../dex", optional = true }
+rand = { version = "0.8", optional = true }
+## Zcash dependencies temporarily removed to resolve dependency conflicts
+## bip0039 removed to avoid pbkdf2/subtle conflicts
+
+# Optional mnemonic support (disabled by default; add dependency if enabling)
 
 [dev-dependencies]
 tempfile = "3.0"
+
+[features]
+default = ["pcd"]
+# Zcash temporarily disabled: feature kept for compatibility but does nothing
+zcash = []
+zcash_mnemonic = []
+pcd = [
+    "net_iroh",
+    "pcd_core",
+    "pq_crypto",
+    "node_ext",
+    "reqwest",
+    "accum_mmr",
+    "dex",
+]

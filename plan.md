@@ -173,59 +173,46 @@ trait Transition {
 
 ⸻
 
+## Status Overview
+
+- **Core foundation:** `net_iroh`, accumulator crates, `pq_crypto`, `circuits`, `wallet`, `storage`, and `cli` are implemented with unit/integration coverage. End-to-end flows operate in development mode using deterministic data.
+- **Networking & sync:** `oss_service`, `node_ext`, and `header_sync` crates are online with working control/data channels but still rely on placeholder deltas and simplified security defaults.
+- **Production gaps:** Need real block pipeline wiring, removal of placeholder proofs, stronger rate limiting/identity, and automated deployment/test coverage.
+
+### Component Readiness
+
+- [x] **Wallet (client, PCD machine)** – Encrypted storage, PCD state machine, OOB payments, CLI commands implemented; requires performance tuning, realistic proofs, and hardening of feature flags.
+- [x] **Oblivious Sync Service (OSS)** – Publishes deterministic delta bundles via `net_iroh`; needs live block ingestion, manifest persistence, stricter auth and rate limiting.
+- [x] **Node / Validator extension** – Nullifier tracking, PCD verification, pruning scaffolding in place; must be wired to chain pipeline, cache Halo2 keys, and undergo performance testing.
+- [ ] **Accumulator service / delta generator** – Logic embedded in OSS but no dedicated service producing real deltas; integrate with block producer and persist outputs.
+- [ ] **Header sync** – Manager exists with placeholder NiPoPoW/PoW; implement real Equihash validation, checkpoint persistence, and peer gossip.
+
+Prototype Tachyon network remains:
+	•	Wallet software (with PCD logic).
+	•	Node software (with validator + pruning).
+	•	OSS (sync servers for wallets).
+	•	Shared accumulator + header sync layer (protocol substrate).
+
 Implementation Phases
 
-Phase 1: Core Networking + Blob Layer
-	•	Integrate iroh and iroh-blobs crates.
-	•	Create net_iroh crate that:
-  • Starts an iroh Endpoint with ALPNs.
-  • Accepts control streams and blob protocol.
-  • Exposes high-level APIs: publish_blob, subscribe_announcements, fetch_blob.
-	•	Build a minimal test: two nodes, node A publishes a blob, node B fetches and verifies via BLAKE3.
-	•	Use latest BLAKE3 hazmat API to compute subtrees and chunk proofs.  ￼
+- [x] **Phase 1: Core Networking + Blob Layer** – `net_iroh` wraps iroh/iroh-blobs with publish/fetch APIs and tests.
+- [x] **Phase 2: Accumulator & MMR** – `accum_mmr` provides append-only structure, delta batching, proofs, persistence, and tests.
+- [x] **Phase 3: PCD Circuits** – `circuits` + `pcd_core` expose Halo2 transition/recursion circuits; placeholder shortcuts still used in some flows.
+- [x] **Phase 4: Wallet + OSS (alpha)** – Wallet, storage, pq_crypto and OSS integrate for deterministic sync; pending live block ingestion and auth hardening.
+- [x] **Phase 5: Validator / Node Extension (alpha)** – `node_ext` validates PCD + nullifiers; awaiting real chain hooks and performance tuning.
+- [ ] **Phase 6: Header Sync & Bootstrapping** – `header_sync` scaffold implemented but needs real PoW/NiPoPoW, persistence and peer wiring.
+- [ ] **Phase 7: Hardening, Privacy, PQ Transition Path** – Privacy padding, token rotation, fallback proving, and PQ upgrade paths outstanding.
 
-Phase 2: Accumulator & MMR
-	•	Build accum_mmr crate: append-only structure, proof generation, delta application, witness updates.
-	•	Support batched deltas and shared path compression.
-	•	Tests: small sets, large sets, path correctness.
+### Forward Roadmap
 
-Phase 3: PCD Circuits
-	•	In circuits, build a transition circuit T that proves:
-  • Given previous state commitment, applying deltas yields new state commitment consistent with MMR roots.
-  • No double-spend in nullifier delta.
-  • Anchor increments correctly.
-	•	Build recursion circuit R for proof folding.
-	•	In pcd_core, provide prove and verify APIs.
+1. **Real block data plumbing** – Feed OSS/node_ext from actual chain state, persist manifests, add replay for late wallets.
+2. **Header sync hardening** – Enforce full Equihash/NiPoPoW, persist checkpoints, add peer gossip and CLI diagnostics.
+3. **Security & ops** – Replace static identities, enforce authenticated control channels, tighten access token logic, document secure configs.
+4. **Proof fidelity upgrades** – Remove placeholder proofs, wire Halo2 proving end-to-end, cache parameters, add regression tests/benchmarks.
+5. **Testing & CI** – Add end-to-end integration harness, fuzz/property tests for accumulators/blob protocol/storage migrations, hook into CI.
+6. **User-facing polish** – Improve CLI UX, surface wallet metrics/logs, document workflows, optional REST/telemetry endpoints.
 
-Phase 4: Wallet + OSS
-	•	Wallet:
-  • OOB interface (PQ KEM + AEAD)
-  • Note DB, encrypted store
-  • Sync client: connect to OSS via control protocol, fetch blobs, apply transitions via pcd_core
-  • Spend builder: combine new PCD proof + note spend circuit
-	•	OSS:
-  • Accept registration / subscription tokens from wallets
-  • Periodically generate block deltas + PCD transitions
-  • Publish blobs and send announce messages
-  • Serve fetches
-  • Manage quotas, access control
-
-Phase 5: Validator / Node Extension
-	•	Extend node to validate tx + pcd_blob:
-  • Verify PCD, ensure nullifier non-membership in recent window
-  • Accept orchard spend proof
-  • Append to block
-	•	Pruning: discard older states keeping only needed MMR peaks and commitments.
-
-Phase 6: Header Sync & Bootstrapping
-	•	Implement NiPoPoW or skip proofs to allow new nodes to bootstrap headers + root commitments.
-	•	On boot, wallet can sync from checkpoint + deltas rather than full history.
-
-Phase 7: Hardening, Privacy, PQ Transition Path
-	•	Nullifier derivation: include epoch tag / VRF blinding so OSS cannot correlate positions.
-	•	Token rotation, request padding, batching.
-	•	Fallback local proving if OSS unreachable.
-	•	PQ migration path: optional flag to insert PQ signature witness in PCD for on-chain authentication (if protocol upgrade later).
+Phase 7 remains focused on privacy hardening and PQ upgrade paths once the integration and security milestones land.
 
 ⸻
 

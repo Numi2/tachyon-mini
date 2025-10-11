@@ -48,6 +48,142 @@ pub enum Commands {
         #[command(subcommand)]
         wallet_command: WalletCommands,
     },
+    /// Zcash: Export backup to directory
+    #[cfg(feature = "zcash")]
+    ZcashExportBackup {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Destination directory
+        #[arg(long)]
+        dst: String,
+    },
+    /// Zcash: Export UFVK (ZIP-32)
+    #[cfg(feature = "zcash")]
+    ZcashUfvk {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Account id
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+    },
+    /// Zcash: Export USK (ZIP-32)
+    #[cfg(feature = "zcash")]
+    ZcashUsk {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Account id
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+    },
+    /// Zcash: Generate ZIP-321 payment URI
+    #[cfg(feature = "zcash")]
+    ZcashPayUri {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Destination Unified Address
+        #[arg(long)]
+        to: String,
+        /// Amount (zatoshi)
+        #[arg(long)]
+        amount: u64,
+        /// Optional memo
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// Zcash: Parse ZIP-321 payment URI
+    #[cfg(feature = "zcash")]
+    ZcashParseUri {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// zcash: URI
+        #[arg(long)]
+        uri: String,
+    },
+    /// Zcash: Import backup from directory
+    #[cfg(feature = "zcash")]
+    ZcashImportBackup {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Source directory
+        #[arg(long)]
+        src: String,
+    },
+    /// Zcash: List accounts with UAs
+    #[cfg(feature = "zcash")]
+    ZcashAccounts {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Zcash: Set default account id
+    #[cfg(feature = "zcash")]
+    ZcashSetDefaultAccount {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Account id
+        #[arg(long)]
+        account: u32,
+    },
+    /// Zcash: Rescan from a height to target
+    #[cfg(feature = "zcash")]
+    ZcashRescan {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Start height
+        #[arg(long)]
+        start: u64,
+        /// Target height
+        #[arg(long)]
+        target: u64,
+    },
+    /// Zcash: Set checkpoint height
+    #[cfg(feature = "zcash")]
+    ZcashCheckpoint {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Checkpoint height
+        #[arg(long)]
+        height: u64,
+    },
     /// Simple DEX operations (in-memory)
     Dex {
         #[command(subcommand)]
@@ -228,6 +364,74 @@ pub enum WalletCommands {
         /// Master password
         #[arg(short, long)]
         password: String,
+    },
+    /// Zcash: Import seed and birthday height
+    #[cfg(feature = "zcash")]
+    ZcashImportSeed {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// BIP-39 mnemonic (quoted)
+        #[arg(long)]
+        mnemonic: String,
+        /// Birthday height (mainnet)
+        #[arg(long)]
+        birthday: u64,
+    },
+    /// Zcash: Show Unified Address
+    #[cfg(feature = "zcash")]
+    ZcashUa {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Zcash: Sync to target height
+    #[cfg(feature = "zcash")]
+    ZcashSync {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Target height
+        #[arg(long)]
+        height: u64,
+    },
+    /// Zcash: Get verified balance
+    #[cfg(feature = "zcash")]
+    ZcashBalance {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+    },
+    /// Zcash: Send Orchard TX
+    #[cfg(feature = "zcash")]
+    ZcashSend {
+        /// Wallet database path
+        #[arg(short, long)]
+        db_path: String,
+        /// Master password
+        #[arg(short, long)]
+        password: String,
+        /// Destination Unified Address
+        #[arg(long)]
+        to: String,
+        /// Amount (zatoshi)
+        #[arg(long)]
+        amount: u64,
+        /// Optional memo
+        #[arg(long)]
+        memo: Option<String>,
     },
 }
 
@@ -495,6 +699,51 @@ pub async fn run() -> Result<()> {
     match cli.command {
         Commands::Wallet { wallet_command } => {
             execute_wallet_command(wallet_command, &cli.data_dir).await
+        }
+        #[cfg(feature = "zcash")]
+        Commands::ZcashUfvk { db_path, password, account } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let ufvk = wallet.zcash_export_ufvk(account).await?;
+            println!("{}", ufvk);
+            Ok(())
+        }
+        #[cfg(feature = "zcash")]
+        Commands::ZcashUsk { db_path, password, account } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let usk = wallet.zcash_export_usk(account).await?;
+            println!("{}", usk);
+            Ok(())
+        }
+        #[cfg(feature = "zcash")]
+        Commands::ZcashPayUri { db_path, password, to, amount, memo } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let uri = wallet.zcash_generate_payment_uri(&to, amount, memo).await?;
+            println!("{}", uri);
+            Ok(())
+        }
+        #[cfg(feature = "zcash")]
+        Commands::ZcashParseUri { db_path, password, uri } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let (ua, amount, memo) = wallet.zcash_parse_payment_uri(&uri).await?;
+            let out = serde_json::json!({"ua": ua, "amount_zat": amount, "memo": memo});
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            Ok(())
         }
         Commands::Dex { dex_command } => execute_dex_command(dex_command, cli.format, cli.non_interactive).await,
         Commands::Network { network_command } => execute_network_command(network_command).await,
@@ -848,6 +1097,56 @@ async fn execute_wallet_command(command: WalletCommands, data_dir: &str) -> Resu
             let wallet = TachyonWallet::new(cfg).await?;
             wallet.sync().await?;
             println!("Wallet synced successfully");
+        }
+        #[cfg(feature = "zcash")]
+        WalletCommands::ZcashImportSeed { db_path, password, mnemonic, birthday } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            wallet.zcash_import_seed(&mnemonic, birthday).await?;
+            println!("ok");
+        }
+        #[cfg(feature = "zcash")]
+        WalletCommands::ZcashUa { db_path, password } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let ua = wallet.zcash_get_unified_address().await?;
+            println!("{}", ua);
+        }
+        #[cfg(feature = "zcash")]
+        WalletCommands::ZcashSync { db_path, password, height } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let (scanned, bal) = wallet.zcash_sync_to_height(height).await?;
+            println!("scanned_height={} balance_zat={}", scanned, bal);
+        }
+        #[cfg(feature = "zcash")]
+        WalletCommands::ZcashBalance { db_path, password } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let bal = wallet.zcash_get_balance().await?;
+            println!("{}", bal);
+        }
+        #[cfg(feature = "zcash")]
+        WalletCommands::ZcashSend { db_path, password, to, amount, memo } => {
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let mut wallet = TachyonWallet::new(cfg).await?;
+            let (txid, bal) = wallet.zcash_send(&to, amount, memo).await?;
+            println!("txid={} balance_zat={}", txid, bal);
         }
     }
 

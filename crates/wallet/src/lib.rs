@@ -4,11 +4,15 @@
 //! PCD state synchronization, and transaction construction.
 
 use anyhow::{anyhow, Result};
+#[cfg(feature = "pcd")]
 use net_iroh::{BlobKind, Cid, ControlMessage, TachyonNetwork, SyncManifest};
+#[cfg(feature = "pcd")]
 use node_ext as _node_ext_dep_check;
+#[cfg(feature = "pcd")]
 use pcd_core::{
     PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier, PcdTransition,
 };
+#[cfg(feature = "pcd")]
 use pq_crypto::{
     derive_nf2, derive_spend_nullifier_key, KyberPublicKey, KyberSecretKey,
     OutOfBandPayment, SimpleKem,
@@ -20,9 +24,15 @@ use tokio::{
     sync::{broadcast, mpsc, RwLock},
     task::JoinHandle,
 };
+#[cfg(feature = "pcd")]
 use reqwest::Client as HttpClient;
+#[cfg(feature = "pcd")]
 use accum_mmr::{MmrAccumulator, MmrWitness};
+#[cfg(feature = "pcd")]
 use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, OwnerId as DexOwnerId, OrderId as DexOrderId, OrderBookSnapshot as DexSnapshot, Trade as DexTrade};
+
+#[cfg(feature = "zcash")]
+mod zcash;
 
 /// Wallet configuration
 #[derive(Debug, Clone)]
@@ -194,62 +204,8 @@ pub struct WalletNote {
     pub memo: Option<String>,
 }
 
-/// Convert encrypted note to wallet note
-impl TryFrom<EncryptedNote> for WalletNote {
-    type Error = anyhow::Error;
-
-    fn try_from(encrypted_note: EncryptedNote) -> Result<Self> {
-        // NOTE: Proper decryption requires access to the master key; WalletNote::try_from
-        // is used in contexts where we already have decrypted note data. For now, we expect
-        // the encrypted payload to be structured as:
-        // [commitment(32) | value(8) | recipient(32) | rseed(32) | memo_len(2) | memo(..)]
-        let data = &encrypted_note.encrypted_data;
-        if data.len() < NOTE_COMMITMENT_SIZE + 8 + 32 + 32 + 2 {
-            return Err(anyhow!("EncryptedNote payload too short for parsing"));
-        }
-
-        let mut offset = 0usize;
-        let mut commitment = [0u8; NOTE_COMMITMENT_SIZE];
-        commitment.copy_from_slice(&data[offset..offset + NOTE_COMMITMENT_SIZE]);
-        offset += NOTE_COMMITMENT_SIZE;
-
-        let mut value_bytes = [0u8; 8];
-        value_bytes.copy_from_slice(&data[offset..offset + 8]);
-        let value = u64::from_le_bytes(value_bytes);
-        offset += 8;
-
-        let mut recipient = [0u8; 32];
-        recipient.copy_from_slice(&data[offset..offset + 32]);
-        offset += 32;
-
-        let mut rseed = [0u8; 32];
-        rseed.copy_from_slice(&data[offset..offset + 32]);
-        offset += 32;
-
-        let mut memo_len_bytes = [0u8; 2];
-        memo_len_bytes.copy_from_slice(&data[offset..offset + 2]);
-        let memo_len = u16::from_le_bytes(memo_len_bytes) as usize;
-        offset += 2;
-
-        let memo = if memo_len > 0 && offset + memo_len <= data.len() {
-            Some(String::from_utf8_lossy(&data[offset..offset + memo_len]).to_string())
-        } else {
-            None
-        };
-
-        Ok(WalletNote {
-            commitment,
-            value,
-            recipient,
-            rseed,
-            position: encrypted_note.position,
-            block_height: encrypted_note.block_height,
-            is_spent: encrypted_note.is_spent,
-            witness_data: Vec::new(),
-            memo,
-        })
-    }
-}
+// Disabled: parsing EncryptedNote without decryption encourages misuse.
+// Use parse_wallet_note_from_plaintext with proper decryption instead.
 
 /// Parse a wallet note from plaintext bytes
 ///
@@ -313,22 +269,31 @@ pub struct TachyonWallet {
     /// Encrypted database
     database: Arc<WalletDatabase>,
     /// Network client
+    #[cfg(feature = "pcd")]
     network: Arc<TachyonNetwork>,
     /// PCD state manager
+    #[cfg(feature = "pcd")]
     pcd_manager: Arc<RwLock<PcdStateManager<SimplePcdVerifier>>>,
     /// PCD sync manager
+    #[cfg(feature = "pcd")]
     sync_manager: Arc<RwLock<Option<PcdSyncManager<WalletSyncClient, SimplePcdVerifier>>>>,
     /// OOB payment handler
+    #[cfg(feature = "pcd")]
     oob_handler: Arc<RwLock<OutOfBandHandler>>,
     /// Background sync task
     sync_task: Option<JoinHandle<()>>,
     /// Shutdown channel
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
     /// In-memory DEX service (single-market) for demo
+    #[cfg(feature = "pcd")]
     dex: Arc<DexService>,
+    /// Optional Zcash context
+    #[cfg(feature = "zcash")]
+    zcash: Option<zcash::ZcashContext>,
 }
 
 /// Out-of-band payment handler
+#[cfg(feature = "pcd")]
 pub struct OutOfBandHandler {
     /// Our Kyber secret key for decrypting OOB payments
     secret_key: KyberSecretKey,
@@ -336,6 +301,7 @@ pub struct OutOfBandHandler {
     pending_payments: HashMap<[u8; 32], OutOfBandPayment>, // Keyed by payment hash
 }
 
+#[cfg(feature = "pcd")]
 impl OutOfBandHandler {
     /// Create a new OOB handler
     pub fn new(secret_key: KyberSecretKey) -> Result<Self> {
@@ -423,6 +389,7 @@ impl OutOfBandHandler {
 }
 
 /// Wallet sync client implementation
+#[cfg(feature = "pcd")]
 pub struct WalletSyncClient {
     /// Network client reference
     network: Arc<TachyonNetwork>,
@@ -430,6 +397,7 @@ pub struct WalletSyncClient {
     announcements: broadcast::Receiver<(BlobKind, Cid, u64, usize, String)>,
 }
 
+#[cfg(feature = "pcd")]
 impl WalletSyncClient {
     /// Create a new sync client
     pub fn new(network: Arc<TachyonNetwork>) -> Self {
@@ -463,12 +431,14 @@ impl WalletSyncClient {
         }
     }
 }
+#[cfg(feature = "pcd")]
 /// Minimal Zebra nullifier client (HTTP JSON), feature-gated by env var
 struct ZebraNullifierClient {
     base_url: String,
     http: HttpClient,
 }
 
+#[cfg(feature = "pcd")]
 impl ZebraNullifierClient {
     fn new(base_url: String) -> Self {
         Self { base_url, http: HttpClient::new() }
@@ -496,6 +466,7 @@ impl ZebraNullifierClient {
 }
 
 
+#[cfg(feature = "pcd")]
 impl PcdSyncClient for WalletSyncClient {
     async fn fetch_state(&self, height: u64) -> Result<Option<PcdState>> {
         // Request state blob by deterministic CID from height via network index
@@ -587,27 +558,37 @@ impl TachyonWallet {
         let database = Arc::new(WalletDatabase::new(db_path, &config.master_password).await?);
 
         // Initialize network client
-        let network_path = Path::new(&config.network_config.data_dir);
-        let network = Arc::new(TachyonNetwork::new(network_path).await?);
+        #[cfg(feature = "pcd")]
+        let network = {
+            let network_path = Path::new(&config.network_config.data_dir);
+            Arc::new(TachyonNetwork::new(network_path).await?)
+        };
 
         // Initialize PCD state manager
+        #[cfg(feature = "pcd")]
         let verifier = SimplePcdVerifier;
+        #[cfg(feature = "pcd")]
         let pcd_manager = Arc::new(RwLock::new(PcdStateManager::new(verifier)));
 
         // Ensure OOB keypair exists and load it
+        #[cfg(feature = "pcd")]
         let (_pk, sk) = database.get_or_generate_oob_keypair().await?;
 
         // Initialize OOB handler with persisted secret key
+        #[cfg(feature = "pcd")]
         let oob_handler = Arc::new(RwLock::new(OutOfBandHandler::new(sk)?));
 
         // Initialize sync manager
+        #[cfg(feature = "pcd")]
         let sync_client = WalletSyncClient::new(network.clone());
+        #[cfg(feature = "pcd")]
         let sync_manager = Arc::new(RwLock::new(Some(PcdSyncManager::new(
             sync_client,
             SimplePcdVerifier,
         ))));
 
         // Default: enable persistent DEX engine under the wallet DB path.
+        #[cfg(feature = "pcd")]
         let dex = {
             let p = std::path::Path::new(&config.db_path).join("dex_sled");
             if let Ok(engine) = dex::SledEngine::open(&p) {
@@ -620,17 +601,25 @@ impl TachyonWallet {
         Ok(Self {
             config,
             database,
+            #[cfg(feature = "pcd")]
             network,
+            #[cfg(feature = "pcd")]
             pcd_manager,
+            #[cfg(feature = "pcd")]
             sync_manager,
+            #[cfg(feature = "pcd")]
             oob_handler,
             sync_task: None,
             shutdown_tx: None,
+            #[cfg(feature = "pcd")]
             dex: Arc::new(dex),
+            #[cfg(feature = "zcash")]
+            zcash: None,
         })
     }
 
     /// Initialize wallet with genesis state
+    #[cfg(feature = "pcd")]
     pub async fn initialize(&mut self) -> Result<()> {
         // Check if we already have a PCD state
         let current_state = self.database.get_pcd_state().await;
@@ -688,8 +677,176 @@ impl TachyonWallet {
         Ok(())
     }
 
+    #[cfg(not(feature = "pcd"))]
+    pub async fn initialize(&mut self) -> Result<()> {
+        // No-op when PCD is disabled
+        Ok(())
+    }
+
+    // ===== Zcash: seed and address APIs =====
+    #[cfg(all(feature = "zcash", feature = "zcash_mnemonic"))]
+    /// Import a Zcash seed (BIP-39 mnemonic) and birthday height (mainnet). Overwrites existing.
+    pub async fn zcash_import_seed(&self, mnemonic: &str, birthday_height: u64) -> Result<()> {
+        // Mnemonic parsing is disabled; accept raw string for now
+        self.database.set_zcash_seed(mnemonic, birthday_height).await
+    }
+
+    #[cfg(all(feature = "zcash", feature = "zcash_mnemonic"))]
+    /// Export the stored Zcash seed and birthday height.
+    pub async fn zcash_export_seed(&self) -> Result<(String, u64)> {
+        self.database
+            .get_zcash_seed()
+            .await
+            .ok_or_else(|| anyhow!("No Zcash seed stored"))
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Get a Unified Address (UA) for receiving on mainnet/testnet based on stored seed.
+    pub async fn zcash_get_unified_address(&mut self) -> Result<String> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.get_ua().await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Connect to lightwalletd and scan up to the given height. Returns scanned height and balance (zatoshi).
+    pub async fn zcash_sync_to_height(&mut self, target_height: u64) -> Result<(u64, u64)> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_mut().unwrap();
+        ctx.sync_to_height(target_height).await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Get current Orchard spendable balance (zatoshi) per derived account 0.
+    pub async fn zcash_get_balance(&mut self) -> Result<u64> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.get_balance().await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Send an Orchard transaction to `to_ua` with `amount_zat` and optional `memo`.
+    pub async fn zcash_send(
+        &mut self,
+        to_ua: &str,
+        amount_zat: u64,
+        memo: Option<String>,
+    ) -> Result<(String, u64)> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_mut().unwrap();
+        ctx.send_shielded(to_ua, amount_zat, memo.as_deref()).await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Multi-account: set default account id
+    pub async fn zcash_set_default_account(&mut self, account: u32) -> Result<()> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.set_default_account(account)
+    }
+
+    #[cfg(feature = "zcash")]
+    /// List accounts with UAs (best-effort)
+    pub async fn zcash_list_accounts(&mut self) -> Result<Vec<(u32, String)>> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.list_accounts().await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Rescan from a height to a target height
+    pub async fn zcash_rescan(&mut self, start_height: u64, target_height: u64) -> Result<u64> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_mut().unwrap();
+        ctx.rescan_from_height(start_height, target_height).await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Set a local checkpoint height for faster future scans
+    pub async fn zcash_set_checkpoint(&mut self, height: u64) -> Result<()> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.set_checkpoint(height).await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Export Zcash wallet backup to directory
+    pub async fn zcash_export_backup(&mut self, dst_dir: &str) -> Result<()> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.export_backup(dst_dir).await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Import Zcash wallet backup from directory
+    pub async fn zcash_import_backup(&mut self, src_dir: &str) -> Result<()> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.import_backup(src_dir).await
+    }
+
+    #[cfg(feature = "zcash")]
+    async fn ensure_zcash_context_initialized(&mut self) -> Result<()> {
+        if self.zcash.is_some() {
+            return Ok(());
+        }
+        let (mnemonic, birthday) = self
+            .database
+            .get_zcash_seed()
+            .await
+            .ok_or_else(|| anyhow!("No Zcash seed stored"))?;
+
+        // Load env config
+        let lwd_url = std::env::var("ZCASH_LWD_URL").unwrap_or_else(|_| "https://mainnet.lightwalletd.com:9067".to_string());
+        let network = std::env::var("ZCASH_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+
+        let ctx = zcash::ZcashContext::new(&self.config.db_path, &mnemonic, birthday, &lwd_url, &network).await?;
+        self.zcash = Some(ctx);
+        Ok(())
+    }
+
+    // ===== Zcash: key export and ZIP-321 helpers =====
+    #[cfg(feature = "zcash")]
+    /// Export UFVK for an account (ZIP-32)
+    pub async fn zcash_export_ufvk(&mut self, account: u32) -> Result<String> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.export_ufvk(account).await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Export USK for an account (ZIP-32)
+    pub async fn zcash_export_usk(&mut self, account: u32) -> Result<String> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.export_usk(account).await
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Generate a ZIP-321 payment URI
+    pub async fn zcash_generate_payment_uri(
+        &mut self,
+        to_ua: &str,
+        amount_zat: u64,
+        memo: Option<String>,
+    ) -> Result<String> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.generate_payment_uri(to_ua, amount_zat, memo.as_deref()).map_err(Into::into)
+    }
+
+    #[cfg(feature = "zcash")]
+    /// Parse a ZIP-321 payment URI -> (ua, amount_zat, memo)
+    pub async fn zcash_parse_payment_uri(&mut self, uri: &str) -> Result<(String, u64, Option<String>)> {
+        self.ensure_zcash_context_initialized().await?;
+        let ctx = self.zcash.as_ref().unwrap();
+        ctx.parse_payment_uri(uri)
+    }
+
     /// Start background synchronization task
+    #[cfg(feature = "pcd")]
     async fn start_sync_task(&mut self) -> Result<()> {
+        if self.sync_task.is_some() { return Ok(()); }
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
         self.shutdown_tx = Some(shutdown_tx);
 
@@ -715,13 +872,14 @@ impl TachyonWallet {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        // Determine latest observed height once for this tick
+                        let latest_height = {
+                            let published = network.get_published().await;
+                            published.iter().map(|p| p.2).max().unwrap_or(0)
+                        };
+
                         // Perform sync operation
                         if let Some(sync_mgr) = sync_manager.write().await.as_mut() {
-                            // Sync to the latest observed height from network announcements
-                            let latest_height = {
-                                let published = network.get_published().await;
-                                published.iter().map(|p| p.2).max().unwrap_or(0)
-                            };
                             if let Err(e) = sync_mgr.sync_to_height(latest_height).await {
                                 tracing::error!("Sync failed: {}", e);
                             }
@@ -734,7 +892,7 @@ impl TachyonWallet {
                             if let Ok(spend_secret) = database.get_or_generate_spend_secret().await {
                                 let snk = derive_spend_nullifier_key(&spend_secret);
                                 // Determine a starting height for fetching nullifiers
-                                let start_h = 0u64;
+                                let start_h = database.get_chain_nf_last_height().await;
                                 if let Ok(chain_nfs) = client.fetch_nullifiers_since(start_h).await {
                                     let chain_set: std::collections::HashSet<[u8;32]> = chain_nfs.into_iter().collect();
                                     for enc_note in unspent {
@@ -752,6 +910,12 @@ impl TachyonWallet {
                                             }
                                         }
                                     }
+                                    // Advance last scanned height to latest observed height
+                                    let latest_height = {
+                                        let published = network.get_published().await;
+                                        published.iter().map(|p| p.2).max().unwrap_or(0)
+                                    };
+                                    let _ = database.set_chain_nf_last_height(latest_height).await;
                                 }
                             }
                         }
@@ -814,6 +978,9 @@ impl TachyonWallet {
         Ok(())
     }
 
+    #[cfg(not(feature = "pcd"))]
+    async fn start_sync_task(&mut self) -> Result<()> { Ok(()) }
+
     /// Stop the wallet and cleanup resources
     pub async fn shutdown(&mut self) -> Result<()> {
         // Stop sync task
@@ -825,8 +992,11 @@ impl TachyonWallet {
             sync_task.await?;
         }
 
-        // Gracefully shutdown network router
-        self.network.shutdown().await?;
+        #[cfg(feature = "pcd")]
+        {
+            // Gracefully shutdown network router
+            self.network.shutdown().await?;
+        }
 
         Ok(())
     }
@@ -835,16 +1005,28 @@ impl TachyonWallet {
     pub async fn get_stats(&self) -> Result<WalletStats> {
         let db_stats = self.database.get_stats().await;
 
+        #[cfg(feature = "pcd")]
+        let current_anchor = self
+            .pcd_manager
+            .read()
+            .await
+            .current_state()
+            .map(|s| s.anchor_height);
+
+        #[cfg(not(feature = "pcd"))]
+        let current_anchor: Option<u64> = None;
+
+        #[cfg(feature = "pcd")]
+        let pending_oob = self.oob_handler.read().await.pending_payments.len();
+
+        #[cfg(not(feature = "pcd"))]
+        let pending_oob: usize = 0;
+
         Ok(WalletStats {
             db_stats,
-            network_connected: true, // Would check actual connection
-            current_anchor_height: self
-                .pcd_manager
-                .read()
-                .await
-                .current_state()
-                .map(|s| s.anchor_height),
-            pending_payments: self.oob_handler.read().await.pending_payments.len(),
+            network_connected: cfg!(feature = "pcd"),
+            current_anchor_height: current_anchor,
+            pending_payments: pending_oob,
         })
     }
 
@@ -869,6 +1051,7 @@ impl TachyonWallet {
     }
 
     /// Place a limit order and lock funds accordingly. Returns order id and trades executed.
+    #[cfg(feature = "pcd")]
     pub async fn place_limit_order(&self, side: DexSide, price: u64, qty: u64) -> Result<(DexOrderId, Vec<DexTrade>)> {
         match side {
             DexSide::Bid => {
@@ -880,22 +1063,23 @@ impl TachyonWallet {
             }
         }
 
-        let (id, trades) = self.dex.place_limit(DexOwnerId(1), side, DexPrice(price), DexQty(qty))?;
+        let owner = DexOwnerId(self.database.get_or_create_dex_owner_id().await?);
+        let (id, trades) = self.dex.place_limit(owner, side, DexPrice(price), DexQty(qty))?;
         // Settle trades: move between locked and available balances
         for t in &trades {
             match t.taker_side {
                 DexSide::Bid => {
                     // We are the taker (bid) only if owner matches; for demo we assume owner id=1
-                    if t.taker_owner.0 == 1 {
+                    if t.taker_owner.0 == owner.0 {
                         self.database.settle_bid_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
-                    } else if t.maker_owner.0 == 1 {
+                    } else if t.maker_owner.0 == owner.0 {
                         self.database.settle_ask_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
                     }
                 }
                 DexSide::Ask => {
-                    if t.taker_owner.0 == 1 {
+                    if t.taker_owner.0 == owner.0 {
                         self.database.settle_ask_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
-                    } else if t.maker_owner.0 == 1 {
+                    } else if t.maker_owner.0 == owner.0 {
                         self.database.settle_bid_fill(t.quantity.0, t.price.0.saturating_mul(t.quantity.0)).await?;
                     }
                 }
@@ -907,6 +1091,7 @@ impl TachyonWallet {
     }
 
     /// Place a market order. Locks max expected spend for bids (estimation) and base for asks.
+    #[cfg(feature = "pcd")]
     pub async fn place_market_order(&self, side: DexSide, qty: u64) -> Result<(DexOrderId, Vec<DexTrade>)> {
         match side {
             DexSide::Bid => {
@@ -914,14 +1099,15 @@ impl TachyonWallet {
                 let (filled, cost) = self.dex.estimate_market_cost(DexSide::Bid, DexQty(qty));
                 if filled == 0 { return Ok((DexOrderId(0), Vec::new())); }
                 self.database.lock_usdc(cost).await?;
-                let (id, trades) = self.dex.place_market(DexOwnerId(1), DexSide::Bid, DexQty(qty))?;
+                let owner = DexOwnerId(self.database.get_or_create_dex_owner_id().await?);
+                let (id, trades) = self.dex.place_market(owner, DexSide::Bid, DexQty(qty))?;
                 // Settle trades and refund any unused locked USDC
                 let mut spent = 0u64;
                 for t in &trades {
-                    if t.taker_owner.0 == 1 {
+                    if t.taker_owner.0 == owner.0 {
                         spent = spent.saturating_add(t.price.0.saturating_mul(t.quantity.0));
                         self.database.deposit_base(t.quantity.0).await?;
-                    } else if t.maker_owner.0 == 1 {
+                    } else if t.maker_owner.0 == owner.0 {
                         self.database.spend_locked_base(t.quantity.0).await?;
                         self.database.deposit_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
                     }
@@ -932,13 +1118,14 @@ impl TachyonWallet {
             }
             DexSide::Ask => {
                 self.database.lock_base(qty).await?;
-                let (id, trades) = self.dex.place_market(DexOwnerId(1), DexSide::Ask, DexQty(qty))?;
+                let owner = DexOwnerId(self.database.get_or_create_dex_owner_id().await?);
+                let (id, trades) = self.dex.place_market(owner, DexSide::Ask, DexQty(qty))?;
                 let mut sold = 0u64;
                 for t in &trades {
-                    if t.taker_owner.0 == 1 {
+                    if t.taker_owner.0 == owner.0 {
                         sold = sold.saturating_add(t.quantity.0);
                         self.database.deposit_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
-                    } else if t.maker_owner.0 == 1 {
+                    } else if t.maker_owner.0 == owner.0 {
                         self.database.spend_locked_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
                         self.database.deposit_base(t.quantity.0).await?;
                     }
@@ -951,6 +1138,7 @@ impl TachyonWallet {
     }
 
     /// Cancel an order and unlock remaining locked funds.
+    #[cfg(feature = "pcd")]
     pub async fn cancel_order(&self, id: DexOrderId) -> Result<bool> {
         if let Some(order) = self.dex.get_order(id) {
             let ok = self.dex.cancel(id)?;
@@ -972,18 +1160,22 @@ impl TachyonWallet {
     }
 
     /// Get orderbook snapshot
+    #[cfg(feature = "pcd")]
     pub fn orderbook(&self, depth: usize) -> DexSnapshot { self.dex.orderbook(depth) }
 
     /// Get recent trades
+    #[cfg(feature = "pcd")]
     pub fn trades(&self, limit: usize) -> Vec<DexTrade> { self.dex.recent_trades(limit) }
 
     /// Receive an out-of-band payment
+    #[cfg(feature = "pcd")]
     pub async fn receive_oob_payment(&self, payment: OutOfBandPayment) -> Result<[u8; 32]> {
         let mut handler = self.oob_handler.write().await;
         handler.add_pending_payment(payment)
     }
 
     /// Process a pending OOB payment
+    #[cfg(feature = "pcd")]
     pub async fn process_oob_payment(&self, payment_hash: &[u8; 32]) -> Result<Option<WalletNote>> {
         let mut handler = self.oob_handler.write().await;
         let note_opt = handler.process_payment(payment_hash)?;
@@ -1019,6 +1211,7 @@ impl TachyonWallet {
     }
 
     /// Create an out-of-band payment for sending
+    #[cfg(feature = "pcd")]
     pub async fn create_oob_payment(
         &self,
         recipient_pk: KyberPublicKey,
@@ -1029,6 +1222,7 @@ impl TachyonWallet {
     }
 
     /// Get our public key for OOB payments
+    #[cfg(feature = "pcd")]
     pub async fn get_oob_public_key(&self) -> KyberPublicKey {
         // Retrieve from storage to avoid accidental regeneration
         if let Ok(Some((pk, _))) = self.database.get_oob_keypair().await {
@@ -1041,6 +1235,7 @@ impl TachyonWallet {
     }
 
     /// Send an out-of-band payment over Iroh to a specific peer.
+    #[cfg(feature = "pcd")]
     pub async fn send_oob_over_iroh(&self, peer: net_iroh::NodeId, payment: OutOfBandPayment) -> Result<[u8; 32]> {
         payment.verify()?;
         let h = blake3::hash(payment.encrypted_metadata.as_slice());
@@ -1053,6 +1248,7 @@ impl TachyonWallet {
     }
 
     /// Subscribe to incoming out-of-band payments.
+    #[cfg(feature = "pcd")]
     pub fn subscribe_incoming_oob(&self) -> tokio::sync::broadcast::Receiver<([u8; 32], Vec<u8>, net_iroh::NodeId)> {
         self.network.subscribe_oob_payments()
     }
@@ -1158,6 +1354,7 @@ impl TachyonWallet {
     }
 
     /// Build a node transaction with membership witnesses for spent inputs
+    #[cfg(feature = "pcd")]
     pub async fn build_node_transaction(
         &self,
         spent_inputs: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
@@ -1249,7 +1446,17 @@ impl TachyonWallet {
         Ok(tx)
     }
 
+    #[cfg(not(feature = "pcd"))]
+    pub async fn build_node_transaction(
+        &self,
+        _spent_inputs: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
+        _output_commitments: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
+    ) -> Result<()> {
+        Err(anyhow!("PCD feature disabled"))
+    }
+
     /// Sync wallet state to latest
+    #[cfg(feature = "pcd")]
     pub async fn sync(&self) -> Result<()> {
         let mut sync_manager = self.sync_manager.write().await;
         if let Some(ref mut sync_mgr) = sync_manager.as_mut() {
@@ -1259,10 +1466,17 @@ impl TachyonWallet {
         Ok(())
     }
 
+    #[cfg(not(feature = "pcd"))]
+    pub async fn sync(&self) -> Result<()> { Ok(()) }
+
     /// Get current PCD state
+    #[cfg(feature = "pcd")]
     pub async fn get_pcd_state(&self) -> Option<PcdState> {
         self.pcd_manager.read().await.current_state().cloned()
     }
+
+    #[cfg(not(feature = "pcd"))]
+    pub async fn get_pcd_state(&self) -> Option<()> { None }
 
     /// Recompute and persist MMR witnesses for all unspent notes after adopting a new PCD state
     async fn update_witnesses_after_pcd(
@@ -1391,6 +1605,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_wallet_initialization() {
+        #[cfg(not(feature = "pcd"))]
+        {
+            // If PCD is disabled, initialize() is a no-op and should not fail.
+            let mut config = WalletConfig::default();
+            config.db_path = tempfile::tempdir()
+                .unwrap()
+                .path()
+                .join("test_wallet")
+                .to_string_lossy()
+                .to_string();
+            let mut wallet = TachyonWallet::new(config).await.unwrap();
+            wallet.initialize().await.unwrap();
+            return;
+        }
         let mut config = WalletConfig::default();
         config.db_path = tempfile::tempdir()
             .unwrap()
@@ -1402,12 +1630,17 @@ mod tests {
         let mut wallet = TachyonWallet::new(config).await.unwrap();
         wallet.initialize().await.unwrap();
 
-        let pcd_state = wallet.get_pcd_state().await;
-        assert!(pcd_state.is_some());
+        #[cfg(feature = "pcd")]
+        {
+            let pcd_state = wallet.get_pcd_state().await;
+            assert!(pcd_state.is_some());
+        }
     }
 
     #[tokio::test]
     async fn test_oob_payment() {
+        #[cfg(not(feature = "pcd"))]
+        return;
         let config = WalletConfig::default();
         let wallet = TachyonWallet::new(config).await.unwrap();
 

@@ -956,7 +956,7 @@ impl HeaderSyncManager {
                     solution: solution_bytes,
                 };
                 // Strict PoW via Zebra if enabled in config
-                if pow.disable_pow_validation { return Some(hdr); }
+                if _pow.disable_pow_validation { return Some(hdr); }
                 // Validate Equihash solution and difficulty target via Zebra's internal checks
                 if zebra_header.is_equihash_solution_valid() && zebra_header.work().is_ok() {
                     return Some(hdr);
