@@ -123,19 +123,12 @@ Design choices
 - Accumulator backends: start with Poseidon-based folding; can swap to Merkle or vector commitments (KZG) with the same unified API.
 
 
-Roadmap
--------
-- Integrate concrete SMT/VC membership and non-membership witnesses behind the unified escape event
-- Batch-friendly folding/I VC for even smaller recursion costs
-- Parameter/key persistence and production-grade setup flows
-- CLI examples that build and verify unified block/chain proofs end-to-end
-
 
 Credits
 -------
 Tachyon, Zcash, and especially Sean Bowe’s writings 
 
-Mini Tachyon
+Mini Tachyon (older version)
 ============
 
 Rust workspace that prototypes a Tachyon-style shielded system: wallet with proof-carrying data (PCD), oblivious sync, pruning validator, and content-addressed networking.
@@ -195,6 +188,9 @@ Advantages
 	•	Future-proof: recursive design allows integration with folding and PQ-friendly accumulators.
 
 
+
+
+even older version
 ------------------
 - Two trees:
   - Tree 1: all coin commitments ever created (append-only).
@@ -230,25 +226,7 @@ What this is
  - **Pruning journals**: node writes per-block journals and prunes beyond a retention window.
 
 
-Workspace layout
-----------------
-`crates/`:
-- `net_iroh`: network layer over iroh/iroh-blobs. Control messages, blob publish/fetch, tickets, and per-height `SyncManifest` with `BlobKind::Manifest`.
-- `accum_mmr`: append-only Merkle Mountain Range, deltas, witness maintenance.
-- `accum_set`: sparse set accumulator for nullifiers, batched deltas.
-- `pcd_core`: PCD state, transitions, verification glue. Uses Halo2 proofs for transitions.
-- `circuits`: Halo2 transition circuit with Poseidon binding; real prover/verifier.
-- `wallet`: high-level wallet API: DB, sync loop consuming Manifests, OOB payments, NF2 nullifiers, optional Zebra integration.
-- `oss_service`: publishes per-height Manifests, commitment/nullifier deltas, and PCD transitions; access tokens & rate limits.
-- `node_ext`: validator shim: verify PCD, enforce canonical nullifier uniqueness, match anchor roots, prune.
-- `header_sync`: simple checkpoint/header bootstrap.
-- `pq_crypto`: Kyber KEM + AES-GCM for OOB; NF2 PRFs (`derive_spend_nullifier_key`, `derive_nf2`); signing helpers.
-- `storage`: encrypted wallet DB: notes, PCD checkpoints, witnesses, OOB keys, and an encrypted spend secret.
-- `cli`: `tachyon` command; wallet and network subcommands.
-- `bench`: async harness to exercise MMR, PCD, network, crypto, storage.
-- `qerkle`: dynamic-hash Merkle tree (BLAKE3 + Poseidon) with Kyber-encrypted metadata and inclusion proofs.
-
-
+Goal for unified accumulator
 Tachygrams and Tachystamps (Prototype)
 --------------------------------------
 Tachyon-style shielded flows collapse commitments and nullifiers into indistinguishable 32-byte blobs called tachygrams and produce a single aggregated proof per transaction or block, called a tachystamp.
@@ -263,8 +241,7 @@ Tachyon-style shielded flows collapse commitments and nullifiers into indistingu
   - Built via `pcd_core::tachyon::Tachystamp::new(anchor, grams, actions, proofs)` using Halo2 recursion.
   - Node verifies the aggregated proof and that anchor roots/height match the canonical state.
 
-What’s new (ease-of-use)
-------------------------
+
 - `TachystampBuilder` (ergonomic API): construct stamps from simple hex strings without touching low-level types.
   - `TachystampBuilder::new(height, mmr_hex, nulls_hex)` → `.add_gram_hex(..)` / `.add_grams_csv(..)` → `.add_action_pair_hex(left_hex, right_hex, [sig_hex])` → `.build()`.
 - Two new CLI helpers for fast experiments, no wallet required:
