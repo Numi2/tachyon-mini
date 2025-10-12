@@ -1,0 +1,22 @@
+# numiproof/Cargo.toml
+[package]
+name = "numiproof"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Post-quantum hash-based zero-knowledge proofs using BLAKE3: non-interactive 3-coloring via Fiat–Shamir"
+
+keywords = ["zero-knowledge", "zk", "post-quantum", "blake3", "fiat-shamir"]
+categories = ["cryptography"]
+
+[dependencies]
+blake3 = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+bincode = "1"
+rand = "0.8"

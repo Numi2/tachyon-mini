@@ -1,5 +1,5 @@
 //! R1CS recorder and drivers for non-uniform circuits.
-//!
+//! Numan Thabit 2025
 //! Provides:
 //! - Minimal rank-1 constraint system (R1CS) recorder with deterministic ordering
 //! - Linear combinations with constants
@@ -15,6 +15,19 @@ use serde::{Serialize, Deserialize};
 
 use crate::circuit::Driver;
 use crate::drivers::PublicInput;
+
+/// Escape hatch events allow recording non-R1CS semantics alongside constraints.
+/// Backends may interpret these to add native gadgets (e.g., Poseidon, lookups).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum EscapeEvent {
+    /// Poseidon2-like permutation invocation with a tag for domain separation.
+    /// inputs/outputs refer to variable indices in this recorder.
+    Poseidon2 { inputs: Vec<Var>, outputs: Vec<Var>, tag: u64 },
+    /// A foreign gadget identified by name with opaque data payload.
+    Foreign { name: String, inputs: Vec<Var>, outputs: Vec<Var>, data: Vec<u8> },
+    /// A lookup into a table identified by an application-specific id.
+    Lookup { table_id: u32, cols: Vec<Var> },
+}
 
 /// Unique identifier for a variable within the recorder
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -75,6 +88,8 @@ pub struct R1csRecorder<F: Field> {
     pub constraints: Vec<Constraint<F>>,
     /// Optional witness assignment for variables (witness values only)
     pub assignments: HashMap<Var, F>,
+    /// Escape hatch events recorded in-order
+    pub escapes: Vec<EscapeEvent>,
 }
 
 impl<F: Field> Default for R1csRecorder<F> {
@@ -85,6 +100,7 @@ impl<F: Field> Default for R1csRecorder<F> {
             vars: Vec::new(),
             constraints: Vec::new(),
             assignments: HashMap::new(),
+            escapes: Vec::new(),
         }
     }
 }
@@ -137,6 +153,21 @@ impl<F: Field> R1csRecorder<F> {
     pub fn enforce_zero(&mut self, label: Option<&str>, lc: LinearCombination<F>) {
         // Encode as lc * 1 = 0
         self.enforce_mul_eq(label, lc, LinearCombination::one(), LinearCombination::zero());
+    }
+
+    /// Record a Poseidon2 escape event with explicit inputs/outputs and a tag.
+    pub fn emit_poseidon2(&mut self, inputs: &[Var], outputs: &[Var], tag: u64) {
+        self.escapes.push(EscapeEvent::Poseidon2 { inputs: inputs.to_vec(), outputs: outputs.to_vec(), tag });
+    }
+
+    /// Record a named foreign gadget with an opaque payload.
+    pub fn emit_foreign(&mut self, name: &str, inputs: &[Var], outputs: &[Var], data: &[u8]) {
+        self.escapes.push(EscapeEvent::Foreign { name: name.to_string(), inputs: inputs.to_vec(), outputs: outputs.to_vec(), data: data.to_vec() });
+    }
+
+    /// Record a lookup event into a table id with provided columns.
+    pub fn emit_lookup(&mut self, table_id: u32, cols: &[Var]) {
+        self.escapes.push(EscapeEvent::Lookup { table_id, cols: cols.to_vec() });
     }
 }
 
@@ -379,6 +410,7 @@ impl<F: Field> R1csRecorder<F> {
         h.update(domain);
         h.update(&(self.vars.len() as u64).to_le_bytes());
         h.update(&(self.constraints.len() as u64).to_le_bytes());
+        h.update(&(self.escapes.len() as u64).to_le_bytes());
 
         for (i, vk) in self.vars.iter().enumerate() {
             h.update(&(i as u64).to_le_bytes());
@@ -398,6 +430,36 @@ impl<F: Field> R1csRecorder<F> {
             };
             emit_lc(&c.a); emit_lc(&c.b); emit_lc(&c.c);
         }
+        // Mix in escapes deterministically
+        for e in &self.escapes {
+            match e {
+                EscapeEvent::Poseidon2 { inputs, outputs, tag } => {
+                    h.update(&[0xE1]);
+                    h.update(&tag.to_le_bytes());
+                    h.update(&(inputs.len() as u64).to_le_bytes());
+                    for v in inputs { h.update(&(v.0 as u64).to_le_bytes()); }
+                    h.update(&(outputs.len() as u64).to_le_bytes());
+                    for v in outputs { h.update(&(v.0 as u64).to_le_bytes()); }
+                }
+                EscapeEvent::Foreign { name, inputs, outputs, data } => {
+                    h.update(&[0xE2]);
+                    h.update(&(name.len() as u64).to_le_bytes());
+                    h.update(name.as_bytes());
+                    h.update(&(inputs.len() as u64).to_le_bytes());
+                    for v in inputs { h.update(&(v.0 as u64).to_le_bytes()); }
+                    h.update(&(outputs.len() as u64).to_le_bytes());
+                    for v in outputs { h.update(&(v.0 as u64).to_le_bytes()); }
+                    h.update(&(data.len() as u64).to_le_bytes());
+                    h.update(data);
+                }
+                EscapeEvent::Lookup { table_id, cols } => {
+                    h.update(&[0xE3]);
+                    h.update(&table_id.to_le_bytes());
+                    h.update(&(cols.len() as u64).to_le_bytes());
+                    for v in cols { h.update(&(v.0 as u64).to_le_bytes()); }
+                }
+            }
+        }
         *h.finalize().as_bytes()
     }
 
@@ -411,7 +473,9 @@ impl<F: Field> R1csRecorder<F> {
         #[derive(Serialize)]
         struct SerCons { id: u64, label: Option<String>, a: SerLc, b: SerLc, c: SerLc }
         #[derive(Serialize)]
-        struct Snapshot { vars: Vec<u8>, constraints: Vec<SerCons> }
+        enum SerEsc { Poseidon2 { inputs: Vec<u64>, outputs: Vec<u64>, tag: u64 }, Foreign { name: String, inputs: Vec<u64>, outputs: Vec<u64>, data: Vec<u8> }, Lookup { table_id: u32, cols: Vec<u64> } }
+        #[derive(Serialize)]
+        struct Snapshot { vars: Vec<u8>, constraints: Vec<SerCons>, escapes: Vec<SerEsc> }
 
         let vars: Vec<u8> = self.vars.iter().map(|k| match k { VarKind::Witness => 0u8, VarKind::Instance => 1u8 }).collect();
         let to_bytes = |f: &F| f.to_repr().as_ref().to_vec();
@@ -422,7 +486,12 @@ impl<F: Field> R1csRecorder<F> {
             };
             SerCons { id: c.id, label: c.label.clone(), a: ser_lc(&c.a), b: ser_lc(&c.b), c: ser_lc(&c.c) }
         }).collect();
-        bincode::serialize(&Snapshot { vars, constraints: ser_constraints }).expect("serialize r1cs")
+        let escapes: Vec<SerEsc> = self.escapes.iter().map(|e| match e {
+            EscapeEvent::Poseidon2 { inputs, outputs, tag } => SerEsc::Poseidon2 { inputs: inputs.iter().map(|v| v.0 as u64).collect(), outputs: outputs.iter().map(|v| v.0 as u64).collect(), tag: *tag },
+            EscapeEvent::Foreign { name, inputs, outputs, data } => SerEsc::Foreign { name: name.clone(), inputs: inputs.iter().map(|v| v.0 as u64).collect(), outputs: outputs.iter().map(|v| v.0 as u64).collect(), data: data.clone() },
+            EscapeEvent::Lookup { table_id, cols } => SerEsc::Lookup { table_id: *table_id, cols: cols.iter().map(|v| v.0 as u64).collect() },
+        }).collect();
+        bincode::serialize(&Snapshot { vars, constraints: ser_constraints, escapes }).expect("serialize r1cs")
     }
 
     /// Deserialize constraints (excluding witness assignments) from bincode
@@ -435,7 +504,9 @@ impl<F: Field> R1csRecorder<F> {
         #[derive(Deserialize)]
         struct SerCons { id: u64, label: Option<String>, a: SerLc, b: SerLc, c: SerLc }
         #[derive(Deserialize)]
-        struct Snapshot { vars: Vec<u8>, constraints: Vec<SerCons> }
+        enum SerEsc { Poseidon2 { inputs: Vec<u64>, outputs: Vec<u64>, tag: u64 }, Foreign { name: String, inputs: Vec<u64>, outputs: Vec<u64>, data: Vec<u8> }, Lookup { table_id: u32, cols: Vec<u64> } }
+        #[derive(Deserialize)]
+        struct Snapshot { vars: Vec<u8>, constraints: Vec<SerCons>, #[serde(default)] escapes: Vec<SerEsc> }
 
         let snap: Snapshot = bincode::deserialize(bytes)?;
         let mut rec = R1csRecorder::<F> {
@@ -462,6 +533,12 @@ impl<F: Field> R1csRecorder<F> {
             let b = parse_lc(c.b).unwrap();
             let cc = parse_lc(c.c).unwrap();
             Constraint { id: c.id, label: c.label, a, b, c: cc }
+        }).collect();
+        // Escapes
+        rec.escapes = snap.escapes.into_iter().map(|e| match e {
+            SerEsc::Poseidon2 { inputs, outputs, tag } => EscapeEvent::Poseidon2 { inputs: inputs.into_iter().map(|i| Var(i as usize)).collect(), outputs: outputs.into_iter().map(|i| Var(i as usize)).collect(), tag },
+            SerEsc::Foreign { name, inputs, outputs, data } => EscapeEvent::Foreign { name, inputs: inputs.into_iter().map(|i| Var(i as usize)).collect(), outputs: outputs.into_iter().map(|i| Var(i as usize)).collect(), data },
+            SerEsc::Lookup { table_id, cols } => EscapeEvent::Lookup { table_id, cols: cols.into_iter().map(|i| Var(i as usize)).collect() },
         }).collect();
         rec.next_var = rec.vars.len();
         rec.next_constraint_id = rec.constraints.iter().map(|c| c.id).max().unwrap_or(0).saturating_add(1);
@@ -507,6 +584,20 @@ mod tests {
         let ser = rec.serialize_constraints();
         let rec2: R1csRecorder<Fr> = R1csRecorder::deserialize_constraints(&ser).unwrap();
         let d2 = rec2.digest(b"test-domain");
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn r1cs_escape_events_roundtrip_affect_digest() {
+        let mut drv: R1csProverDriver<Fr> = R1csProverDriver::default();
+        let x = drv.add(|| vec![(Wire::Const(Fr::from(11u64)), Fr::ONE)]).unwrap();
+        let y = drv.add(|| vec![(Wire::Const(Fr::from(13u64)), Fr::ONE)]).unwrap();
+        let (vx, vy) = match (x, y) { (Wire::Var(a), Wire::Var(b)) => (a, b), _ => panic!() };
+        drv.r1cs.emit_poseidon2(&[vx], &[vy], 42);
+        let d1 = drv.r1cs.digest(b"e-domain");
+        let ser = drv.r1cs.serialize_constraints();
+        let rec2: R1csRecorder<Fr> = R1csRecorder::deserialize_constraints(&ser).unwrap();
+        let d2 = rec2.digest(b"e-domain");
         assert_eq!(d1, d2);
     }
 }

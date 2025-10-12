@@ -1,5 +1,5 @@
 //! qerkle: Dynamic-hash Merkle tree with optional Kyber-encrypted metadata
-//!
+//! Numan Thabit 2025
 //! Provides:
 //! - Dynamic hashing over BLAKE3 and Poseidon (same Poseidon spec as `circuits`)
 //! - Simple inclusion proof generation/verification with per-edge hash choice bits

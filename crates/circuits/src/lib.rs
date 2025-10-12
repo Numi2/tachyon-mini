@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! # circuits
-//!
-//! Zero-knowledge proof circuits for Tachyon PCD system.
+//! Numan Thabit 2025
+//! Zero-knowledge proof circuits for Tachyon-mini PCD system.
 //! Implements transition circuits and aggregation for proof-carrying data.
 
 use anyhow::Result;
@@ -35,6 +35,7 @@ mod sparse_merkle;
 pub mod tachy;
 pub mod orchard;
 pub mod recursion;
+pub mod unified_block;
 
 // Re-export selected helpers for external consumers (e.g., CLI)
 pub use crate::tachy::compute_tachy_digest;

@@ -1,4 +1,5 @@
 //! Core gadgets over the r1cs driver: booleanity, select, arithmetic, range checks.
+//! Numan Thabit 2025
 
 use anyhow::Result;
 use ff::Field;
@@ -6,6 +7,7 @@ use ff::Field;
 use crate::circuit::Driver;
 use halo2_gadgets::poseidon::primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3};
 use pasta_curves::Fp as Fr;
+use crate::r1cs::{R1csProverDriver, Wire};
 
 /// Constrain `b` to be boolean: b * (b - 1) = 0
 pub fn boolean<D: Driver>(dr: &mut D, b: D::W) -> Result<()> {
@@ -60,6 +62,22 @@ pub fn poseidon2_t3_hash_tagged(a: Fr, b: Fr, tag: u64) -> Fr {
     let tag_f = Fr::from(tag);
     poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
         .hash([tag_f, a, b])
+}
+
+/// Emit a Poseidon2 escape hatch event in the R1CS recorder, wiring inputs/outputs by vars.
+pub fn poseidon2_escape<FDrv: Driver<F = Fr>>(dr: &mut R1csProverDriver<Fr>, inputs: &[Wire<Fr>], outputs: &[Wire<Fr>], tag: u64) {
+    let to_var = |w: &Wire<Fr>| match w { Wire::Var(v) => *v, Wire::Const(_) => panic!("poseidon escape requires vars") };
+    let ins: Vec<_> = inputs.iter().map(to_var).collect();
+    let outs: Vec<_> = outputs.iter().map(to_var).collect();
+    dr.r1cs.emit_poseidon2(&ins, &outs, tag);
+}
+
+/// Circuit-level gadget to compute a tachygram (Poseidon commitment) indistinguishably.
+/// Emits an escape event with inputs as vars and output var; returns output wire.
+pub fn tachygram_commit_poseidon(dr: &mut R1csProverDriver<Fr>, a: Wire<Fr>, b: Wire<Fr>, tag: u64) -> Wire<Fr> {
+    let out = dr.alloc_witness_value(Fr::ZERO);
+    poseidon2_escape::<R1csProverDriver<Fr>>(dr, &[a.clone(), b.clone()], &[match out { Wire::Var(v) => Wire::Var(v), _ => out.clone() }], tag);
+    out
 }
 
 

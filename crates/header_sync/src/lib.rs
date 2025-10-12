@@ -1,6 +1,7 @@
 //! # header_sync
+//! Numan Thabit 2025
 //!
-//! Header chain synchronization and bootstrapping for Tachyon.
+//! Header chain synchronization and bootstrapping for Tachyon mini.
 //! Implements NiPoPoW-style proofs for efficient header verification and fast bootstrapping.
 
 use anyhow::{anyhow, Result};

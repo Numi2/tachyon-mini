@@ -1,6 +1,6 @@
 //! dex
-//!
-//! In-memory orderbook engine and simple DEX service API.
+//! Numan Thabit 2025
+//! In-memory orderbook engine and DEX service API.
 
 use anyhow::anyhow;
 use crate::error::Result;

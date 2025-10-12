@@ -1,5 +1,5 @@
 //! # cli
-//!
+//! Numan Thabit 2025
 //! Command-line interface for Tachyon wallet and network tools.
 
 use anyhow::{anyhow, Result};
@@ -859,12 +859,42 @@ pub async fn run() -> Result<()> {
         Commands::TachyVerifyStamp { file } => {
             let json = if let Some(path) = file { std::fs::read_to_string(path)? } else { use std::io::Read as _; let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s };
             let stamp: pcd_core::tachyon::Tachystamp = serde_json::from_str(&json)?;
-            // Re-commit all actions' binding digests as proof payloads, aggregate, compare
+            // 1) Verify recursion proof against the aggregated commitment
             let core = RecursionCore::new()?;
-            let mut payloads: Vec<Vec<u8>> = Vec::new();
-            for a in &stamp.actions { payloads.push(a.binding_digest.to_vec()); }
-            let (_proof, agg) = if payloads.is_empty() { (Vec::new(), [0u8; 32]) } else { core.aggregate_many_proofs(&payloads, pcd_core::tachyon::TACHY_FOLDING_FACTOR)? };
-            if agg == stamp.aggregated_commitment { println!("ok: agg=0x{}", hex::encode(agg)); } else { println!("mismatch: expected=0x{} actual=0x{}", hex::encode(stamp.aggregated_commitment), hex::encode(agg)); }
+            if stamp.aggregated_proof.is_empty() {
+                // Allow empty proof only if the commitment is zero (represents no aggregation)
+                if stamp.aggregated_commitment == [0u8; 32] {
+                    println!("ok: empty recursion proof and zero commitment");
+                } else {
+                    println!("verification failed: empty recursion proof but non-zero commitment=0x{}", hex::encode(stamp.aggregated_commitment));
+                    return Err(anyhow::anyhow!("recursion proof verification failed"));
+                }
+            } else {
+                let verified = core.verify_aggregate_pair(&stamp.aggregated_proof, &stamp.aggregated_commitment)?;
+                if !verified {
+                    println!("verification failed: recursion proof invalid for commitment=0x{}", hex::encode(stamp.aggregated_commitment));
+                    return Err(anyhow::anyhow!("recursion proof verification failed"));
+                }
+                println!("ok: recursion proof verified for agg=0x{}", hex::encode(stamp.aggregated_commitment));
+            }
+
+            // 2) Ease-of-use cross-check (builder path): re-aggregate action binding digests and compare commitments
+            // Skip this check if there are no actions, since block-level stamps aggregate tx proofs instead.
+            if !stamp.actions.is_empty() {
+                let mut payloads: Vec<Vec<u8>> = Vec::new();
+                for a in &stamp.actions { payloads.push(a.binding_digest.to_vec()); }
+                let (_proof2, agg2) = core.aggregate_many_proofs(&payloads, pcd_core::tachyon::TACHY_FOLDING_FACTOR)?;
+                if agg2 == stamp.aggregated_commitment {
+                    println!("ok: action-binding aggregate matches stamp commitment");
+                } else {
+                    println!(
+                        "warning: action-binding aggregate mismatch: expected=0x{} recomputed=0x{}",
+                        hex::encode(stamp.aggregated_commitment),
+                        hex::encode(agg2)
+                    );
+                }
+            }
+
             Ok(())
         }
     }

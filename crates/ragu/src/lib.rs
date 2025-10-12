@@ -1,5 +1,5 @@
-//! ragu: PCD-oriented circuit API for Tachyon
-//!
+//! ragu: PCD-oriented circuit API for Tachyon mini
+//! Numan Thabit 2025
 //! Minimal scaffolding: Maybe, Driver, Circuit traits.
 
 pub mod maybe {
@@ -416,10 +416,18 @@ pub mod r1cs;
 pub mod gadgets;
 pub mod backend;
 pub mod backend_halo2;
+pub mod pcd;
+pub mod accum;
+pub mod folding;
+pub mod tachygram;
+pub mod accum_unified;
 
 #[cfg(test)]
 mod tests {
     use super::maybe::*;
+    use super::accum::*;
+    use super::folding::*;
+    use super::tachygram::Tachygram;
 
     #[test]
     fn maybe_always_executes_closures() {
@@ -442,6 +450,18 @@ mod tests {
     fn zst_size_checks() {
         assert_eq!(core::mem::size_of::<Empty>(), 0);
         assert_eq!(core::mem::size_of::<Always<u64>>(), core::mem::size_of::<u64>());
+    }
+
+    #[test]
+    fn accum_and_fold_basics() {
+        use pasta_curves::Fp as Fr;
+        let mut acc = PoseidonUnifiedAccum::new(7);
+        let g1 = Tachygram::from_field(Fr::from(3));
+        let g2 = Tachygram::from_field(Fr::from(9));
+        acc.absorb_all(&[AccumItem::Member(g1), AccumItem::NonMember(g2)]);
+        let d = acc.digest();
+        let folded = fold_digests(FoldDigest(d.0), FoldDigest(d.0), 123);
+        assert_ne!(folded.0, Fr::ZERO);
     }
 }
 

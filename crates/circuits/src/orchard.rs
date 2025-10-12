@@ -1,12 +1,11 @@
 //! Orchard-oriented gadgets and circuit skeletons.
-//!
+//! Numan Thabit 2025
 //! This module provides production-grade building blocks required to express
 //! Orchard-like note commitment checks, nullifier derivations, and membership
 //! paths over Poseidon2-compatible hashes on Pasta. It intentionally avoids
 //! specifying spend authorization details and focuses on accumulator and
 //! constraint soundness.
 
-#![allow(dead_code)]
 
 use ff::Field;
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};

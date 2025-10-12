@@ -1,3 +1,140 @@
+Tachyon-mini: credit to Sean Bowe and Zcash team, ideas from Sean Bowe Blog
+===============================================================
+
+Overview
+--------
+Tachyon-mini is a Rust workspace prototyping a succinct, privacy-preserving ledger that achieves:
+
+- Constant-size verification via recursive proofs (O(1) verify per block)
+- Privacy via Tachygrams: a single 32-byte encoding for both commitments and nullifiers
+- A unified accumulator that supports both membership and non-membership proofs without revealing a Tachygram’s role
+
+This design is inspired by Tachyon and work by Sean Bowe and the Zcash community.
+
+
+Key concepts
+------------
+- Tachygram: 32-byte blob representing either a commitment or a nullifier. Indistinguishable on the wire and in proofs.
+- Unified accumulator: one accumulator over Tachygrams that supports inclusion (commitments) and exclusion (nullifiers) proofs under a single abstraction.
+- Recursive step: each block proves validity against the previous step using a small proof over Pasta curves; validators verify only the latest state and proof.
+
+
+What’s implemented
+------------------
+In this repo, the core building blocks are implemented and integrated :
+
+- Tachygrams
+  - `ragu::tachygram::Tachygram([u8; 32])` with conversions to/from Pasta `Fp`
+  - Poseidon-based derivations for commitments and nullifiers (keyed PRF with flavor)
+
+- Unified accumulator (PCD-friendly)
+  - `ragu::accum::{UnifiedAccumulator, PoseidonUnifiedAccum, AccumItem}`
+  - Absorbs Tachygrams uniformly, preserving indistinguishability
+  - Folding digests for recursive aggregation
+
+- Role-hiding verification hooks
+  - Escape events (recorded in `ragu::r1cs`) allow backends to implement native membership/non-membership checks without leaking role in circuit shape
+  - `ragu::accum_unified::verify_unified_accum` and `update_unified_accum` emit a single foreign event with a private selector bit
+
+- Recursive proving on Pasta (Halo2/KZG)
+  - `circuits::recursion`: Poseidon binder circuit and helpers
+    - `prove_poseidon_bind(prev, cur, k)` → proof, `agg = H(tag, prev, cur)`
+    - `verify_poseidon_bind(proof, agg, cur, k)` → bool
+
+- Unified block circuit (constant U updates)
+  - `circuits::unified_block`: verifies public prev bind agg + prev state, applies U Tachygram updates with a private selector, exposes next state; helpers `prove_unified_block`/`verify_unified_block`
+
+- Chain step wrapper and validator API
+  - `ragu::pcd::prove_chain_step` composes unified block proof and recursion binder
+  - `ragu::pcd::verify_chain_tip` verifies both with O(1) work given `(prev_bind_agg, proof bundle)`
+
+
+High-level architecture
+-----------------------
+1) Encoding: commitments and nullifiers become Tachygrams (32 bytes). Nullifiers derive via a keyed PRF and flavor tag; commitments via a Poseidon commitment.
+2) Accumulator: a single domain of Tachygrams. In-circuit, a private boolean selector determines membership vs non-membership and is enforced as boolean, but the verifier sees only one path.
+3) Recursion: each block proves correctness relative to the previous state and proof using small KZG-backed Halo2 circuits over Pasta (Vesta). Verification is O(1), independent of chain length.
+
+
+Minimal usage (Rust)
+--------------------
+Produce and verify a single chain step (U=2 updates):
+
+```rust
+use pasta_curves::Fp as Fr;
+use ragu::pcd::{prove_chain_step, verify_chain_tip};
+
+// Parameters
+let k: u32 = 12; // circuit size (2^k)
+let prev_bind_agg = Fr::from(7);
+let prev_state = Fr::from(11);
+
+// Two Tachygrams as field elements (in practice, derive from 32-byte grams)
+let grams = [Fr::from(3), Fr::from(9)];
+let flags = [true, false]; // member, non-member (private inside circuit)
+
+// Prove one chain step
+let proof = prove_chain_step::<2>(k, prev_bind_agg, prev_state, grams, flags)?;
+
+// Validator verifies O(1) with only (prev_bind_agg, proof bundle)
+let ok = verify_chain_tip(k, prev_bind_agg, &proof)?;
+assert!(ok);
+```
+
+
+Build, test, and run
+--------------------
+- Build all:
+
+```bash
+cargo build
+```
+
+- Run core tests (Halo2 included):
+
+```bash
+cargo test -p ragu -p circuits -- --nocapture
+```
+
+- Bench (optional):
+
+```bash
+cargo run -p bench --release
+```
+
+
+Module map
+----------
+- `crates/ragu/src/tachygram.rs`: Tachygram type and Poseidon-based derivations
+- `crates/ragu/src/accum.rs`: unified accumulator trait and Poseidon instance
+- `crates/ragu/src/accum_unified.rs`: role-hiding unified verification/update gadgets
+- `crates/ragu/src/r1cs.rs`: R1CS recorder with escape events (Poseidon/foreign/lookup)
+- `crates/ragu/src/pcd.rs`: PCD step interfaces, block-step skeleton, chain-step wrapper, validator API
+- `crates/circuits/src/recursion.rs`: Poseidon binder circuit (prove/verify helpers)
+- `crates/circuits/src/unified_block.rs`: unified block circuit (U updates) + prove/verify
+- `crates/circuits/src/sparse_merkle.rs`: sparse-Merkle skeleton and tests (reference)
+
+
+Design choices
+--------------
+- Curves: Pasta (Vesta G1, scalar Fp). Proofs use Halo2 PLONK + KZG over Pasta params.
+- Hash: Poseidon2 (t=3, rate=2) with explicit domain tags for binding operations.
+- Privacy: single escape-based verification path hides commitment vs nullifier role; selector bit is private and enforced as boolean.
+- Accumulator backends: start with Poseidon-based folding; can swap to Merkle or vector commitments (KZG) with the same unified API.
+
+
+Roadmap
+-------
+- Integrate concrete SMT/VC membership and non-membership witnesses behind the unified escape event
+- Batch-friendly folding/I VC for even smaller recursion costs
+- Parameter/key persistence and production-grade setup flows
+- CLI examples that build and verify unified block/chain proofs end-to-end
+
+
+Credits
+-------
+Tachyon, Zcash, and especially Sean Bowe’s writings 
+
 Mini Tachyon
 ============
 
@@ -7,6 +144,57 @@ Scope: experimental, credit to Sean Bowe & Zcash team
 
 
 idea
+
+a succinct, privacy-preserving blockchain architecture. recursive proofs and a unified accumulator to maintain a constant-size verification footprint, while hiding ledger roles at the proof level. Validators verify only the latest state and proof, without access to the full ledger history.
+
+Motivation
+
+Earlier designs stored:
+	•	Commitments in a Merkle Mountain Range (MMR).
+	•	Nullifiers in a Sparse Merkle Tree (SMT).
+
+This worked, but had drawbacks:
+	•	Two separate roots per block → larger state.
+	•	Distinct proof types → role leakage (validators could infer whether data was a note or nullifier).
+	•	Wallets needed to track both trees independently.
+
+Current Design
+
+The system now uses a unified accumulator with recursive proofs:
+	•	All ledger data is encoded as a Tachygram (uniform 32 bytes).
+	•	Inside the proving circuit, a single private selector enforces whether a Tachygram is treated as a commitment (membership) or nullifier (non-membership).
+	•	The role of each Tachygram is hidden from validators.
+
+Each block is verified in a step circuit:
+	1.	Inputs: prior state + prior proof, new Tachygrams, consensus metadata.
+	2.	Checks:
+	•	Verifies the recursive proof of the previous block.
+	•	Applies Tachygrams to the unified accumulator.
+	•	Enforces consensus and state transition rules.
+	3.	Outputs: new state commitment and proof.
+
+Validator Interface
+
+Validators need only the latest (StateCommit, Proof).
+
+fn verify(state: StateCommit, proof: Proof) -> bool
+
+Verification cost is constant, independent of chain length.
+
+Practical Choices
+	•	Recursive backend: Halo2 recursion (Plonk-in-Plonk over Pasta), with optional folding schemes (Nova/SuperNova) for efficiency.
+	•	Accumulator:
+	•	Merkle over Tachygrams (transparent, slightly larger proofs), or
+	•	Vector commitment (KZG/Pasta-cycle, constant size, requires SRS).
+	•	Data availability: Tachygrams themselves must remain available; the proof only certifies correctness of state transitions.
+
+Advantages
+	•	Constant-size verification (succinct blockchain).
+	•	Privacy: commitments and nullifiers indistinguishable at proof level.
+	•	Simpler validator interface: validators track only (Sₙ, Pₙ).
+	•	Future-proof: recursive design allows integration with folding and PQ-friendly accumulators.
+
+
 ------------------
 - Two trees:
   - Tree 1: all coin commitments ever created (append-only).

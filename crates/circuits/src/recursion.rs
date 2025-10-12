@@ -1,5 +1,5 @@
 //! Recursion verifier circuit (Poseidon-binder): aggregates inner proof commitments.
-//!
+//! Numan Thabit 2025
 //! This circuit computes `agg = H(TAG_REC, prev, cur)` with Poseidon2 (t=3, rate=2)
 //! and exposes `agg` as a public instance. It is intended to recursively bind
 //! previously-verified proofs into a single succinct accumulator, while keeping
@@ -7,7 +7,10 @@
 //! invoking this circuit (e.g., on host or via a higher-order verification).
 
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
-use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector};
+use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, keygen_pk, keygen_vk, create_proof, verify_proof, SingleVerifier};
+use halo2_proofs::poly::commitment::Params;
+use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
+use pasta_curves::vesta::Affine as G1Affine;
 use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
 use pasta_curves::Fp as Fr;
@@ -93,8 +96,9 @@ impl Circuit<Fr> for RecPoseidonCircuit {
             },
         )?;
 
-        // Expose agg as public input index 0
+        // Expose agg as public input index 0 and cur as index 1 to tie recursion to step
         layouter.constrain_instance(agg_cell.cell(), cfg.instance, 0)?;
+        layouter.constrain_instance(cur_cell.cell(), cfg.instance, 1)?;
         Ok(())
     }
 }
@@ -103,6 +107,32 @@ impl Circuit<Fr> for RecPoseidonCircuit {
 pub fn compute_rec_agg(prev: Fr, cur: Fr) -> Fr {
     use halo2_gadgets::poseidon::primitives as p;
     p::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([Fr::from(TAG_REC), prev, cur])
+}
+
+/// Prove a Poseidon recursion bind: agg = H(TAG, prev, cur). Returns (proof_bytes, agg_value).
+pub fn prove_poseidon_bind(prev: Fr, cur: Fr, k: u32) -> anyhow::Result<(Vec<u8>, Fr)> {
+    let params = Params::<G1Affine>::new(k);
+    let agg = compute_rec_agg(prev, cur);
+    let circuit = RecPoseidonCircuit { prev: Value::known(prev), cur: Value::known(cur), agg: Value::known(agg) };
+    let vk = keygen_vk(&params, &circuit)?;
+    let pk = keygen_pk(&params, vk, &circuit)?;
+    let inst = [agg, cur];
+    let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
+    create_proof(&params, &pk, &[circuit], &[&[&inst[..]]], rand::rngs::OsRng, &mut transcript)?;
+    Ok((transcript.finalize(), agg))
+}
+
+/// Verify a Poseidon recursion bind proof given (agg, cur) public inputs.
+pub fn verify_poseidon_bind(proof: &[u8], agg: Fr, cur: Fr, k: u32) -> anyhow::Result<bool> {
+    if proof.is_empty() { return Ok(false); }
+    let params = Params::<G1Affine>::new(k);
+    // Rebuild vk from empty circuit with unknowns
+    let empty = RecPoseidonCircuit { prev: Value::unknown(), cur: Value::unknown(), agg: Value::unknown() };
+    let vk = keygen_vk(&params, &empty)?;
+    let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<G1Affine>>::init(std::io::Cursor::new(proof));
+    let strategy = SingleVerifier::new(&params);
+    let inst = [agg, cur];
+    Ok(verify_proof(&params, &vk, strategy, &[&[&inst[..]]], &mut transcript).is_ok())
 }
 
 

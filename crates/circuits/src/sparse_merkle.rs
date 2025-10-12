@@ -1,4 +1,5 @@
 //! Sparse Merkle set gadgets (halo2) for membership, non-membership, and root updates.
+//! Numan Thabit 2025
 
 use ff::Field;
 use halo2_proofs::circuit::{Layouter, Value, AssignedCell, SimpleFloorPlanner};

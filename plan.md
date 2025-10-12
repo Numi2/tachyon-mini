@@ -1,8 +1,63 @@
 Mini Tachyon experiments with a Zcash upgrade path where recursive proofs keep both validators and wallets light without sacrificing privacy.
 
-### How succinctness emerges
+
+Dependency graph of Tachyon concepts from Sean Bowe’s blog posts:
+
+                         ┌────────────────────┐
+                         │  Core Goals        │
+                         │ O(1) chain growth  │
+                         │ Fast wallet sync   │
+                         │ Privacy preserved  │
+                         └─────────┬──────────┘
+                                   │
+                ┌──────────────────┴───────────────────┐
+                │                                      │
+     ┌──────────▼─────────┐                  ┌─────────▼─────────┐
+     │ Oblivious Sync     │                  │ Out-of-Band Txns  │
+     │ - PCD proofs       │                  │ - no in-band      │
+     │ - recursive SNARKs │                  │   ciphertexts     │
+     └──────────┬─────────┘                  │ - URIs/payment    │
+                │                            │   requests        │
+                │                            └─────────┬─────────┘
+                │                                      │
+     ┌──────────▼──────────┐                  ┌─────────▼─────────┐
+     │ Tachystamps (PCD)   │                  │ Simplified Wallet │
+     │ - wrap tachygrams   │                  │ - no diversifiers │
+     │ - carry history     │                  │ - leaner circuits │
+     └──────────┬──────────┘                  └─────────┬─────────┘
+                │                                      │
+                │                                      │
+     ┌──────────▼─────────┐                 ┌──────────▼──────────┐
+     │ Tachygrams         │                 │ Nullifier Derivation │
+     │ - unified blob     │                 │ - keyed PRF          │
+     │   (commit+null)    │                 │ - pruning enabled    │
+     └──────────┬─────────┘                 └──────────┬──────────┘
+                │                                      │
+                └──────────────┬───────────────────────┘
+                               │
+                  ┌────────────▼────────────┐
+                  │ Accumulators & Proofs   │
+                  │ - one set for both      │
+                  │ - batch inserts         │
+                  │ - membership + non-mem  │
+                  └────────────┬────────────┘
+                               │
+                  ┌────────────▼────────────┐
+                  │ Aggregated Blocks       │
+                  │ - producers merge       │
+                  │   tachystamps           │
+                  │ - constant verification │
+                  └─────────────────────────┘
+
+Flow:
+	1.	Core goals drive two design tracks: Oblivious sync (proof-carrying data) and Out-of-band transactions (no ciphertexts in chain).
+	2.	Oblivious sync → Tachystamps (recursive envelopes).
+	3.	Out-of-band → simpler wallet + unified tachygrams + new nullifier rules.
+	4.	Tachygrams + nullifier changes feed into accumulators.
+	5.	Accumulators + tachystamps → aggregated block proofs.
+
+
 - Wallets treat their entire local state as proof-carrying data: each time they absorb a block they roll forward a recursive proof that “everything so far is valid.” When they later spend, that proof (the tachystamp) accompanies the transaction, so validators only need to check the latest step plus the recursive proof rather than replaying history.  
-- Because the proof certifies continuity from a recent anchor, nodes can discard older state: validity is compressed into the proof chain instead of needing historical blocks.
 
 ### Role of tachystamps and aggregation
 - A tachystamp bundles the recursive SNARK, the current anchor, and the relevant nullifier/commitment set (tachygrams). Multiple tachystamps can merge into one, letting a block point to a single proof that attests to many prior state transitions.  
@@ -24,4 +79,3 @@ Mini Tachyon experiments with a Zcash upgrade path where recursive proofs keep b
 - Prior work on PCD and proof aggregation underpins Tachyon’s design choices.  
 - Zcash primitives (nullifiers, commitments) are simplified to fit recursion smoothly.
 
-Net effect: succinct chain validation, lightweight wallet sync, and preserved shielded privacy all ride on recursive proofs that carry the full history’s correctness in a single object.

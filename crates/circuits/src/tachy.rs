@@ -1,4 +1,5 @@
 //! Tachyactions: minimal spend/output circuit skeleton over Fr with SMT checks and Poseidon digest.
+//! Numan Thabit 2025
 
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector};

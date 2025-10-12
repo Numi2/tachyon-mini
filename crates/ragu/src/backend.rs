@@ -1,5 +1,5 @@
 //! Backend traits and a mock prover/verifier for R1CS.
-//!
+//! Numan Thabit 2025
 //! This module provides a production-ready API shape with a development/mock backend
 //! that serializes R1CS constraints and witness assignments, derives a transcript
 //! digest, and verifies constraints in the value domain. A Halo2+KZG backend can

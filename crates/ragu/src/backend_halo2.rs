@@ -1,5 +1,5 @@
-//! Halo2 + KZG backend for R1CS recorder (no mocks).
-//!
+//! Halo2 + KZG backend for R1CS recorder.
+//! Numan Thabit 2025
 //! This backend compiles a recorded R1CS (with linear-combination terms and constants)
 //! into a Halo2 circuit that enforces, for each constraint row i:
 //!   (<A_i, x> + a0_i) * (<B_i, x> + b0_i) = (<C_i, x> + c0_i)
@@ -21,6 +21,7 @@ use halo2_proofs::{
 use pasta_curves::{Fp as Fr, vesta::Affine as G1Affine};
 
 use crate::r1cs::{R1csRecorder, Var, LinearCombination};
+use crate::r1cs::EscapeEvent;
 use serde::{Serialize, Deserialize};
 
 /// Configuration for one LC group with `max_terms` variable/coeff slots and a constant cell.
@@ -173,6 +174,10 @@ impl Circuit<Fr> for R1csCircuit {
                 Ok(())
             },
         )?;
+
+        // NOTE: Escape events are currently hints only; a production backend could
+        // materialize native gates/lookups keyed by these events.
+        let _escapes: &Vec<EscapeEvent> = &self.recorder.escapes;
 
         Ok(())
     }

@@ -1,4 +1,5 @@
 //! Polynomial evaluation interfaces and drivers for non-uniform circuits.
+//! Numan Thabit 2025
 
 use ff::Field;
 use core::marker::PhantomData;

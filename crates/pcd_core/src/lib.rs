@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! # pcd_core
 //! Numan Thabit 2025
-//! Proof-carrying data (PCD) state management for Tachyon wallet.
+//! Proof-carrying data (PCD) state management for Tachyon-mini wallet.
 //! Provides state definitions, proof interfaces, and recursion management.
 
 use accum_mmr::{MmrAccumulator, MmrDelta};
@@ -22,41 +22,8 @@ use serde::{Deserialize, Serialize};
 type PersistenceCallback = Box<dyn Fn(&PcdState) -> Result<()> + Send + Sync>;
 use std::path::PathBuf;
 
-/// Unified 32-byte object used at consensus: commitments and nullifiers share this type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Tachygram(pub [u8; 32]);
-
-impl Tachygram {
-    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
-}
-
-/// Proof-carrying data artifact output by transactions/blocks.
-/// Carries an anchor, a list of tachygrams, and a recursion-friendly proof blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tachystamp {
-    /// Anchor height the proof/state binds to
-    pub anchor_height: u64,
-    /// Aggregated proof bytes (recursion-friendly)
-    pub aggregated_proof: Vec<u8>,
-    /// Aggregated commitment for quick verification (32 bytes)
-    pub aggregated_commitment: [u8; 32],
-    /// Tachygrams revealed/emitted by this action bundle (order-preserving)
-    pub tachygrams: Vec<Tachygram>,
-}
-
-impl Tachystamp {
-    /// Deterministically compute a hash for the stamp (not a SNARK check)
-    pub fn hash(&self) -> [u8; 32] {
-        let mut h = blake3::Hasher::new();
-        h.update(b"tachystamp:v1");
-        h.update(&self.anchor_height.to_le_bytes());
-        h.update(&self.aggregated_commitment);
-        for tg in &self.tachygrams { h.update(&tg.0); }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(h.finalize().as_bytes());
-        out
-    }
-}
+// Note: Tachyon-style unified blob and stamp types live in `pcd_core::tachyon`.
+// This crate intentionally avoids duplicate top-level definitions to standardize usage.
 
 /// Size of PCD state commitment (BLAKE3 hash)
 pub const PCD_STATE_COMMITMENT_SIZE: usize = 32;

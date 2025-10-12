@@ -1,6 +1,6 @@
 //! # pq_crypto
-//!
-//! Post-quantum cryptography utilities for Tachyon.
+//! Numan Thabit 2025
+//! Post-quantum cryptography utilities for Tachyon-mini.
 //! Provides KEM (Key Encapsulation Mechanism) and AEAD encryption for out-of-band payments.
 
 use anyhow::{anyhow, Result};

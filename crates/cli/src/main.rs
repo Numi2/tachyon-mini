@@ -1,4 +1,5 @@
 //! Tachyon CLI binary
+//! Numan Thabit 2025
 
 use anyhow::Result;
 use cli::run;

@@ -1,6 +1,6 @@
 //! # net_iroh
-//!
-//! A wrapper over iroh + iroh-blobs for Tachyon network communication.
+//! Numan Thabit 2025
+//! A wrapper over iroh + iroh-blobs for Tachyon mini network communication.
 //! Provides high-level APIs for blob publishing, fetching, and control protocol handling.
 
 use anyhow::{anyhow, Result};

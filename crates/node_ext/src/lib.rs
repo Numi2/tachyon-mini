@@ -5,7 +5,7 @@ pub mod error;
 // Validator / Node extension implementation for Tachyon.
 // Verifies PCD proofs, nullifier checks, and maintains minimal state for validation.
 
-use accum_mmr::{MmrAccumulator, MmrWitness, SerializableHash, MmrDelta};
+use accum_mmr::{MmrAccumulator, MmrWitness, SerializableHash, MmrDelta, TachygramAccumulator};
 use accum_set::{Smt16Accumulator, Smt16NonMembershipProof, Smt16Delta};
 use anyhow::{anyhow, Result};
 use blake3::Hash;
@@ -135,6 +135,10 @@ pub struct NodeState {
     pub mmr_root: [u8; 32],
     /// Current nullifier set root
     pub nullifier_root: [u8; 32],
+    /// Unified tachygram accumulator (commitments and nullifiers)
+    pub tachygram_accum: TachygramAccumulator,
+    /// Current tachygram accumulator root (domain-separated MMR root)
+    pub tachygram_root: [u8; 32],
     /// Recent nullifier window (per-block buckets) for uniqueness checks
     recent_nullifiers: VecDeque<Vec<[u8; 32]>>,
     /// Fast membership set for recent nullifiers
@@ -165,6 +169,8 @@ impl NodeState {
             mmr_peaks: Vec::new(),
             mmr_root: [0u8; 32],
             nullifier_root: [0u8; 32],
+            tachygram_accum: TachygramAccumulator::new(),
+            tachygram_root: [0u8; 32],
             recent_nullifiers: VecDeque::new(),
             recent_nullifiers_set: HashSet::new(),
             last_pruned: Instant::now(),
@@ -211,6 +217,16 @@ impl NodeState {
                 arr.copy_from_slice(h.as_bytes());
                 arr
             })
+            .unwrap_or([0u8; 32]);
+    }
+
+    /// Update tachygram accumulator and root with a batch of grams
+    pub fn update_tachygrams(&mut self, grams: &[[u8; 32]]) {
+        if grams.is_empty() { return; }
+        let _ = self.tachygram_accum.batch_insert(grams);
+        self.tachygram_root = self
+            .tachygram_accum
+            .root()
             .unwrap_or([0u8; 32]);
     }
 
@@ -309,6 +325,8 @@ struct PersistedNodeState {
     pub mmr_peaks: Vec<(u64, SerializableHash)>,
     pub mmr_root: [u8; 32],
     pub nullifier_root: [u8; 32],
+    pub tachygram_accum: TachygramAccumulator,
+    pub tachygram_root: [u8; 32],
     pub state_digest: [u8; 32],
 }
 
@@ -321,6 +339,8 @@ impl From<PersistedNodeState> for NodeState {
             mmr_peaks: p.mmr_peaks,
             mmr_root: p.mmr_root,
             nullifier_root: p.nullifier_root,
+            tachygram_accum: p.tachygram_accum,
+            tachygram_root: p.tachygram_root,
             recent_nullifiers: VecDeque::new(),
             recent_nullifiers_set: HashSet::new(),
             last_pruned: Instant::now(),
@@ -340,6 +360,8 @@ impl From<&NodeState> for PersistedNodeState {
             mmr_peaks: s.mmr_peaks.clone(),
             mmr_root: s.mmr_root,
             nullifier_root: s.nullifier_root,
+            tachygram_accum: s.tachygram_accum.clone(),
+            tachygram_root: s.tachygram_root,
             state_digest: s.state_digest,
         }
     }
@@ -585,8 +607,8 @@ impl TachyonNode {
             block_proof,
         };
         let body = BlockBody {
-            ordered_outputs,
-            ordered_nullifiers,
+            ordered_outputs: ordered_outputs.clone(),
+            ordered_nullifiers: ordered_nullifiers.clone(),
             mmr_deltas: bincode::serialize(&mmr_ops).map_err(|e| anyhow!("serialize mmr_deltas: {}", e))?,
             smt_deltas: bincode::serialize(&smt_ops).map_err(|e| anyhow!("serialize smt_deltas: {}", e))?,
         };
@@ -613,7 +635,7 @@ impl TachyonNode {
     /// Tachygrams are the union of commitments and nullifiers; order: commitments then nullifiers per tx order.
     pub fn build_block_tachystamp(&self, block: &Block) -> Result<Tachystamp> {
         // Aggregate proofs (reuse existing method)
-        let (aggregated_proof, _aggregated_commitment) = self.aggregate_block_proofs(block)?;
+        let (aggregated_proof, aggregated_commitment) = self.aggregate_block_proofs(block)?;
 
         // Collect tachygrams from transactions in order: outputs then nullifiers
         let mut grams: Vec<Tachygram> = Vec::new();
@@ -627,9 +649,15 @@ impl TachyonNode {
         let anchor = TachyAnchor { height: block.height, mmr_root: s.mmr_root, nullifier_root: s.nullifier_root };
         drop(s);
 
-        // No detailed actions in this stub; we rely on the aggregated proof bytes as input
+        // No detailed actions in this stub; we rely on the aggregated recursion proof and commitment as input
         let actions: Vec<Tachyaction> = Vec::new();
-        Tachystamp::new(anchor, grams, actions, &[aggregated_proof])
+        Ok(Tachystamp {
+            anchor,
+            tachygrams: grams,
+            actions,
+            aggregated_proof,
+            aggregated_commitment,
+        })
     }
 
     /// Validate a transaction
@@ -846,6 +874,16 @@ impl TachyonNode {
             // Refresh peaks and root
             state.refresh_mmr_view();
 
+            // Update unified tachygram accumulator: commitments first then nullifiers per tx order
+            {
+                let mut grams: Vec<[u8; 32]> = Vec::new();
+                for tx in &block.transactions {
+                    for cm in &tx.commitments { grams.push(*cm); }
+                    for nf in &tx.nullifiers { grams.push(*nf); }
+                }
+                state.update_tachygrams(&grams);
+            }
+
             // Advance anchor height to this block's height
             state.current_height = block.height;
 
@@ -950,6 +988,21 @@ impl TachyonNode {
         let _ = self
             ._network
             .publish_blob_with_ticket(BlobKind::NullifierDelta, Bytes::from(smt_bytes.clone()), block.height)
+            .await;
+
+        // Publish tachygram accumulator snapshot delta (ordered grams) for unified-light clients
+        // We encode as a simple Vec<[u8; 32]> for now; in production this could be a delta
+        let grams_bytes = {
+            let mut buf: Vec<u8> = Vec::new();
+            for tx in &block.transactions {
+                for cm in &tx.commitments { buf.extend_from_slice(cm); }
+                for nf in &tx.nullifiers { buf.extend_from_slice(nf); }
+            }
+            buf
+        };
+        let _ = self
+            ._network
+            .publish_blob_with_ticket(BlobKind::CommitmentDelta, Bytes::from(grams_bytes.clone()), block.height)
             .await;
 
         Ok(BlockValidationResult {
@@ -1082,6 +1135,8 @@ impl TachyonNode {
             mmr_peaks: guard.mmr_peaks.clone(),
             mmr_root: guard.mmr_root,
             nullifier_root: guard.nullifier_root,
+            tachygram_accum: guard.tachygram_accum.clone(),
+            tachygram_root: guard.tachygram_root,
             recent_nullifiers: VecDeque::new(),
             recent_nullifiers_set: HashSet::new(),
             last_pruned: guard.last_pruned,
