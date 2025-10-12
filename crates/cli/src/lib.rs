@@ -12,6 +12,8 @@ use std::str::FromStr;
 use node_ext::{NodeConfig, NetworkConfig};
 use header_sync::{HeaderSyncConfig as HsConfig, HeaderSyncManager};
 use onramp_stripe as onramp;
+use circuits::{RecursionCore, compute_tachy_digest};
+use pasta_curves::Fp as Fr;
 
 /// Tachyon CLI application
 #[derive(Parser)]
@@ -203,6 +205,15 @@ pub enum Commands {
     Onramp {
         #[command(subcommand)]
         onramp_command: OnrampCommands,
+    },
+    /// Process sample Tachyactions: compute digests and aggregate O(1)
+    ProcessActions {
+        /// Number of actions to synthesize
+        #[arg(long, default_value_t = 4)]
+        count: usize,
+        /// Optional fixed seed (unused placeholder for now)
+        #[arg(long)]
+        seed: Option<u64>,
     },
 }
 
@@ -754,6 +765,28 @@ pub async fn run() -> Result<()> {
         Commands::Network { network_command } => execute_network_command(network_command).await,
         Commands::HeaderSync { hs_command } => execute_header_sync_command(hs_command).await,
         Commands::Onramp { onramp_command } => execute_onramp_command(onramp_command).await,
+        Commands::ProcessActions { count, seed } => {
+            // Synthesize demo Tachyactions and aggregate their digests
+            let mut digests: Vec<Fr> = Vec::with_capacity(count);
+            // Simple deterministic sequence if seed provided; otherwise use OsRng-derived anchors
+            let base_pk = Fr::from(123u64);
+            let base_val = Fr::from(5u64);
+            let mut cur_nonce = Fr::from(seed.unwrap_or(77));
+            for i in 0..count {
+                // Derive per-action values deterministically
+                let pk = base_pk + Fr::from((i as u64) + 1);
+                let val = base_val + Fr::from(((i as u64) % 11) + 1);
+                cur_nonce += Fr::from(13u64);
+                let d = compute_tachy_digest(pk, val, cur_nonce);
+                digests.push(d);
+            }
+
+            // Aggregate digests using RecursionCore folding
+            let core = RecursionCore::new()?;
+            let (_proof, agg_bytes) = core.aggregate_tachy_digests(&digests)?;
+            println!("final_agg_commitment=0x{}", hex::encode(agg_bytes));
+            Ok(())
+        }
     }
 }
 

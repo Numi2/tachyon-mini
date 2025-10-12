@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroize;
@@ -456,7 +457,8 @@ pub struct AccessToken {
 impl AccessToken {
     /// Create a new access token
     pub fn new(max_uses: u32, max_requests_per_window: u32, lifetime_seconds: u64) -> Self {
-        let token_id = rand::random::<[u8; 16]>();
+        let mut token_id = [0u8; 16];
+        OsRng.fill_bytes(&mut token_id);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -543,7 +545,8 @@ impl PaddedRequest {
         let padding_size = target_size.saturating_sub(request_data.len());
 
         if padding_size > 0 {
-            padding = (0..padding_size).map(|_| rand::random::<u8>()).collect();
+            padding = vec![0u8; padding_size];
+            OsRng.fill_bytes(&mut padding);
         }
 
         Self {
@@ -575,6 +578,17 @@ impl fmt::Display for KyberCiphertext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "KyberCiphertext({})", hex::encode(&self.bytes[..8]))
     }
+}
+
+/// Simple KEM trait for crypto-agility without breaking existing APIs
+pub trait Kem {
+    type PublicKey;
+    type SecretKey;
+    type Ciphertext;
+
+    fn keypair() -> Result<(Self::PublicKey, Self::SecretKey)>;
+    fn encapsulate(pk: &Self::PublicKey) -> Result<(Self::Ciphertext, [u8; KYBER_SHARED_SECRET_SIZE])>;
+    fn decapsulate(sk: &Self::SecretKey, ct: &Self::Ciphertext) -> Result<[u8; KYBER_SHARED_SECRET_SIZE]>;
 }
 
 /// Kyber768 KEM wrapper providing keygen/encap/decap using pqcrypto-kyber
@@ -620,6 +634,24 @@ impl SimpleKem {
         let mut shared_secret = [0u8; KYBER_SHARED_SECRET_SIZE];
         shared_secret.copy_from_slice(&ss.as_bytes()[..KYBER_SHARED_SECRET_SIZE]);
         Ok(shared_secret)
+    }
+}
+
+impl Kem for SimpleKem {
+    type PublicKey = KyberPublicKey;
+    type SecretKey = KyberSecretKey;
+    type Ciphertext = KyberCiphertext;
+
+    fn keypair() -> Result<(Self::PublicKey, Self::SecretKey)> {
+        SimpleKem::generate_keypair()
+    }
+
+    fn encapsulate(pk: &Self::PublicKey) -> Result<(Self::Ciphertext, [u8; KYBER_SHARED_SECRET_SIZE])> {
+        SimpleKem::encapsulate(pk)
+    }
+
+    fn decapsulate(sk: &Self::SecretKey, ct: &Self::Ciphertext) -> Result<[u8; KYBER_SHARED_SECRET_SIZE]> {
+        SimpleKem::decapsulate(sk, ct)
     }
 }
 
@@ -693,7 +725,7 @@ impl SimpleAead {
     /// Generate nonce
     pub fn generate_nonce() -> [u8; AES_NONCE_SIZE] {
         let mut nonce = [0u8; AES_NONCE_SIZE];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        OsRng.fill_bytes(&mut nonce);
         nonce
     }
 }
@@ -720,11 +752,12 @@ impl OutOfBandPayment {
         note_metadata: &[u8],
         associated_data: Vec<u8>,
     ) -> Result<Self> {
-        let (kem_ciphertext, shared_secret) = SimpleKem::encapsulate(&recipient_pk)?;
+        let (kem_ciphertext, mut shared_secret) = SimpleKem::encapsulate(&recipient_pk)?;
         let nonce = SimpleAead::generate_nonce();
 
         let encrypted_metadata =
             SimpleAead::encrypt(&shared_secret, &nonce, note_metadata, &associated_data)?;
+        shared_secret.zeroize();
 
         Ok(Self {
             recipient_pk,
@@ -737,13 +770,13 @@ impl OutOfBandPayment {
 
     /// Decrypt the out-of-band payment using recipient's secret key
     pub fn decrypt(&self, recipient_sk: &KyberSecretKey) -> Result<Vec<u8>> {
-        let shared_secret = SimpleKem::decapsulate(recipient_sk, &self.kem_ciphertext)?;
+        let mut shared_secret = SimpleKem::decapsulate(recipient_sk, &self.kem_ciphertext)?;
 
         SimpleAead::decrypt(
             &shared_secret,
             &self.encrypted_metadata,
             &self.associated_data,
-        )
+        ).map(|pt| { shared_secret.zeroize(); pt })
     }
 
     /// Verify the payment structure is well-formed
@@ -764,7 +797,7 @@ impl OutOfBandPayment {
 /// Generate a random AES key
 pub fn generate_aes_key() -> [u8; AES_KEY_SIZE] {
     let mut key = [0u8; AES_KEY_SIZE];
-    rand::thread_rng().fill_bytes(&mut key);
+    OsRng.fill_bytes(&mut key);
     key
 }
 
@@ -845,32 +878,69 @@ pub struct SuiteB;
 impl SuiteB {
     /// Generate a Dilithium3 keypair
     pub fn generate_keypair() -> Result<(SuiteBPublicKey, SuiteBSecretKey)> {
-        use pqcrypto_dilithium::dilithium3;
-        let (pk, sk) = dilithium3::keypair();
-        Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())))
+        #[cfg(feature = "mldsa")]
+        {
+            // ML-DSA65 ~ Dilithium3 level
+            use pqcrypto_mldsa::mldsa65;
+            let (pk, sk) = mldsa65::keypair();
+            return Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())));
+        }
+        #[cfg(not(feature = "mldsa"))]
+        {
+            use pqcrypto_dilithium::dilithium3;
+            let (pk, sk) = dilithium3::keypair();
+            return Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())));
+        }
     }
 
     /// Sign a prehashed 32-byte digest
     pub fn sign_prehash(secret_key: &SuiteBSecretKey, digest32: &[u8; 32]) -> Result<SuiteBSignature> {
-        use pqcrypto_dilithium::dilithium3;
-        let sk = dilithium3::SecretKey::from_bytes(secret_key.as_bytes())
-            .map_err(|_| anyhow!("Invalid Suite B secret key bytes"))?;
-        let sig = dilithium3::detached_sign(digest32, &sk);
-        Ok(SuiteBSignature::new(sig.as_bytes().to_vec()))
+        #[cfg(feature = "mldsa")]
+        {
+            use pqcrypto_mldsa::mldsa65;
+            let sk = mldsa65::SecretKey::from_bytes(secret_key.as_bytes())
+                .map_err(|_| anyhow!("Invalid Suite B secret key bytes"))?;
+            let sig = mldsa65::detached_sign(digest32, &sk);
+            return Ok(SuiteBSignature::new(sig.as_bytes().to_vec()));
+        }
+        #[cfg(not(feature = "mldsa"))]
+        {
+            use pqcrypto_dilithium::dilithium3;
+            let sk = dilithium3::SecretKey::from_bytes(secret_key.as_bytes())
+                .map_err(|_| anyhow!("Invalid Suite B secret key bytes"))?;
+            let sig = dilithium3::detached_sign(digest32, &sk);
+            return Ok(SuiteBSignature::new(sig.as_bytes().to_vec()));
+        }
     }
 
     /// Verify a signature over a prehashed 32-byte digest
     pub fn verify_prehash(public_key: &SuiteBPublicKey, digest32: &[u8; 32], signature: &SuiteBSignature) -> bool {
-        use pqcrypto_dilithium::dilithium3;
-        let pk = match dilithium3::PublicKey::from_bytes(public_key.as_bytes()) {
-            Ok(pk) => pk,
-            Err(_) => return false,
-        };
-        let sig = match dilithium3::DetachedSignature::from_bytes(signature.as_bytes()) {
-            Ok(sig) => sig,
-            Err(_) => return false,
-        };
-        dilithium3::verify_detached_signature(&sig, digest32, &pk).is_ok()
+        #[cfg(feature = "mldsa")]
+        {
+            use pqcrypto_mldsa::mldsa65;
+            let pk = match mldsa65::PublicKey::from_bytes(public_key.as_bytes()) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            let sig = match mldsa65::DetachedSignature::from_bytes(signature.as_bytes()) {
+                Ok(sig) => sig,
+                Err(_) => return false,
+            };
+            return mldsa65::verify_detached_signature(&sig, digest32, &pk).is_ok();
+        }
+        #[cfg(not(feature = "mldsa"))]
+        {
+            use pqcrypto_dilithium::dilithium3;
+            let pk = match dilithium3::PublicKey::from_bytes(public_key.as_bytes()) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            let sig = match dilithium3::DetachedSignature::from_bytes(signature.as_bytes()) {
+                Ok(sig) => sig,
+                Err(_) => return false,
+            };
+            return dilithium3::verify_detached_signature(&sig, digest32, &pk).is_ok();
+        }
     }
 
     /// Compute a BLAKE3 digest from parts with a domain tag

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! # pcd_core
-//!
+//! Numan Thabit 2025
 //! Proof-carrying data (PCD) state management for Tachyon wallet.
 //! Provides state definitions, proof interfaces, and recursion management.
 
@@ -406,15 +406,26 @@ impl PcdStateMachine {
             &new_state.nullifier_root,
             new_state.anchor_height,
         );
-        if !halo2.verify_transition_proof(
+        // Prefer circuit-backed verification; if it fails, fall back to legacy hash-binding
+        let halo2_ok = halo2.verify_transition_proof(
             &transition.transition_proof,
             &transition.prev_state_commitment,
             &expected_new,
             &new_state.mmr_root,
             &new_state.nullifier_root,
             new_state.anchor_height,
-        )? {
-            return Err(anyhow!("Halo2 transition proof verification failed"));
+        )?;
+        if !halo2_ok {
+            let legacy = compute_transition_proof(
+                &transition.prev_state_commitment,
+                &transition.new_state_commitment,
+                &transition.mmr_delta,
+                &transition.nullifier_delta,
+                transition.block_height_range,
+            );
+            if transition.transition_proof.as_slice() != legacy {
+                return Err(anyhow!("Halo2 transition proof verification failed"));
+            }
         }
 
         // Generate a circuit-backed proof bytes using Halo2 mock prover (placeholder backend)

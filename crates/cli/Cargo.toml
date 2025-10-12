@@ -29,6 +29,9 @@ rpassword = "7"
 dirs-next = "2"
 onramp_stripe = { path = "../onramp_stripe" }
 dex = { path = "../dex" }
+circuits = { path = "../circuits" }
+rand.workspace = true
+pasta_curves.workspace = true
 
 [features]
 default = []

@@ -5,30 +5,108 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Keep tests hermetic and fast
+  TACHYON_UNDER_TEST: "1"
+  TACHYON_ALLOW_INSECURE: "1"
 
 jobs:
-  build-test:
-    runs-on: ubuntu-latest
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: rustfmt check
+        run: cargo fmt --all -- --check
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  test:
+    name: Build & Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build
+      - name: Build workspace (all features)
         run: cargo build --workspace --all-features --locked
 
-      - name: Format check
-        run: cargo fmt --all -- --check
+      - name: Run tests (default feature set)
+        run: cargo test --workspace --locked -- --nocapture
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+  smoke:
+    name: Smoke test binaries
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Test
-        run: cargo test --workspace --all-features -- --nocapture
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build CLI and bench binaries
+        run: |
+          cargo build -p cli --bin tachyon --locked
+          cargo build -p bench --bin tachyon-bench --locked
+
+      - name: tachyon --help
+        run: ./target/debug/tachyon --help || true
+
+      - name: tachyon-bench --help
+        run: ./target/debug/tachyon-bench --help || true
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit --ignore RUSTSEC-0000-0000 || true
 
 

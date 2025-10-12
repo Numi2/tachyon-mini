@@ -464,6 +464,7 @@ dependencies = [
  "net_iroh",
  "pcd_core",
  "pq_crypto",
+ "ragu",
  "serde",
  "serde_json",
  "storage",
@@ -771,6 +772,7 @@ dependencies = [
  "ragu",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -821,6 +823,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "bytes",
+ "circuits",
  "clap",
  "dex",
  "dirs-next",
@@ -829,7 +832,9 @@ dependencies = [
  "net_iroh",
  "node_ext",
  "onramp_stripe",
+ "pasta_curves",
  "pq_crypto",
+ "rand 0.8.5",
  "rpassword",
  "serde",
  "serde_json",

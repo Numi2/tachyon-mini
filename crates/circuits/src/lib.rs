@@ -25,11 +25,17 @@ use rand::rngs::OsRng;
 use std::io::Cursor;
 use std::path::Path;
 use std::{fs, fs::File};
+use std::io::{Read, Write};
 use ragu::circuit as ragu_circuit;
 use ragu::circuit::Sink;
 use ragu::drivers::compute_public_inputs;
 use ragu::maybe as ragu_maybe;
 use ragu::maybe::Maybe as _;
+mod sparse_merkle;
+pub mod tachy;
+
+// Re-export selected helpers for external consumers (e.g., CLI)
+pub use crate::tachy::compute_tachy_digest;
 
 /// Poseidon-based transition hash (native) mirroring the in-circuit composition.
 ///
@@ -107,11 +113,8 @@ impl ragu_circuit::Circuit<Fr> for TransitionRagu {
         witness: ragu_circuit::Witness<D, Self::Witness<'witness>>,
     ) -> Result<(Self::IO<'witness, D>, ragu_circuit::Witness<D, Self::Aux<'witness>>), anyhow::Error> {
         let io = self.input(dr, witness)?;
-        // Produce a Maybe<()> value without constraining MaybeKind further
-        let aux: ragu_circuit::Witness<D, ()> = <
-            <D as ragu_circuit::Driver>::MaybeKind as ragu_maybe::MaybeKind
-        >::Rebind::<()>
-        ::just(|| ());
+        // Produce aux via driver proxy helper
+        let aux: ragu_circuit::Witness<D, ()> = dr.just(|| ());
         Ok((io, aux))
     }
 
@@ -208,10 +211,18 @@ pub fn compute_state_commitment(components: &[Fr]) -> Fr {
         hasher.update(&bytes);
     }
     let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest.as_bytes());
-    // Reduce into field (if not canonical, fall back to zero)
-    Fr::from_repr(out).unwrap_or(Fr::zero())
+    // Map into the field uniformly to avoid bias/collisions
+    {
+        use blake3::Hasher;
+        use std::io::Read as _;
+        let mut h = Hasher::new();
+        h.update(b"pcd:state_commitment:fr:uniform:v1");
+        h.update(digest.as_bytes());
+        let mut xof = h.finalize_xof();
+        let mut wide = [0u8; 64];
+        xof.read_exact(&mut wide).unwrap();
+        Fr::from_uniform_bytes(&wide)
+    }
 }
 
 // Removed obsolete external verifier helper (superseded by on-circuit Poseidon relation)
@@ -293,10 +304,10 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         // Assign all witness values in one region where the selector applies
         let (
             prev_state_cell,
-            _new_state_cell,
+            new_state_cell,
             mmr_root_cell,
-            _nullifier_root_cell,
-            _anchor_height_cell,
+            nullifier_root_cell,
+            anchor_height_cell,
         ) = layouter.assign_region(
             || "assign transition row",
             |mut region| {
@@ -321,7 +332,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
 
                 let nul = region.assign_advice(
                     || "nullifier root",
-                    config.advice[3],
+                    config.advice[5],
                     0,
                     || self.nullifier_root,
                 )?;
@@ -348,7 +359,11 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         )?;
         let tag_d1_cell = layouter.assign_region(
             || "assign tag_d1",
-            |mut region| region.assign_advice(|| "tag_d1", config.advice[5], 0, || Value::known(Fr::from(1u64))),
+            |mut region| {
+                let c = region.assign_advice(|| "tag_d1", config.advice[5], 0, || Value::known(Fr::from(1u64)))?;
+                region.constrain_constant(c.cell(), Fr::from(1u64))?;
+                Ok(c)
+            },
         )?;
         let d1 = h2.hash(
             layouter.namespace(|| "poseidon h(prev,mmr)"),
@@ -361,11 +376,15 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         )?;
         let tag_d2_cell = layouter.assign_region(
             || "assign tag_d2",
-            |mut region| region.assign_advice(|| "tag_d2", config.advice[5], 0, || Value::known(Fr::from(2u64))),
+            |mut region| {
+                let c = region.assign_advice(|| "tag_d2", config.advice[5], 0, || Value::known(Fr::from(2u64)))?;
+                region.constrain_constant(c.cell(), Fr::from(2u64))?;
+                Ok(c)
+            },
         )?;
         let d2 = h2b.hash(
             layouter.namespace(|| "poseidon h(nullifier,anchor)"),
-            [tag_d2_cell.clone(), _nullifier_root_cell.clone(), _anchor_height_cell.clone()],
+            [tag_d2_cell.clone(), nullifier_root_cell.clone(), anchor_height_cell.clone()],
         )?;
         let chip_h3 = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
         let h3 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
@@ -374,20 +393,33 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         )?;
         let tag_d3_cell = layouter.assign_region(
             || "assign tag_d3",
-            |mut region| region.assign_advice(|| "tag_d3", config.advice[5], 0, || Value::known(Fr::from(3u64))),
+            |mut region| {
+                let c = region.assign_advice(|| "tag_d3", config.advice[5], 0, || Value::known(Fr::from(3u64)))?;
+                region.constrain_constant(c.cell(), Fr::from(3u64))?;
+                Ok(c)
+            },
         )?;
         let digest = h3.hash(
             layouter.namespace(|| "poseidon h(d1,d2,tag)"),
             [tag_d3_cell.clone(), d1, d2],
         )?;
 
+        // Bind computed digest to provided new_state witness
+        layouter.assign_region(
+            || "bind new_state == digest",
+            |mut region| {
+                region.constrain_equal(new_state_cell.cell(), digest.cell())?;
+                Ok(())
+            },
+        )?;
+
         // Expose public inputs (prev_state, new_state, mmr_root, nullifier_root, anchor_height)
         layouter.constrain_instance(prev_state_cell.cell(), config.instance[0], 0)?;
-        // Expose computed digest as new_state public input to avoid requiring an equality API
-        layouter.constrain_instance(digest.cell(), config.instance[1], 0)?;
+        // Expose the provided new_state (now bound to digest) as public input
+        layouter.constrain_instance(new_state_cell.cell(), config.instance[1], 0)?;
         layouter.constrain_instance(mmr_root_cell.cell(), config.instance[2], 0)?;
-        layouter.constrain_instance(_nullifier_root_cell.cell(), config.instance[3], 0)?;
-        layouter.constrain_instance(_anchor_height_cell.cell(), config.instance[4], 0)?;
+        layouter.constrain_instance(nullifier_root_cell.cell(), config.instance[3], 0)?;
+        layouter.constrain_instance(anchor_height_cell.cell(), config.instance[4], 0)?;
 
         Ok(())
     }
@@ -792,8 +824,10 @@ impl RecursionCore {
         current_commitment: &[u8; 32],
         folding_factor: u64,
     ) -> Result<(Vec<u8>, [u8; 32])> {
-        let prev_fr = Self::to_fr_from_bytes(prev_commitment);
-        let cur_fr = Self::to_fr_from_bytes(current_commitment);
+        let prev_fr = Fr::from_repr(*prev_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(prev_commitment));
+        let cur_fr = Fr::from_repr(*current_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(current_commitment));
         let fold_fr = Fr::from(folding_factor);
         let agg_fr = prev_fr * fold_fr + cur_fr;
 
@@ -810,7 +844,7 @@ impl RecursionCore {
             &self.params,
             &self.pk,
             &[circuit],
-            &[&[&inst_agg[..]]],
+            &[&[&inst_agg[..], &[][..]]],
             OsRng,
             &mut transcript,
         )?;
@@ -823,7 +857,8 @@ impl RecursionCore {
 
     /// Verify a recursion step proof for the provided aggregated commitment
     pub fn verify_aggregate_pair(&self, proof: &[u8], aggregated_commitment: &[u8; 32]) -> Result<bool> {
-        let agg_fr = Self::to_fr_from_bytes(aggregated_commitment);
+        let agg_fr = Fr::from_repr(*aggregated_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(aggregated_commitment));
         let inst_agg = [agg_fr];
         let mut transcript = Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
         let strategy = SingleVerifier::new(&self.params);
@@ -831,7 +866,7 @@ impl RecursionCore {
             &self.params,
             &self.vk,
             strategy,
-            &[&[&inst_agg[..]]],
+            &[&[&inst_agg[..], &[][..]]],
             &mut transcript,
         )
         .is_ok();
@@ -861,6 +896,48 @@ impl RecursionCore {
             commitments.push(self.commit_proof_bytes(p));
         }
         self.aggregate_many_commitments(&commitments, folding_factor)
+    }
+
+    /// Aggregate many field digests by repeatedly folding with a fixed factor
+    /// Returns (last recursion proof, aggregated commitment bytes)
+    pub fn aggregate_many_digests_fr(&self, digests: &[Fr], folding_factor: u64) -> Result<(Vec<u8>, [u8; 32])> {
+        if digests.is_empty() { return Ok((Vec::new(), [0u8; 32])); }
+        let mut agg = digests[0];
+        let mut last_proof: Vec<u8> = Vec::new();
+        for d in digests.iter().skip(1) {
+            let prev_bytes = {
+                let mut b = [0u8; 32];
+                b.copy_from_slice(agg.to_repr().as_ref());
+                b
+            };
+            let cur_bytes = {
+                let mut b = [0u8; 32];
+                b.copy_from_slice(d.to_repr().as_ref());
+                b
+            };
+            let (proof, new_agg_bytes) = self.prove_aggregate_pair(&prev_bytes, &cur_bytes, folding_factor)?;
+            last_proof = proof;
+            agg = Fr::from_repr(new_agg_bytes).unwrap_or_else(|| {
+                use blake3::Hasher;
+                use std::io::Read as _;
+                let mut hasher = Hasher::new();
+                hasher.update(b"pcd:rec:fr:uniform:v1");
+                hasher.update(&new_agg_bytes);
+                let mut xof = hasher.finalize_xof();
+                let mut wide = [0u8; 64];
+                xof.read_exact(&mut wide).unwrap();
+                Fr::from_uniform_bytes(&wide)
+            });
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(agg.to_repr().as_ref());
+        Ok((last_proof, out))
+    }
+
+    /// Convenience: aggregate tachyaction digests (as Fr) with fixed folding factor
+    pub fn aggregate_tachy_digests(&self, digests: &[Fr]) -> Result<(Vec<u8>, [u8; 32])> {
+        // Choose a small fixed folding factor (e.g., 2) for simplicity
+        self.aggregate_many_digests_fr(digests, 2)
     }
 }
 
@@ -895,8 +972,14 @@ impl PcdCore {
     pub fn save_to_dir<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        // Write params
         let mut f = File::create(dir.join("pcd_params.bin"))?;
         self.params.write(&mut f)?;
+        // VK/PK serialization is not supported in halo2_proofs 0.3; regenerate on load.
+        // Circuit metadata with a simple version and circuit hash
+        let meta = Self::circuit_metadata(self.proving_k);
+        let mut mf = File::create(dir.join("pcd_meta.json"))?;
+        mf.write_all(serde_json::to_string_pretty(&meta)?.as_bytes())?;
         Ok(())
     }
 
@@ -905,9 +988,19 @@ impl PcdCore {
         let dir = dir.as_ref();
         let params_path = dir.join("pcd_params.bin");
         if params_path.exists() {
-            let mut pf = File::open(params_path)?;
+            // Read meta if present
+            let meta_path = dir.join("pcd_meta.json");
+            let meta: Option<PcdCircuitMeta> = if meta_path.exists() {
+                let mut s = String::new();
+                File::open(&meta_path)?.read_to_string(&mut s)?;
+                Some(serde_json::from_str(&s)?)
+            } else { None };
+
+            // Read params
+            let mut pf = File::open(&params_path)?;
             let params = Params::<G1Affine>::read(&mut pf)?;
-            // Recompute keys deterministically from params and empty circuit
+
+            // Always regenerate vk/pk from params and the empty circuit
             let empty = PcdTransitionCircuit {
                 prev_state: Value::unknown(),
                 new_state: Value::unknown(),
@@ -918,18 +1011,47 @@ impl PcdCore {
             };
             let vk = keygen_vk(&params, &empty)?;
             let pk = keygen_pk(&params, vk.clone(), &empty)?;
-            Ok(Self {
-                initialized: true,
-                proving_k: k,
-                params,
-                vk,
-                pk,
-            })
+
+            // Validate metadata if available
+            if let Some(m) = meta {
+                let cur = Self::circuit_metadata(k);
+                if m.circuit_hash != cur.circuit_hash || m.k != k {
+                    return Err(anyhow::anyhow!("pcd_meta mismatch: stored (k={}, hash={}) != current (k={}, hash={})",
+                        m.k, m.circuit_hash, k, cur.circuit_hash));
+                }
+            }
+
+            Ok(Self { initialized: true, proving_k: k, params, vk, pk })
         } else {
             let core = Self::with_k(k)?;
             let _ = core.save_to_dir(dir);
             Ok(core)
         }
+    }
+}
+
+/// Simple circuit metadata for persistence validation
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct PcdCircuitMeta {
+    version: u32,
+    k: u32,
+    circuit_hash: String,
+}
+
+impl PcdCore {
+    fn circuit_metadata(k: u32) -> PcdCircuitMeta {
+        // Compute a short hash over key circuit structure choices
+        // Note: this is a heuristic; for production use a stable circuit ID
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcd:transition:v1");
+        hasher.update(&[3u8, 2u8]); // poseidon t=3, rate=2
+        hasher.update(&k.to_le_bytes());
+        // Include tags used for domain separation
+        hasher.update(&Fr::from(1u64).to_repr());
+        hasher.update(&Fr::from(2u64).to_repr());
+        hasher.update(&Fr::from(3u64).to_repr());
+        let hash = hasher.finalize();
+        PcdCircuitMeta { version: 1, k, circuit_hash: format!("{}", hash.to_hex()) }
     }
 }
 
@@ -1184,8 +1306,12 @@ pub mod performance {
 
             // Benchmark proving time
             let start = Instant::now();
-            let proof =
-                core.prove_transition(&[1u8; 32], &[2u8; 32], &[3u8; 32], &[4u8; 32], 100)?;
+            let prev = [1u8; 32];
+            let mmr = [3u8; 32];
+            let nul = [4u8; 32];
+            let anch = 100u64;
+            let new = compute_transition_digest_bytes(&prev, &mmr, &nul, anch);
+            let proof = core.prove_transition(&prev, &new, &mmr, &nul, anch)?;
             let proving_time = start.elapsed();
             self.proving_times.push(proving_time);
 
@@ -1193,11 +1319,11 @@ pub mod performance {
             let start = Instant::now();
             let _verified = core.verify_transition_proof(
                 &proof,
-                &[1u8; 32],
-                &[2u8; 32],
-                &[3u8; 32],
-                &[4u8; 32],
-                100,
+                &prev,
+                &new,
+                &mmr,
+                &nul,
+                anch,
             )?;
             let verification_time = start.elapsed();
             self.verification_times.push(verification_time);
@@ -1372,13 +1498,11 @@ mod tests {
             delta_commitments: vec![],
         };
 
-        let public_inputs = vec![
-            vec![prev],
-            vec![wrong_new], // intentionally wrong new
-            vec![mmr],
-            vec![nul],
-            vec![anch],
-        ];
+        // Since the circuit now binds new_state == digest, the MockProver
+        // must be provided with the digest at the instance column, while the
+        // witness remains the wrong value to trigger failure.
+        let correct_new = compute_transition_poseidon(prev, mmr, nul, anch);
+        let public_inputs = vec![vec![prev], vec![correct_new], vec![mmr], vec![nul], vec![anch]];
         let prover = MockProver::run(k, &circuit, public_inputs).unwrap();
         assert!(prover.verify().is_err());
     }
@@ -1444,5 +1568,28 @@ mod tests {
         assert_eq!(agg1.len(), 32);
         assert_eq!(agg2.len(), 32);
         assert_ne!(agg1, agg2);
+    }
+
+    #[test]
+    fn test_recursion_roundtrip_and_negative() {
+        let rec = RecursionCore::new().unwrap();
+
+        // Two dummy commitments (canonical field encodings)
+        let c1_fr = Fr::from(7u64);
+        let c2_fr = Fr::from(11u64);
+        let mut c1 = [0u8; 32];
+        let mut c2 = [0u8; 32];
+        c1.copy_from_slice(c1_fr.to_repr().as_ref());
+        c2.copy_from_slice(c2_fr.to_repr().as_ref());
+
+        let (proof, agg) = rec.prove_aggregate_pair(&c1, &c2, 3).unwrap();
+        let ok = rec.verify_aggregate_pair(&proof, &agg).unwrap();
+        assert!(ok);
+
+        // Negative: tweak agg
+        let mut bad = agg;
+        bad[0] ^= 1;
+        let ok_bad = rec.verify_aggregate_pair(&proof, &bad).unwrap();
+        assert!(!ok_bad);
     }
 }

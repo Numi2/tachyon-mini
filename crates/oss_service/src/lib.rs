@@ -1,5 +1,5 @@
 //! # oss_service
-//!
+//! Numan Thabit
 //! Oblivious Sync Service (OSS) implementation for Tachyon.
 //! Provides delta generation and PCD transition proofs for wallet synchronization.
 

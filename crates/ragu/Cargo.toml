@@ -12,3 +12,14 @@ thiserror.workspace = true
 ff.workspace = true
 
 
+[features]
+default = ["ragu-nonuniform"]
+# Enable the internal R1CS-like backend and mock prover
+ragu-backend = []
+# Placeholder for choosing Halo2 as a host circuit engine (used by other crates)
+halo2-backend = []
+# Orchard-aligned circuit helpers and constants (reserved)
+ragu-orchard = []
+# Non-uniform circuit evaluation drivers and oracle support
+ragu-nonuniform = []
+

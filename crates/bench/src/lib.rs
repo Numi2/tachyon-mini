@@ -473,16 +473,30 @@ impl TachyonBenchmark {
     /// Benchmark PCD proof verification
     pub async fn benchmark_pcd_proof_verification(&mut self) -> Result<()> {
         use pcd_core::{PcdState, SimplePcdVerifier};
+        use circuits::compute_transition_digest_bytes;
 
         let verifier = SimplePcdVerifier;
-        let state = PcdState::new(
-            0,
-            [0u8; 32],
-            [0u8; 32],
-            [0u8; 32],
-            vec![0u8; self.config.test_data_size],
-            vec![0u8; 1024],
+        // Construct a state with a consistent transition proof via circuits
+        let mmr = [1u8; 32];
+        let nul = [2u8; 32];
+        let block = [3u8; 32];
+        let data = vec![0u8; self.config.test_data_size];
+        let provisional = PcdState::new(0, mmr, nul, block, data.clone(), vec![])?;
+        let new_digest = compute_transition_digest_bytes(
+            &provisional.state_commitment,
+            &provisional.mmr_root,
+            &provisional.nullifier_root,
+            provisional.anchor_height,
+        );
+        let halo2 = circuits::PcdCore::new()?;
+        let proof = halo2.prove_transition(
+            &provisional.state_commitment,
+            &new_digest,
+            &provisional.mmr_root,
+            &provisional.nullifier_root,
+            provisional.anchor_height,
         )?;
+        let state = PcdState::new(0, mmr, nul, block, data, proof)?;
 
         let start_time = Instant::now();
         let mut min_time = Duration::MAX;

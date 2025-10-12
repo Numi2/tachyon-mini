@@ -18,6 +18,10 @@ pub mod maybe {
         fn map<U>(self, f: impl FnOnce(T) -> U) -> <Self::Kind as MaybeKind>::Rebind<U>;
         fn view(&self) -> <Self::Kind as MaybeKind>::Rebind<&T>;
         fn snag(&self) -> &T where Self: Sized { self.view().take() }
+        /// Mutable view of the inner value if present; no-op for Empty
+        fn view_mut(&mut self) -> <Self::Kind as MaybeKind>::Rebind<&mut T>;
+        /// Monadic bind; chains operations without allocating in Empty case
+        fn and_then<U>(self, f: impl FnOnce(T) -> <Self::Kind as MaybeKind>::Rebind<U>) -> <Self::Kind as MaybeKind>::Rebind<U>;
     }
 
     /// Always-present wrapper
@@ -57,6 +61,12 @@ pub mod maybe {
         }
 
         fn view(&self) -> <Self::Kind as MaybeKind>::Rebind<&T> { Always(&self.0) }
+
+        fn view_mut(&mut self) -> <Self::Kind as MaybeKind>::Rebind<&mut T> { Always(&mut self.0) }
+
+        fn and_then<U>(self, f: impl FnOnce(T) -> <Self::Kind as MaybeKind>::Rebind<U>) -> <Self::Kind as MaybeKind>::Rebind<U> {
+            f(self.0)
+        }
     }
 
     impl<T> Maybe<T> for Empty {
@@ -71,6 +81,10 @@ pub mod maybe {
         fn map<U>(self, _: impl FnOnce(T) -> U) -> <Self::Kind as MaybeKind>::Rebind<U> { Empty }
 
         fn view(&self) -> <Self::Kind as MaybeKind>::Rebind<&T> { Empty }
+
+        fn view_mut(&mut self) -> <Self::Kind as MaybeKind>::Rebind<&mut T> { Empty }
+
+        fn and_then<U>(self, _f: impl FnOnce(T) -> <Self::Kind as MaybeKind>::Rebind<U>) -> <Self::Kind as MaybeKind>::Rebind<U> { Empty }
     }
 
     /// Factory to construct Maybe values for a given Kind without naming the concrete wrapper
@@ -91,11 +105,26 @@ pub mod maybe {
         fn unit() -> <Self::Kind as MaybeKind>::Rebind<()> { Empty }
         fn from<T>(_value: T) -> <Self::Kind as MaybeKind>::Rebind<T> { Empty }
     }
+
+    /// Extension trait implemented only for present (Always) values to safely extract contents
+    pub trait Present<T>: Maybe<T> {
+        fn take_present(self) -> T;
+        fn snag_present(&self) -> &T;
+    }
+
+    impl<T> Present<T> for Always<T> {
+        #[inline(always)]
+        fn take_present(self) -> T { self.0 }
+        #[inline(always)]
+        fn snag_present(&self) -> &T { &self.0 }
+    }
 }
 
 pub mod circuit {
     use ff::Field;
     use super::maybe::{MaybeKind};
+    // Bring trait methods (including associated fns) into scope for Maybe
+    use super::maybe::Maybe;
 
     pub trait Sink<D: Driver, W> {
         fn absorb(&mut self, value: W);
@@ -126,6 +155,22 @@ pub mod circuit {
             &mut self,
             lc: impl FnOnce() -> L,
         ) -> Result<(), anyhow::Error>;
+
+        /// Convenience: obtain a representation of the field-one constant in the driver's wire domain
+        #[inline(always)]
+        fn one(&mut self) -> Self::W { self.from_field(Self::F::ONE) }
+
+        /// Convenience: construct a Maybe value bound to this driver's MaybeKind
+        #[inline(always)]
+        fn just<T>(&mut self, f: impl FnOnce() -> T) -> Witness<Self, T> {
+            <Self::MaybeKind as MaybeKind>::Rebind::<T>::just(f)
+        }
+
+        /// Convenience: construct a fallible Maybe value bound to this driver's MaybeKind
+        #[inline(always)]
+        fn with<T, E>(&mut self, f: impl FnOnce() -> Result<T, E>) -> Result<Witness<Self, T>, E> {
+            <Self::MaybeKind as MaybeKind>::Rebind::<T>::with(f)
+        }
     }
 
     pub type Witness<D, T> = <<D as Driver>::MaybeKind as MaybeKind>::Rebind<T>;
@@ -161,6 +206,7 @@ pub mod drivers {
     use ff::Field;
     use crate::circuit::{Circuit, Driver, Sink};
     use crate::maybe::{Always};
+    use core::marker::PhantomData;
 
     /// Sink that collects public inputs/outputs as field elements
     #[derive(Default)]
@@ -219,6 +265,120 @@ pub mod drivers {
         fn from_field(&mut self, value: Self::F) -> Self::W { value }
     }
 
+    /// Driver that models wires as indices (positions) — skeleton for proving path
+    pub struct ProvingDriver<F: Field> {
+        pub next_index: usize,
+        _marker: PhantomData<F>,
+    }
+
+    impl<F: Field> Default for ProvingDriver<F> {
+        fn default() -> Self { Self { next_index: 1, _marker: PhantomData } }
+    }
+
+    impl<F: Field> Driver for ProvingDriver<F> {
+        type F = F;
+        type W = usize;
+        const ONE: Self::W = 0; // reserved constant wire index
+        type MaybeKind = crate::maybe::KindAlways;
+        type IO = PublicInput<F>;
+
+        fn mul(
+            &mut self,
+            values: impl FnOnce() -> Result<(Self::F, Self::F, Self::F), anyhow::Error>,
+        ) -> Result<(Self::W, Self::W, Self::W), anyhow::Error> {
+            // In proving path, witness exists; evaluate closure then allocate wires
+            let _ = values()?;
+            let a = { let i = self.next_index; self.next_index += 1; i };
+            let b = { let i = self.next_index; self.next_index += 1; i };
+            let c = { let i = self.next_index; self.next_index += 1; i };
+            Ok((a, b, c))
+        }
+
+        fn add<L: IntoIterator<Item = (Self::W, Self::F)>>( 
+            &mut self,
+            lc: impl FnOnce() -> L,
+        ) -> Result<Self::W, anyhow::Error> {
+            // In proving path, we avoid evaluating the linear combination eagerly
+            let out = self.next_index;
+            self.next_index += 1;
+            Ok(out)
+        }
+
+        fn enforce_zero<L: IntoIterator<Item = (Self::W, Self::F)>>( 
+            &mut self,
+            lc: impl FnOnce() -> L,
+        ) -> Result<(), anyhow::Error> {
+            // In proving path, constraints are recorded by the backend; no eager evaluation
+            Ok(())
+        }
+
+        fn from_field(&mut self, _value: Self::F) -> Self::W {
+            let idx = self.next_index;
+            self.next_index += 1;
+            idx
+        }
+    }
+
+    // Allow collecting outputs when using ProvingDriver; since W=usize here, 
+    // we cannot map wire indices to values in this lightweight driver, so we no-op.
+    impl<F: Field> Sink<ProvingDriver<F>, usize> for PublicInput<F> {
+        fn absorb(&mut self, _value: usize) {
+            // No-op in proving driver; real backends would map wires to values.
+        }
+    }
+
+    /// Driver that treats wires as field values — skeleton for verification path
+    pub struct VerificationDriver<F: Field> {
+        _marker: PhantomData<F>,
+    }
+
+    impl<F: Field> Default for VerificationDriver<F> {
+        fn default() -> Self { Self { _marker: PhantomData } }
+    }
+
+    impl<F: Field> Driver for VerificationDriver<F> {
+        type F = F;
+        type W = F;
+        const ONE: Self::W = F::ONE;
+        type MaybeKind = crate::maybe::KindAlways;
+        type IO = PublicInput<F>;
+
+        fn mul(
+            &mut self,
+            values: impl FnOnce() -> Result<(Self::F, Self::F, Self::F), anyhow::Error>,
+        ) -> Result<(Self::W, Self::W, Self::W), anyhow::Error> {
+            // In verification (witnessless) path, avoid invoking assignment closure
+            let _ = core::mem::size_of_val(&values); // keep generic param usage
+            Ok((F::ZERO, F::ZERO, F::ZERO))
+        }
+
+        fn add<L: IntoIterator<Item = (Self::W, Self::F)>>( 
+            &mut self,
+            lc: impl FnOnce() -> L,
+        ) -> Result<Self::W, anyhow::Error> {
+            let mut acc = F::ZERO;
+            for (w, coeff) in lc() { acc += w * coeff; }
+            Ok(acc)
+        }
+
+        fn enforce_zero<L: IntoIterator<Item = (Self::W, Self::F)>>( 
+            &mut self,
+            lc: impl FnOnce() -> L,
+        ) -> Result<(), anyhow::Error> {
+            let mut acc = F::ZERO;
+            for (w, coeff) in lc() { acc += w * coeff; }
+            if acc.is_zero_vartime() { Ok(()) } else { Err(anyhow::anyhow!("constraint not satisfied")) }
+        }
+
+        fn from_field(&mut self, value: Self::F) -> Self::W { value }
+    }
+
+    impl<F: Field> Sink<VerificationDriver<F>, F> for PublicInput<F> {
+        fn absorb(&mut self, value: F) {
+            self.values.push(value);
+        }
+    }
+
     /// Convenience: compute public inputs for a circuit using the public-input driver
     pub fn compute_public_inputs<F: Field, C: Circuit<F>>(
         circuit: &C,
@@ -231,9 +391,39 @@ pub mod drivers {
         Ok(sink.values)
     }
 
-    /// Aliases for clarity in production code
-    pub type ProvingDriver<F> = PublicInputDriver<F>;
-    pub type VerificationDriver<F> = PublicInputDriver<F>;
+    /// Convenience: compute public inputs for a circuit using the public-input driver
+    /// (aliases preserved for backwards compatibility)
+    pub type PublicInputsDriver<F> = PublicInputDriver<F>;
+}
+
+pub mod poly;
+
+#[cfg(test)]
+mod tests {
+    use super::maybe::*;
+
+    #[test]
+    fn maybe_always_executes_closures() {
+        let mut hit = 0u32;
+        let m: Always<u32> = <KindAlways as MaybeKind>::Rebind::with(|| { hit += 1; Ok(7u32) }).unwrap();
+        assert_eq!(hit, 1);
+        let v = m.map(|x| x + 1).take();
+        assert_eq!(v, 8);
+    }
+
+    #[test]
+    fn maybe_empty_skips_closures() {
+        let mut hit = 0u32;
+        let m: Empty = <KindEmpty as MaybeKind>::Rebind::with::<u32, ()>(|| { hit += 1; Ok(7u32) }).unwrap();
+        assert_eq!(hit, 0);
+        let _n: Empty = m.and_then(|_x| Empty);
+    }
+
+    #[test]
+    fn zst_size_checks() {
+        assert_eq!(core::mem::size_of::<Empty>(), 0);
+        assert_eq!(core::mem::size_of::<Always<u64>>(), core::mem::size_of::<u64>());
+    }
 }
 
 
