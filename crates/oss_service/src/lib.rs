@@ -72,9 +72,9 @@ pub struct ObliviousSyncService {
     /// Background network listener task
     listener_task: Option<JoinHandle<()>>,
     /// Shutdown channel
-    shutdown_tx: Option<mpsc::UnboundedSender<()>>,
+    shutdown_tx: Option<mpsc::Sender<()>>,
     /// Network listener shutdown channel
-    listener_shutdown_tx: Option<mpsc::UnboundedSender<()>>,
+    listener_shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 /// Wallet subscription information
@@ -232,7 +232,7 @@ impl ObliviousSyncService {
     pub async fn stop(&mut self) -> Result<()> {
         // Stop sync task
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+            let _ = shutdown_tx.send(()).await;
         }
 
         if let Some(sync_task) = self.sync_task.take() {
@@ -241,7 +241,7 @@ impl ObliviousSyncService {
 
         // Stop network listener task
         if let Some(listener_shutdown_tx) = self.listener_shutdown_tx.take() {
-            let _ = listener_shutdown_tx.send(());
+            let _ = listener_shutdown_tx.send(()).await;
         }
         if let Some(listener_task) = self.listener_task.take() {
             let _ = listener_task.await;
@@ -255,7 +255,7 @@ impl ObliviousSyncService {
 
     /// Start background synchronization task
     async fn start_sync_task(&mut self) -> Result<()> {
-        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
 
         let sync_interval = Duration::from_secs(self.config.sync_interval_secs);
@@ -545,7 +545,7 @@ impl ObliviousSyncService {
         let published = self.published.clone();
 
         // Create a dedicated shutdown channel for the listener
-        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
         let task = tokio::spawn(async move {
             // Keep a bounded list size to avoid unbounded memory growth

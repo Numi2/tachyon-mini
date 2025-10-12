@@ -232,7 +232,7 @@ pub struct TachyonNetwork {
     /// Optional convenience local blob store (legacy, used in benches)
     pub blob_store: TachyonBlobStore,
     /// Control protocol handler
-    _control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
+    _control_tx: mpsc::Sender<(NodeId, ControlMessage)>,
     /// Blob announcements
     announcements: broadcast::Sender<(BlobKind, Cid, u64, usize, String)>,
     /// Active control connections per peer
@@ -314,7 +314,7 @@ impl TachyonNetwork {
         let blob_store = TachyonBlobStore::new(data_dir).await?;
 
         // Create channels for communication
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::channel(1024);
         let (announcements, _) = broadcast::channel(1000);
         let (oob_events, _oob_rx) = broadcast::channel(1000);
         let announcements_tx = announcements.clone();
@@ -331,7 +331,8 @@ impl TachyonNetwork {
             published: published.clone(),
             header_provider: Arc::new(RwLock::new(None)),
             auth_ok: Arc::new(RwLock::new(HashMap::new())),
-            rate: Arc::new(RwLock::new(HashMap::new())),
+            
+            buckets: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Register control protocol and iroh-blobs provider for remote blob serving
@@ -895,11 +896,11 @@ async fn read_framed(mut recv: RecvStream) -> Result<Vec<u8>> {
 #[derive(Clone)]
 struct ControlProtocol {
     peers: Arc<RwLock<HashMap<NodeId, Connection>>>,
-    control_tx: mpsc::UnboundedSender<(NodeId, ControlMessage)>,
+    control_tx: mpsc::Sender<(NodeId, ControlMessage)>,
     header_provider: Arc<RwLock<Option<Arc<dyn HeaderProvider>>>>,
     published: Arc<RwLock<Published>>,
     auth_ok: Arc<RwLock<HashMap<NodeId, bool>>>,
-    rate: Arc<RwLock<HashMap<NodeId, RateState>>>,
+    buckets: Arc<RwLock<HashMap<NodeId, TokenBucket>>>,
 }
 
 impl std::fmt::Debug for ControlProtocol {
@@ -924,7 +925,7 @@ impl ProtocolHandler for ControlProtocol {
         let published = self.published.clone();
         let header_provider = self.header_provider.clone();
         let auth_ok = self.auth_ok.clone();
-        let rate = self.rate.clone();
+        let buckets = self.buckets.clone();
         Box::pin(async move {
             let node_id = match conn.remote_node_id() {
                 Ok(id) => id,
@@ -977,23 +978,18 @@ impl ProtocolHandler for ControlProtocol {
                             }
                         }
 
-                        // Simple per-peer rate limiting (requests per second)
+                        // Token-bucket per-peer rate limiting
                         {
                             let rps: u32 = std::env::var("TACHYON_CTRL_RPS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+                            let burst: u32 = std::env::var("TACHYON_CTRL_BURST").ok().and_then(|s| s.parse().ok()).unwrap_or(rps.saturating_mul(2));
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                            // Update window and count without holding the lock across awaits
-                            let exceeded = {
-                                let mut map = rate.write().unwrap();
-                                let st = map.entry(node_id).or_insert(RateState { window_start: now, count: 0 });
-                                if now != st.window_start {
-                                    st.window_start = now;
-                                    st.count = 0;
-                                }
-                                st.count = st.count.saturating_add(1);
-                                st.count > rps
+                            let allow = {
+                                let mut map = buckets.write().unwrap();
+                                let entry = map.entry(node_id).or_insert(TokenBucket { tokens: burst, last_refill: now });
+                                TokenBucket::allow(now, entry, rps, burst)
                             };
-                            if exceeded {
-                                // Exceeded; drop silently
+                            if !allow {
+                                // Drop silently when bucket empty
                                 continue;
                             }
                         }
@@ -1028,11 +1024,14 @@ impl ProtocolHandler for ControlProtocol {
                                             let _ = write_framed(&mut send, &encoded).await;
                                         }
                                         // Forward to control task for event broadcast
-                                        let _ = tx.send((node_id, ControlMessage::OobPayment { hash, payment }));
+                                        let _ = tx.send((node_id, ControlMessage::OobPayment { hash, payment })).await;
                                     }
                                     other => {
-                                        // Forward other control messages to the control task
-                                        let _ = tx.send((node_id, other));
+                                        // Forward other control messages to the control task with backpressure
+                                        if let Err(_e) = tx.try_send((node_id, other)) {
+                                            // Drop on saturation to apply backpressure to sender implicitly
+                                            // Optionally log at debug level
+                                        }
                                     }
                                 }
                             }
@@ -1067,5 +1066,23 @@ fn persist_or_load_secret_key(data_dir: &std::path::Path) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&bytes))
 }
 
+/// Token-bucket style rate limiter (simple per-connection bucket)
 #[derive(Clone, Copy)]
-struct RateState { window_start: u64, count: u32 }
+struct TokenBucket { tokens: u32, last_refill: u64 }
+
+impl TokenBucket {
+    fn allow(now: u64, bucket: &mut TokenBucket, rate_per_sec: u32, burst: u32) -> bool {
+        if bucket.last_refill != now {
+            let elapsed = now.saturating_sub(bucket.last_refill);
+            let refill = (elapsed as u32).saturating_mul(rate_per_sec);
+            bucket.tokens = (bucket.tokens.saturating_add(refill)).min(burst);
+            bucket.last_refill = now;
+        }
+        if bucket.tokens > 0 {
+            bucket.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}

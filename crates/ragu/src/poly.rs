@@ -149,6 +149,15 @@ impl<F: Field, O: PolynomialOracle<F>> Driver for PolyVerifierDriver<F, O> {
     }
 }
 
+// Support absorbing outputs produced under polynomial drivers (module scope)
+impl<F: Field, O: PolynomialOracle<F>> Sink<super::poly::PolyProverDriver<F, O>, F> for PublicInput<F> {
+    fn absorb(&mut self, value: F) { self.values.push(value); }
+}
+
+impl<F: Field, O: PolynomialOracle<F>> Sink<super::poly::PolyVerifierDriver<F, O>, F> for PublicInput<F> {
+    fn absorb(&mut self, value: F) { self.values.push(value); }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,15 +173,6 @@ mod tests {
         let out = drv.add(|| vec![(a, Fr::ONE), (b, Fr::from(2u64))]).unwrap();
         assert_eq!(out, Fr::from(3) + Fr::from(10));
     }
-}
-
-// Support absorbing outputs produced under polynomial drivers (module scope)
-impl<F: Field, O: PolynomialOracle<F>> Sink<super::poly::PolyProverDriver<F, O>, F> for PublicInput<F> {
-    fn absorb(&mut self, value: F) { self.values.push(value); }
-}
-
-impl<F: Field, O: PolynomialOracle<F>> Sink<super::poly::PolyVerifierDriver<F, O>, F> for PublicInput<F> {
-    fn absorb(&mut self, value: F) { self.values.push(value); }
 }
 
 

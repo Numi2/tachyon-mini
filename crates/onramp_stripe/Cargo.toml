@@ -14,6 +14,7 @@ tracing.workspace = true
 reqwest.workspace = true
 hex.workspace = true
 wallet = { path = "../wallet" }
+tachyon_common = { path = "../tachyon_common" }
 
 # lightweight http server for webhook (axum)
 axum = { version = "0.7", features = ["macros"] }

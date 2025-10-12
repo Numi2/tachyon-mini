@@ -6,22 +6,22 @@ Rust workspace that prototypes a Tachyon-style shielded system: wallet with proo
 Scope: experimental, credit to Sean Bowe & Zcash team
 
 
-Core idea (simple)
+idea
 ------------------
 - Two trees:
   - Tree 1: all coin commitments ever created (append-only).
   - Tree 2: all nullifiers of spent coins (insert-only; no deletes).
 
-- When spending a coin:
+- at spend:
   1. Prove the coin is in the coin tree.
   2. Prove the spend nullifier is not in the nullifier tree.
   3. Insert the nullifier into the nullifier tree.
 
-- Block rule:
+- Blocks:
   - One block-wide proof (Halo2 + Poseidon2) checks all spends, inserts, and new coins at once.
   - Validators verify only this succinct proof and update the two accumulators.
 
-- Why it works:
+- resultat:
   - No deletions → simpler, faster accumulators and witness updates.
   - Wallets apply small per-block deltas.
   - Verifiers avoid replaying transactions; they check one succinct proof.
@@ -33,11 +33,11 @@ What this is
 - **OSS (Oblivious Sync Service)**: publishes per-height Manifests that reference commitment MMR deltas, nullifier deltas, and PCD transition blobs. Peers see only content hashes/sizes.
 - **Node extension**: maintains canonical commitment MMR and nullifier SetAccumulator; verifies PCD; enforces nullifier uniqueness across full history; prunes old state.
 - **Accumulators**: MMR for commitments, sparse set for nullifiers; support batched deltas and witness updates.
-- **Header sync**: simplified bootstrap/checkpoint flow.
+- **Header sync**: simplified bootstrap/checkpoint flow, pooled HTTP client for Zebra headers.
 - **Networking**: `iroh` + `iroh-blobs` for transport and content addressing; includes `BlobKind::Manifest` and a `SyncManifest` index by height.
-- **Chain nullifier client (optional)**: wallet can query a Zebra HTTP endpoint for observed nullifiers using TLS (`reqwest` + `rustls`).
+- **Chain nullifier client )**: wallet can query a Zebra HTTP endpoint for observed nullifiers using TLS (`reqwest` + `rustls`).
 - **Witness maintenance**: after adopting a new PCD state, the wallet recomputes and persists MMR witnesses for all unspent notes.
- - **Halo2 transition proofs (real)**: transitions are proven/verified with Halo2; legacy hash/mocks removed.
+ - **Halo2 transition proofs )**: transitions are proven/verified with Halo2; legacy hash/mocks removed.
  - **Manifests from block data**: OSS consumes node-published deltas and publishes per-height manifests and PCD transitions only.
  - **Pruning journals**: node writes per-block journals and prunes beyond a retention window.
 
@@ -238,6 +238,8 @@ Assumptions & non-goals
 -----------------------
 - Fixed demo keys, localhost relay, permissive defaults; safe for local dev only.
 - Transition proofs are real Halo2; performance numbers are still aspirational.
+- Ingress limits: bounded mpsc channels and per-peer token-bucket limiting on control ingress.
+- Shared HTTP pooling: `tachyon_common::HTTP_CLIENT` for connection reuse across crates.
 - OSS auth/rate limit is minimal.
 - API surfaces may change.
 
@@ -258,6 +260,46 @@ See `.github/workflows/ci.yml` for lint, build, unit tests, and an integration j
 Credits
 -------
 Idea inspired by Tachyon and Sean Bowe’s writing.
+
+## DEX (orderbook + wallet integration)
+
+A simple in-memory price-time priority orderbook with a pluggable engine and tight wallet integration for balances and settlement.
+
+- Engine
+  - In-memory `DexService` by default; optional `sled`-backed engine.
+  - Automatic snapshot persistence for the in-memory engine at `<wallet_db>/dex/orderbook.bin` (loaded on startup, saved after order ops).
+  - Single market (BASE/USDC) for now; integer `u64` prices/qty.
+
+- Wallet integration
+  - Uses `storage::TokenLedger` with available/locked balances.
+  - Bids lock USDC; asks lock BASE. Fills are settled atomically:
+    - Bid fill: spend locked USDC, credit BASE.
+    - Ask fill: spend locked BASE, credit USDC.
+  - Market orders refund any unused locks; cancel unlocks remaining.
+
+- CLI usage (examples)
+
+```bash
+# Show balances
+cargo run -p cli -- dex balance --db-path ~/.tachyon/wallets/alice --password pass
+
+# Deposit demo funds
+cargo run -p cli -- dex deposit-usdc --db-path ~/.tachyon/wallets/alice --amount 1000000 --password pass
+cargo run -p cli -- dex deposit-base --db-path ~/.tachyon/wallets/alice --amount 25 --password pass
+
+# Place orders
+cargo run -p cli -- dex place-limit --db-path ~/.tachyon/wallets/alice --side bid --price 100 --qty 10 --password pass
+cargo run -p cli -- dex place-market --db-path ~/.tachyon/wallets/alice --side ask --qty 5 --password pass
+
+# Inspect orderbook and trades
+cargo run -p cli -- dex orderbook --db-path ~/.tachyon/wallets/alice --depth 10 --format json --password pass
+cargo run -p cli -- dex trades --db-path ~/.tachyon/wallets/alice --limit 20 --password pass
+
+# Watch (polling)
+cargo run -p cli -- dex watch --db-path ~/.tachyon/wallets/alice --depth 10 --interval-ms 1000 --password pass
+```
+
+Notes: demo-only, no fees or risk controls yet; owner identity is per-wallet and persisted.
 
 ## Onramp (Stripe) Integration
 

@@ -3,13 +3,28 @@
 //! Merkle Mountain Range (MMR) accumulator implementation for Tachyon.
 //! Provides append-only structure with proof generation, delta application, and witness updates.
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
+use crate::error::Result;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt};
 
 /// Size of MMR nodes in bytes
 pub const MMR_NODE_SIZE: usize = 32;
+pub mod error {
+    use thiserror::Error as ThisError;
+    pub type Result<T> = core::result::Result<T, Error>;
+    #[derive(Debug, ThisError)]
+    pub enum Error {
+        #[error("invalid input: {0}")] InvalidInput(String),
+        #[error("missing data: {0}")] Missing(String),
+        #[error("serialize error: {0}")] Serialize(String),
+        #[error("deserialize error: {0}")] Deserialize(String),
+        #[error("other: {0}")] Other(String),
+    }
+    impl From<anyhow::Error> for Error { fn from(e: anyhow::Error) -> Self { Error::Other(e.to_string()) } }
+}
+
 
 /// Wrapper for Hash that implements Serialize/Deserialize
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,7 +37,7 @@ impl SerializableHash {
 }
 
 impl Serialize for SerializableHash {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -31,7 +46,7 @@ impl Serialize for SerializableHash {
 }
 
 impl<'de> Deserialize<'de> for SerializableHash {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -308,12 +323,12 @@ impl MmrAccumulator {
     /// Generate a proof for the element at the given position
     pub fn prove(&self, position: u64) -> Result<MmrProof> {
         if position >= self.size {
-            return Err(anyhow!("Position out of bounds"));
+            return Err(anyhow!("Position out of bounds").into());
         }
-        let element = *self
-            .nodes
-            .get(&position)
-            .ok_or_else(|| anyhow!("Element not found"))?;
+        let element = match self.nodes.get(&position) {
+            Some(n) => *n,
+            None => return Err(anyhow!("Element not found").into()),
+        };
 
         // Generate siblings bottom-up until reaching a peak (i.e., no parent present)
         let mut siblings = Vec::new();
@@ -336,11 +351,17 @@ impl MmrAccumulator {
         Ok(MmrProof {
             element,
             siblings,
-            peaks: self
-                .peaks
-                .iter()
-                .map(|&pos| *self.nodes.get(&pos).unwrap())
-                .collect(),
+            peaks: {
+                let mut out = Vec::with_capacity(self.peaks.len());
+                for &pos in &self.peaks {
+                    if let Some(n) = self.nodes.get(&pos) {
+                        out.push(*n);
+                    } else {
+                        return Err(anyhow!("Peak node missing").into());
+                    }
+                }
+                out
+            },
         })
     }
 
@@ -433,7 +454,7 @@ impl TachygramAccumulator {
     /// Produce a membership proof for the given element, if present.
     pub fn prove(&self, element: &[u8; 32]) -> Result<TachygramMembershipProof> {
         let Some(positions) = self.index.get(element) else {
-            return Err(anyhow!("Element not found"));
+            return Err(anyhow!("Element not found").into());
         };
         let &pos = positions
             .first()
@@ -539,6 +560,20 @@ impl MmrWitness {
             None => Hash::from([0u8; 32]) == *mmr_root,
         }
     }
+
+    /// Apply a witness update produced against a new MMR state.
+    pub fn apply_update(&mut self, update: &MmrWitnessUpdate) {
+        if !update.auth_path_updates.is_empty() {
+            self.auth_path = update.auth_path_updates.clone();
+        }
+        if !update.new_peaks.is_empty() {
+            self.peaks = update
+                .new_peaks
+                .iter()
+                .map(|(pos, h)| (*pos, *h))
+                .collect();
+        }
+    }
 }
 
 /// Persistence layer
@@ -614,6 +649,49 @@ impl MmrAccumulator {
             size: meta.size,
         })
     }
+
+    /// Compute a targeted witness update for the element at `position` against this MMR state.
+    /// Returns only the updated auth path and current peaks, avoiding full witness recomputation for others.
+    pub fn compute_witness_update(&self, position: u64) -> Result<MmrWitnessUpdate> {
+        if position >= self.size {
+            return Err(anyhow!("Position out of bounds").into());
+        }
+        // Rebuild the auth path for this position by walking siblings upward until reaching a peak.
+        let mut auth_path: Vec<(u64, SerializableHash)> = Vec::new();
+        let mut current_pos = position;
+        loop {
+            let sib_pos = mmr_sibling_pos(current_pos);
+            if let Some(sibling) = self.nodes.get(&sib_pos) {
+                auth_path.push((sibling.position, sibling.hash));
+            } else {
+                break;
+            }
+            let parent_pos = mmr_parent_pos(current_pos);
+            if self.nodes.contains_key(&parent_pos) {
+                current_pos = parent_pos;
+            } else {
+                break;
+            }
+        }
+
+        // Snapshot current peaks
+        let mut peaks: Vec<(u64, SerializableHash)> = Vec::with_capacity(self.peaks.len());
+        for &pos in &self.peaks {
+            let Some(n) = self.nodes.get(&pos) else { return Err(anyhow!("Peak node missing").into()); };
+            peaks.push((n.position, n.hash));
+        }
+
+        Ok(MmrWitnessUpdate { auth_path_updates: auth_path, new_peaks: peaks })
+    }
+}
+
+/// Compact witness update describing only the parts that changed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MmrWitnessUpdate {
+    /// Replacement authentication path nodes (position, hash)
+    pub auth_path_updates: Vec<(u64, SerializableHash)>,
+    /// New current peaks for the accumulator
+    pub new_peaks: Vec<(u64, SerializableHash)>,
 }
 
 /// Tests for the MMR accumulator

@@ -28,6 +28,7 @@ accum_set = { path = "../accum_set", optional = true }
 dex = { path = "../dex", optional = true }
 rand = { version = "0.8", optional = true }
 circuits = { path = "../circuits", optional = true }
+tachyon_common = { path = "../tachyon_common", optional = true }
 ## Zcash dependencies temporarily removed to resolve dependency conflicts
 ## bip0039 removed to avoid pbkdf2/subtle conflicts
 
@@ -51,4 +52,5 @@ pcd = [
     "accum_set",
     "dex",
     "circuits",
+    "tachyon_common",
 ]

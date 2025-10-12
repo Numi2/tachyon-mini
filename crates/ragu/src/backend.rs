@@ -10,6 +10,7 @@ use ff::{Field, PrimeField};
 use serde::{Serialize, Deserialize};
 
 use crate::r1cs::{R1csRecorder, Var, VarKind};
+// use crate::circuit::Driver; // no direct trait methods used here
 
 /// Versioned proof format for mock proofs
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -130,6 +131,7 @@ pub fn verify_mock<F: PrimeField>(
 mod tests {
     use super::*;
     use crate::r1cs::{R1csProverDriver, Wire};
+    use crate::circuit::Driver; // bring trait methods (add, mul, enforce_zero) into scope
     type Fr = pasta_curves::Fp;
 
     #[test]

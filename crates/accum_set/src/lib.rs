@@ -3,11 +3,25 @@
 //! Sparse accumulator for nullifiers and note commitments supporting batch (non-)membership checks.
 //! This is a simplified stand-in for a cryptographic accumulator suitable for PCD integration.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow};
+use crate::error::Result;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use std::collections::BTreeSet;
+pub mod error {
+    use thiserror::Error as ThisError;
+    pub type Result<T> = core::result::Result<T, Error>;
+    #[derive(Debug, ThisError)]
+    pub enum Error {
+        #[error("invalid input: {0}")] InvalidInput(String),
+        #[error("serialize error: {0}")] Serialize(String),
+        #[error("deserialize error: {0}")] Deserialize(String),
+        #[error("other: {0}")] Other(String),
+    }
+    impl From<anyhow::Error> for Error { fn from(e: anyhow::Error) -> Self { Error::Other(e.to_string()) } }
+}
+
 
 /// A domain-separated hash for set elements
 fn hash_element(elem: &[u8]) -> Hash {
@@ -139,9 +153,7 @@ impl SetAccumulator {
 
     /// Create a membership witness for an element
     pub fn create_membership_witness(&self, element: &[u8; 32]) -> Result<MembershipWitness> {
-        if !self.contains(element) {
-            return Err(anyhow!("Element not in set"));
-        }
+        if !self.contains(element) { return Err(anyhow!("Element not in set").into()); }
 
         // Build sorted leaf list and locate index
         let elements_vec: Vec<[u8; 32]> = self.elements.iter().cloned().collect();
@@ -437,7 +449,7 @@ impl Smt16Accumulator {
     }
 
     pub fn create_non_membership_witness(&self, key: &[u8; 32]) -> Result<Smt16NonMembershipProof> {
-        if self.contains(key) { return Err(anyhow!("Key present; cannot create non-membership proof")); }
+        if self.contains(key) { return Err(anyhow!("Key present; cannot create non-membership proof").into()); }
         let empty = smt16_empty_hashes();
         let path = smt16_key_to_nibbles(key);
         let mut siblings: Vec<[[u8; 32]; SMT16_ARITY - 1]> = vec![[[0u8; 32]; SMT16_ARITY - 1]; SMT16_DEPTH];

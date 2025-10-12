@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn maybe_always_executes_closures() {
         let mut hit = 0u32;
-        let m: Always<u32> = <KindAlways as MaybeKind>::Rebind::with(|| { hit += 1; Ok(7u32) }).unwrap();
+        let m: Always<u32> = <Always<u32> as Maybe<u32>>::with(|| { hit += 1; Ok::<u32, ()>(7u32) }).unwrap();
         assert_eq!(hit, 1);
         let v = m.map(|x| x + 1).take();
         assert_eq!(v, 8);
@@ -433,9 +433,9 @@ mod tests {
     #[test]
     fn maybe_empty_skips_closures() {
         let mut hit = 0u32;
-        let m: Empty = <KindEmpty as MaybeKind>::Rebind::with::<u32, ()>(|| { hit += 1; Ok(7u32) }).unwrap();
+        let m: Empty = <Empty as Maybe<u32>>::with(|| { hit += 1; Ok::<u32, ()>(7u32) }).unwrap();
         assert_eq!(hit, 0);
-        let _n: Empty = m.and_then(|_x| Empty);
+        let _n: Empty = m.and_then::<u32>(|_x: u32| Empty);
     }
 
     #[test]

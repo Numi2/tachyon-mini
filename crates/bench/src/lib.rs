@@ -1192,7 +1192,7 @@ mod tests {
     #[tokio::test]
     async fn test_quick_benchmarks() {
         let report = run_quick_benchmarks().await.unwrap();
-        assert!(report.results.len() > 0);
+        assert!(!report.results.is_empty());
         assert!(report.summary.total_operations > 0);
     }
 

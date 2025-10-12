@@ -56,13 +56,15 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(if cli.verbose {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::INFO
-        })
+    // Initialize structured logging (JSON)
+    let env_level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        if cli.verbose { "debug".into() } else { "info".into() }
+    });
+    std::env::set_var("RUST_LOG", env_level);
+    let subscriber = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_ansi(false)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber)?;

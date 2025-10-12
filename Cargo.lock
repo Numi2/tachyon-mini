@@ -10,6 +10,7 @@ dependencies = [
  "blake3",
  "hex",
  "serde",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -21,6 +22,7 @@ dependencies = [
  "blake3",
  "serde",
  "serde-big-array",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1358,6 +1360,7 @@ dependencies = [
  "serde_json",
  "sled",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -2228,6 +2231,7 @@ dependencies = [
  "pq_crypto",
  "reqwest",
  "serde",
+ "tachyon_common",
  "tokio",
  "tracing",
  "zebra-chain",
@@ -3591,7 +3595,9 @@ dependencies = [
  "pq_crypto",
  "ragu",
  "rand 0.8.5",
+ "rayon",
  "serde",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -3732,6 +3738,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tachyon_common",
  "time",
  "tokio",
  "tower 0.4.13",
@@ -4360,6 +4367,7 @@ dependencies = [
  "hex",
  "pqcrypto-dilithium",
  "pqcrypto-kyber",
+ "pqcrypto-mldsa",
  "pqcrypto-traits",
  "rand 0.8.5",
  "serde",
@@ -4401,6 +4409,20 @@ dependencies = [
  "cc",
  "glob",
  "libc",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
+]
+
+[[package]]
+name = "pqcrypto-mldsa"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f812cd126a2582599478a434fea75937b4b05d234c64a49e0cea129e130528"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
+ "paste",
  "pqcrypto-internals",
  "pqcrypto-traits",
 ]
@@ -5634,7 +5656,9 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -5799,6 +5823,17 @@ dependencies = [
  "anyhow",
  "derive_builder",
  "regex",
+]
+
+[[package]]
+name = "tachyon_common"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "reqwest",
+ "serde",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -6391,6 +6426,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storage",
+ "tachyon_common",
  "tempfile",
  "tokio",
  "tracing",

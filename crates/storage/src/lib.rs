@@ -3,9 +3,13 @@
 //! Encrypted storage layer for Tachyon wallet.
 //! Provides secure note database with encryption at rest and in-memory caching.
 
+pub mod error;
+
 use anyhow::{anyhow, Result};
 use fs2::FileExt;
 use rand::RngCore;
+use rand::rngs::OsRng;
+use zeroize::Zeroize;
 use pq_crypto::{
     KyberPublicKey, KyberSecretKey, SimpleAead, SimpleKem, AES_KEY_SIZE, AES_NONCE_SIZE,
 };
@@ -263,11 +267,15 @@ pub struct WalletDatabase {
 impl WalletDatabase {
     /// Create a new wallet database
     pub async fn new(db_path: &Path, master_password: &str) -> Result<Self> {
-        // Derive master key from password (in production, use proper KDF like Argon2)
-        let master_key = Self::derive_master_key(master_password)?;
-
-        // Create database directory
+        // Input validation
+        if master_password.is_empty() && std::env::var("TACHYON_ALLOW_INSECURE").unwrap_or_default() != "1" {
+            return Err(anyhow!("master password must not be empty"));
+        }
+        // Ensure database directory exists first (for salt file)
         fs::create_dir_all(db_path).await?;
+
+        // Derive master key from password using Argon2id with per-db random salt (migrates if needed)
+        let (master_key, maybe_legacy_key) = Self::derive_master_key(db_path, master_password)?;
 
         // Acquire process-wide lock file for this database to prevent concurrent writers
         let lock_path = db_path.join("db.lock");
@@ -297,16 +305,173 @@ impl WalletDatabase {
         // Load existing data from disk
         db.load_from_disk().await?;
 
+        // If we have a legacy key (salt was newly created) and there is existing encrypted data,
+        // migrate all encrypted records to the new master key and persist.
+        if let Some(mut legacy_key) = maybe_legacy_key {
+            let has_existing = {
+                let notes = db.note_cache.read().unwrap();
+                let pcd = db.pcd_state_cache.read().unwrap();
+                let wits = db.witness_cache.read().unwrap();
+                let oob = db.oob_keys_cache.read().unwrap();
+                let spend = db.spend_secret_cache.read().unwrap();
+                let zseed = db.zcash_seed_cache.read().unwrap();
+                !notes.is_empty() || pcd.is_some() || !wits.is_empty() || oob.is_some() || spend.is_some() || zseed.is_some()
+            };
+
+            if has_existing {
+                // Migrate notes
+                {
+                    let mut new_map: HashMap<[u8; NOTE_COMMITMENT_SIZE], EncryptedNote> = HashMap::new();
+                    let old_map = db.note_cache.read().unwrap().clone();
+                    for (cm, enc) in old_map.into_iter() {
+                        if let Ok(plaintext) = enc.decrypt(&legacy_key) {
+                            if let Ok(new_rec) = EncryptedNote::new(enc.position, enc.block_height, &plaintext, &db.master_key) {
+                                new_map.insert(cm, new_rec);
+                            } else {
+                                new_map.insert(cm, enc); // keep old if re-encrypt fails
+                            }
+                        } else {
+                            new_map.insert(cm, enc);
+                        }
+                    }
+                    *db.note_cache.write().unwrap() = new_map;
+                }
+
+                // Migrate PCD state
+                if let Some(rec) = db.pcd_state_cache.read().unwrap().clone() {
+                    if let Ok(state_bytes) = rec.decrypt_state(&legacy_key) {
+                        let new_rec = PcdStateRecord::new(
+                            rec.anchor_height,
+                            rec.state_commitment,
+                            &state_bytes,
+                            rec.proof.clone(),
+                            &db.master_key,
+                        )?;
+                        *db.pcd_state_cache.write().unwrap() = Some(new_rec);
+                    }
+                }
+
+                // Migrate witnesses
+                {
+                    let mut new_wits: HashMap<u64, WitnessRecord> = HashMap::new();
+                    let old_wits = db.witness_cache.read().unwrap().clone();
+                    for (pos, enc) in old_wits.into_iter() {
+                        if let Ok(plaintext) = enc.decrypt_witness(&legacy_key) {
+                            if let Ok(new_rec) = WitnessRecord::new(pos, &plaintext, &db.master_key) {
+                                new_wits.insert(pos, new_rec);
+                            } else {
+                                new_wits.insert(pos, enc);
+                            }
+                        } else {
+                            new_wits.insert(pos, enc);
+                        }
+                    }
+                    *db.witness_cache.write().unwrap() = new_wits;
+                }
+
+                // Migrate OOB keys
+                if let Some(keys) = db.oob_keys_cache.read().unwrap().clone() {
+                    if let Ok(sk_bytes) = keys.decrypt_secret(&legacy_key) {
+                        let pk = KyberPublicKey::new(keys.public_key.clone());
+                        let sk = KyberSecretKey::new(sk_bytes);
+                        let new_keys = OobKeysRecord::new(&pk, &sk, &db.master_key)?;
+                        *db.oob_keys_cache.write().unwrap() = Some(new_keys);
+                    }
+                }
+
+                // Migrate spend secret
+                if let Some(spend) = db.spend_secret_cache.read().unwrap().clone() {
+                    if let Ok(sec) = spend.decrypt(&legacy_key) {
+                        let new_rec = SpendSecretRecord::new(&sec, &db.master_key)?;
+                        *db.spend_secret_cache.write().unwrap() = Some(new_rec);
+                    }
+                }
+
+                // Migrate Zcash seed
+                if let Some(zrec) = db.zcash_seed_cache.read().unwrap().clone() {
+                    if let Ok(mnemonic) = zrec.decrypt_mnemonic(&legacy_key) {
+                        let new_rec = ZcashSeedRecord::new(&mnemonic, zrec.birthday_height, &db.master_key)?;
+                        *db.zcash_seed_cache.write().unwrap() = Some(new_rec);
+                    }
+                }
+
+                // Persist migrated data
+                db.save_to_disk().await?;
+            }
+
+            // Zeroize legacy key material
+            legacy_key.zeroize();
+        }
+
         Ok(db)
     }
 
-    /// Derive master key from password using Argon2id
-    fn derive_master_key(password: &str) -> Result<[u8; DB_MASTER_KEY_SIZE]> {
+    /// Derive master key from password using Argon2id and per-db salt.
+    /// Returns (new_key, maybe_legacy_key) where legacy is Some if a migration may be needed.
+    fn derive_master_key(db_path: &Path, password: &str) -> Result<([u8; DB_MASTER_KEY_SIZE], Option<[u8; DB_MASTER_KEY_SIZE]>)> {
         use argon2::{Argon2, ParamsBuilder};
         use argon2::password_hash::{PasswordHasher, SaltString};
         use argon2::{Algorithm, Version};
 
-        // Derive a deterministic salt from the password (for demo). In production, store a random salt.
+        // Salt file path
+        let salt_path = db_path.join("salt.bin");
+        let mut created_new_salt = false;
+        let salt_bytes: [u8; 16] = if salt_path.exists() {
+            let bytes = std::fs::read(&salt_path)?;
+            if bytes.len() != 16 { return Err(anyhow!("invalid salt file length")); }
+            let mut s = [0u8; 16];
+            s.copy_from_slice(&bytes);
+            s
+        } else {
+            let mut s = [0u8; 16];
+            OsRng.fill_bytes(&mut s);
+            // Best-effort atomic write
+            let tmp = db_path.join("salt.bin.tmp");
+            std::fs::write(&tmp, s)?;
+            std::fs::rename(&tmp, &salt_path)?;
+            created_new_salt = true;
+            s
+        };
+
+        let salt = SaltString::encode_b64(&salt_bytes)
+            .map_err(|_| anyhow!("salt encode failed"))?;
+
+        // Reasonable defaults; tune as needed.
+        let params = ParamsBuilder::new()
+            .m_cost(19456)
+            .t_cost(2)
+            .p_cost(1)
+            .output_len(DB_MASTER_KEY_SIZE)
+            .build()
+            .map_err(|e| anyhow!("argon2 params error: {:?}", e))?;
+
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let phc = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| anyhow!("argon2 hash error: {:?}", e))?;
+
+        let out = phc.hash.ok_or_else(|| anyhow!("argon2 output missing"))?;
+        let out_bytes = out.as_bytes();
+        if out_bytes.len() < DB_MASTER_KEY_SIZE {
+            return Err(anyhow!("argon2 output too short"));
+        }
+        let mut key = [0u8; DB_MASTER_KEY_SIZE];
+        key.copy_from_slice(&out_bytes[..DB_MASTER_KEY_SIZE]);
+
+        // If we just created a new random salt, compute legacy deterministic key for migration
+        let legacy = if created_new_salt {
+            Some(Self::derive_legacy_master_key(password)?)
+        } else { None };
+
+        Ok((key, legacy))
+    }
+
+    /// Legacy deterministic-salt derivation used by earlier versions (for migration only).
+    fn derive_legacy_master_key(password: &str) -> Result<[u8; DB_MASTER_KEY_SIZE]> {
+        use argon2::{Argon2, ParamsBuilder};
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        use argon2::{Algorithm, Version};
+
         let mut h = blake3::Hasher::new();
         h.update(b"wallet_master_salt");
         h.update(password.as_bytes());
@@ -315,7 +480,6 @@ impl WalletDatabase {
         let salt = SaltString::encode_b64(&salt_bytes)
             .map_err(|_| anyhow!("salt encode failed"))?;
 
-        // Reasonable defaults; tune as needed.
         let params = ParamsBuilder::new()
             .m_cost(19456)
             .t_cost(2)
@@ -738,7 +902,7 @@ impl WalletDatabase {
         }
         // Generate new random spend secret
         let mut sec = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut sec);
+        OsRng.fill_bytes(&mut sec);
         let rec = SpendSecretRecord::new(&sec, &self.master_key)?;
         {
             *self.spend_secret_cache.write().unwrap() = Some(rec);

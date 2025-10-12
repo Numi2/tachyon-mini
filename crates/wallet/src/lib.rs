@@ -24,11 +24,13 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, sync::Arc};
 use storage::{EncryptedNote, PcdStateRecord, WalletDatabase, NOTE_COMMITMENT_SIZE};
 use tokio::{
-    sync::{broadcast, mpsc, RwLock},
+    sync::{broadcast, mpsc, RwLock, Semaphore},
     task::JoinHandle,
 };
 #[cfg(feature = "pcd")]
 use reqwest::Client as HttpClient;
+#[cfg(feature = "pcd")]
+use tachyon_common::HTTP_CLIENT;
 #[cfg(feature = "pcd")]
 use accum_mmr::{MmrAccumulator, MmrWitness};
 use pcd_core::tachyon::{Tachystamp, Tachygram, Tachyaction, TachyAnchor, TachyOpKind};
@@ -60,7 +62,7 @@ impl Default for WalletConfig {
         // Default is suitable for local development/tests only. Use from_env() for production.
         Self {
             db_path: "./wallet_db".to_string(),
-            master_password: "default_password".to_string(),
+            master_password: String::new(),
             network_config: NetworkConfig::default(),
             sync_config: SyncConfig::default(),
         }
@@ -82,8 +84,7 @@ impl WalletConfig {
         let get = |key: &str| std::env::var(key).ok();
 
         let db_path = get("TACHYON_DB_PATH").unwrap_or_else(|| "./wallet_db".to_string());
-        let master_password =
-            get("TACHYON_MASTER_PASSWORD").unwrap_or_else(|| "default_password".to_string());
+        let master_password = get("TACHYON_MASTER_PASSWORD").unwrap_or_else(String::new);
 
         let data_dir = get("TACHYON_IROH_DATA_DIR").unwrap_or_else(|| "./wallet_data".to_string());
         let bootstrap_nodes = get("TACHYON_BOOTSTRAP_NODES")
@@ -131,7 +132,7 @@ impl WalletConfig {
     pub fn validate(&self) -> Result<()> {
         let allow_insecure = std::env::var("TACHYON_ALLOW_INSECURE").unwrap_or_default() == "1";
 
-        let insecure_password = self.master_password == "default_password";
+        let insecure_password = self.master_password.is_empty() || self.master_password == "default_password";
         let insecure_oss = self
             .sync_config
             .oss_endpoints
@@ -141,7 +142,7 @@ impl WalletConfig {
         if (insecure_password || insecure_oss) && !allow_insecure {
             return Err(anyhow!(
                 "Insecure configuration: {}{}. Set secure values or TACHYON_ALLOW_INSECURE=1 for development.",
-                if insecure_password { "MASTER_PASSWORD is default. " } else { "" },
+                if insecure_password { "MASTER_PASSWORD is empty or default. " } else { "" },
                 if insecure_oss { "OSS endpoints include localhost." } else { "" }
             ));
         }
@@ -291,7 +292,7 @@ pub struct TachyonWallet {
     /// Background sync task
     sync_task: Option<JoinHandle<()>>,
     /// Shutdown channel
-    shutdown_tx: Option<mpsc::UnboundedSender<()>>,
+    shutdown_tx: Option<mpsc::Sender<()>>,
     /// In-memory DEX service (single-market) for demo
     #[cfg(feature = "pcd")]
     dex: Arc<DexService>,
@@ -403,14 +404,16 @@ pub struct WalletSyncClient {
     network: Arc<TachyonNetwork>,
     /// Blob announcement receiver
     announcements: broadcast::Receiver<(BlobKind, Cid, u64, usize, String)>,
+    /// Concurrency limiter for network fetches
+    fetch_sema: Arc<Semaphore>,
 }
 
 #[cfg(feature = "pcd")]
 impl WalletSyncClient {
     /// Create a new sync client
-    pub fn new(network: Arc<TachyonNetwork>) -> Self {
+    pub fn new(network: Arc<TachyonNetwork>, fetch_sema: Arc<Semaphore>) -> Self {
         let announcements = network.subscribe_announcements();
-        Self { network, announcements }
+        Self { network, announcements, fetch_sema }
     }
 
     /// Subscribe to blob announcements for sync
@@ -432,6 +435,8 @@ impl WalletSyncClient {
     pub async fn poll_and_fetch_once(&mut self) -> Result<Option<(BlobKind, Vec<u8>)>> {
         match self.announcements.recv().await {
             Ok((kind, _cid, _height, _size, ticket)) => {
+                // Acquire a permit before fetching over the network
+                if self.fetch_sema.acquire().await.is_err() { return Ok(None); }
                 let bytes = self.network.fetch_blob_from_ticket(&ticket).await?;
                 Ok(Some((kind, bytes.to_vec())))
             }
@@ -448,9 +453,7 @@ struct ZebraNullifierClient {
 
 #[cfg(feature = "pcd")]
 impl ZebraNullifierClient {
-    fn new(base_url: String) -> Self {
-        Self { base_url, http: HttpClient::new() }
-    }
+    fn new(base_url: String) -> Self { Self { base_url, http: HTTP_CLIENT.clone() } }
 
     async fn fetch_nullifiers_since(&self, start_height: u64) -> Result<Vec<[u8; 32]>> {
         let url = format!("{}/nullifiers?since={}", self.base_url, start_height);
@@ -604,7 +607,7 @@ impl TachyonWallet {
 
         // Initialize sync manager
         #[cfg(feature = "pcd")]
-        let sync_client = WalletSyncClient::new(network.clone());
+        let sync_client = WalletSyncClient::new(network.clone(), Arc::new(Semaphore::new(8)));
         #[cfg(feature = "pcd")]
         let sync_manager = Arc::new(RwLock::new(Some(PcdSyncManager::new(
             sync_client,
@@ -614,11 +617,12 @@ impl TachyonWallet {
         // Default: enable persistent DEX engine under the wallet DB path.
         #[cfg(feature = "pcd")]
         let dex = {
-            let p = std::path::Path::new(&config.db_path).join("dex_sled");
-            if let Ok(engine) = dex::SledEngine::open(&p) {
-                DexService::with_engine(Arc::new(engine))
+            let sled_path = std::path::Path::new(&config.db_path).join("dex_sled");
+            let snap_path = std::path::Path::new(&config.db_path).join("dex").join("orderbook.bin");
+            if let Ok(engine) = dex::SledEngine::open(&sled_path) {
+                DexService::with_engine_and_snapshot(Arc::new(engine), &snap_path)
             } else {
-                DexService::new()
+                DexService::with_snapshot(&snap_path)
             }
         };
 
@@ -930,7 +934,7 @@ impl TachyonWallet {
     #[cfg(feature = "pcd")]
     async fn start_sync_task(&mut self) -> Result<()> {
         if self.sync_task.is_some() { return Ok(()); }
-        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
 
         let sync_manager = self.sync_manager.clone();
@@ -948,7 +952,7 @@ impl TachyonWallet {
 
         let sync_task = tokio::spawn(async move {
             // Subscribe to blob announcements
-            let mut client = WalletSyncClient::new(network.clone());
+            let mut client = WalletSyncClient::new(network.clone(), Arc::new(Semaphore::new(8)));
             let _ = client.subscribe_to_sync_blobs().await;
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(sync_interval));
@@ -1071,7 +1075,7 @@ impl TachyonWallet {
     pub async fn shutdown(&mut self) -> Result<()> {
         // Stop sync task
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+            let _ = shutdown_tx.send(()).await;
         }
 
         if let Some(sync_task) = self.sync_task.take() {
@@ -1190,16 +1194,17 @@ impl TachyonWallet {
                 // Settle trades and refund any unused locked USDC
                 let mut spent = 0u64;
                 for t in &trades {
+                    let trade_cost = t.price.0.saturating_mul(t.quantity.0);
                     if t.taker_owner.0 == owner.0 {
-                        spent = spent.saturating_add(t.price.0.saturating_mul(t.quantity.0));
-                        self.database.deposit_base(t.quantity.0).await?;
+                        // We are market buyer: spend locked USDC, receive base
+                        spent = spent.saturating_add(trade_cost);
+                        self.database.settle_bid_fill(t.quantity.0, trade_cost).await?;
                     } else if t.maker_owner.0 == owner.0 {
-                        self.database.spend_locked_base(t.quantity.0).await?;
-                        self.database.deposit_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
+                        // We were maker on ask: spend locked base, receive USDC
+                        self.database.settle_ask_fill(t.quantity.0, trade_cost).await?;
                     }
                 }
                 if cost > spent { self.database.unlock_usdc(cost - spent).await?; }
-                self.database.spend_locked_usdc(spent).await?;
                 Ok((id, trades))
             }
             DexSide::Ask => {
@@ -1208,16 +1213,17 @@ impl TachyonWallet {
                 let (id, trades) = self.dex.place_market(owner, DexSide::Ask, DexQty(qty))?;
                 let mut sold = 0u64;
                 for t in &trades {
+                    let trade_gain = t.price.0.saturating_mul(t.quantity.0);
                     if t.taker_owner.0 == owner.0 {
+                        // We are market seller: spend locked base, receive USDC
                         sold = sold.saturating_add(t.quantity.0);
-                        self.database.deposit_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
+                        self.database.settle_ask_fill(t.quantity.0, trade_gain).await?;
                     } else if t.maker_owner.0 == owner.0 {
-                        self.database.spend_locked_usdc(t.price.0.saturating_mul(t.quantity.0)).await?;
-                        self.database.deposit_base(t.quantity.0).await?;
+                        // We were maker on bid: spend locked USDC, receive base
+                        self.database.settle_bid_fill(t.quantity.0, trade_gain).await?;
                     }
                 }
                 if qty > sold { self.database.unlock_base(qty - sold).await?; }
-                self.database.spend_locked_base(sold).await?;
                 Ok((id, trades))
             }
         }
@@ -1648,7 +1654,8 @@ impl TachyonWallet {
     #[cfg(not(feature = "pcd"))]
     pub async fn get_pcd_state(&self) -> Option<()> { None }
 
-    /// Recompute and persist MMR witnesses for all unspent notes after adopting a new PCD state
+    /// Update and persist MMR witnesses for unspent notes after adopting a new PCD state.
+    /// Uses the delta update API to avoid full recomputation and only persists changed witnesses.
     async fn update_witnesses_after_pcd(
         database: &WalletDatabase,
         state: &PcdState,
@@ -1663,23 +1670,47 @@ impl TachyonWallet {
         for enc_note in unspent {
             let pos = enc_note.position;
             if pos >= mmr.size() { continue; }
-            if let Ok(proof) = mmr.prove(pos) {
-                let witness = MmrWitness {
-                    position: proof.element.position,
-                    auth_path: proof
-                        .siblings
-                        .iter()
-                        .map(|s| (s.position, s.hash))
-                        .collect(),
-                    peaks: proof
-                        .peaks
-                        .iter()
-                        .map(|p| (p.position, p.hash))
-                        .collect(),
-                };
-                let witness_bytes = bincode::serialize(&witness)
-                    .map_err(|e| anyhow!("Witness serialize failed: {}", e))?;
-                let rec = storage::WitnessRecord::new(pos, &witness_bytes, &database.master_key)?;
+
+            // Try to load existing witness and apply a delta update
+            let mut updated_bytes_opt: Option<Vec<u8>> = None;
+
+            if let Some(existing) = database.get_witness(pos).await {
+                if let Ok(old_bytes) = existing.decrypt_witness(&database.master_key) {
+                    if let Ok(mut old_witness) = bincode::deserialize::<MmrWitness>(&old_bytes) {
+                        if let Ok(update) = mmr.compute_witness_update(pos) {
+                            old_witness.apply_update(&update);
+                            if let Ok(new_bytes) = bincode::serialize(&old_witness) {
+                                if new_bytes != old_bytes { updated_bytes_opt = Some(new_bytes); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If no existing witness or delta path failed, compute a fresh one
+            if updated_bytes_opt.is_none() {
+                if let Ok(proof) = mmr.prove(pos) {
+                    let witness = MmrWitness {
+                        position: proof.element.position,
+                        auth_path: proof
+                            .siblings
+                            .iter()
+                            .map(|s| (s.position, s.hash))
+                            .collect(),
+                        peaks: proof
+                            .peaks
+                            .iter()
+                            .map(|p| (p.position, p.hash))
+                            .collect(),
+                    };
+                    if let Ok(bytes) = bincode::serialize(&witness) {
+                        updated_bytes_opt = Some(bytes);
+                    }
+                }
+            }
+
+            if let Some(bytes) = updated_bytes_opt {
+                let rec = storage::WitnessRecord::new(pos, &bytes, &database.master_key)?;
                 let _ = database.upsert_witness(pos, rec).await;
             }
         }

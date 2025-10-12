@@ -505,7 +505,7 @@ mod tests {
         let rec = &drv.r1cs;
         let d1 = rec.digest(b"test-domain");
         let ser = rec.serialize_constraints();
-        let rec2 = R1csRecorder::deserialize_constraints::<Fr>(&ser).unwrap();
+        let rec2: R1csRecorder<Fr> = R1csRecorder::deserialize_constraints(&ser).unwrap();
         let d2 = rec2.digest(b"test-domain");
         assert_eq!(d1, d2);
     }

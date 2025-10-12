@@ -2,13 +2,28 @@
 //!
 //! In-memory orderbook engine and simple DEX service API.
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
+use crate::error::Result;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::fs;
-use std::path::Path;
+use std::{fs, any::Any};
+use std::path::{Path, PathBuf};
+
+pub mod error {
+    use thiserror::Error as ThisError;
+    pub type Result<T> = core::result::Result<T, Error>;
+    #[derive(Debug, ThisError)]
+    pub enum Error {
+        #[error("invalid input: {0}")] InvalidInput(String),
+        #[error("io error: {0}")] Io(String),
+        #[error("serialize error: {0}")] Serialize(String),
+        #[error("deserialize error: {0}")] Deserialize(String),
+        #[error("other: {0}")] Other(String),
+    }
+    impl From<anyhow::Error> for Error { fn from(e: anyhow::Error) -> Self { Error::Other(e.to_string()) } }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
@@ -256,6 +271,7 @@ pub trait OrderBookEngine: Send + Sync {
     fn recent_trades(&self, limit: usize) -> Vec<Trade>;
     fn estimate_market_cost(&self, side: Side, qty: Quantity) -> (u64, u64);
     fn get_order(&self, id: OrderId) -> Option<Order>;
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// In-memory engine implementing OrderBookEngine
@@ -272,7 +288,7 @@ impl InMemoryEngine {
         let book = self.book.read();
         let trades = self.trades.read();
         let snapshot = (&*book, &*trades);
-        let bytes = bincode::serialize(&snapshot)?;
+        let bytes = bincode::serialize(&snapshot).map_err(|e| anyhow!("serialize snapshot: {}", e))?;
         if let Some(dir) = path.parent() { fs::create_dir_all(dir).ok(); }
         fs::write(path, bytes).map_err(|e| anyhow!("persist orderbook: {}", e))?;
         Ok(())
@@ -366,17 +382,59 @@ impl OrderBookEngine for InMemoryEngine {
         (filled, cost)
     }
     fn get_order(&self, id: OrderId) -> Option<Order> { self.book.read().find_order(id) }
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// DEX facade over a pluggable engine
-pub struct DexService { engine: Arc<dyn OrderBookEngine> }
+pub struct DexService {
+    engine: Arc<dyn OrderBookEngine>,
+    snapshot_path: Option<PathBuf>,
+}
 
 impl DexService {
-    pub fn new() -> Self { Self { engine: Arc::new(InMemoryEngine::new()) } }
-    pub fn with_engine(engine: Arc<dyn OrderBookEngine>) -> Self { Self { engine } }
-    pub fn place_limit(&self, owner: OwnerId, side: Side, price: Price, qty: Quantity) -> Result<(OrderId, Vec<Trade>)> { self.engine.place_limit(owner, side, price, qty) }
-    pub fn place_market(&self, owner: OwnerId, side: Side, qty: Quantity) -> Result<(OrderId, Vec<Trade>)> { self.engine.place_market(owner, side, qty) }
-    pub fn cancel(&self, id: OrderId) -> Result<bool> { self.engine.cancel(id) }
+    pub fn new() -> Self { Self { engine: Arc::new(InMemoryEngine::new()), snapshot_path: None } }
+    pub fn with_engine(engine: Arc<dyn OrderBookEngine>) -> Self { Self { engine, snapshot_path: None } }
+    /// Construct with an in-memory engine and enable snapshot persistence
+    pub fn with_snapshot<P: AsRef<Path>>(snapshot_path: P) -> Self {
+        let s = Self { engine: Arc::new(InMemoryEngine::new()), snapshot_path: Some(snapshot_path.as_ref().to_path_buf()) };
+        if let Some(ref p) = s.snapshot_path { s.try_load_snapshot(p); }
+        s
+    }
+    /// Construct with a provided engine and enable snapshot persistence (only used for InMemoryEngine)
+    pub fn with_engine_and_snapshot<P: AsRef<Path>>(engine: Arc<dyn OrderBookEngine>, snapshot_path: P) -> Self {
+        let s = Self { engine, snapshot_path: Some(snapshot_path.as_ref().to_path_buf()) };
+        if let Some(ref p) = s.snapshot_path { s.try_load_snapshot(p); }
+        s
+    }
+    fn try_load_snapshot(&self, path: &Path) {
+        if let Some(engine) = self.engine.as_any().downcast_ref::<InMemoryEngine>() {
+            let _ = engine.load_from_path(path);
+        }
+    }
+    fn try_save_snapshot(&self) {
+        if let (Some(path), Some(engine)) = (self.snapshot_path.as_ref(), self.engine.as_any().downcast_ref::<InMemoryEngine>()) {
+            let _ = engine.save_to_path(path);
+        }
+    }
+    pub fn place_limit(&self, owner: OwnerId, side: Side, price: Price, qty: Quantity) -> Result<(OrderId, Vec<Trade>)> {
+        if price.0 == 0 { return Err(anyhow!("price must be > 0").into()); }
+        if qty.0 == 0 { return Err(anyhow!("quantity must be > 0").into()); }
+        let res = self.engine.place_limit(owner, side, price, qty);
+        if res.is_ok() { self.try_save_snapshot(); }
+        res
+    }
+    pub fn place_market(&self, owner: OwnerId, side: Side, qty: Quantity) -> Result<(OrderId, Vec<Trade>)> {
+        if qty.0 == 0 { return Err(anyhow!("quantity must be > 0").into()); }
+        let res = self.engine.place_market(owner, side, qty);
+        if res.is_ok() { self.try_save_snapshot(); }
+        res
+    }
+    pub fn cancel(&self, id: OrderId) -> Result<bool> {
+        if id.0 == 0 { return Err(anyhow!("invalid order id").into()); }
+        let res = self.engine.cancel(id);
+        if res.as_ref().unwrap_or(&false) == &true { self.try_save_snapshot(); }
+        res
+    }
     pub fn orderbook(&self, depth: usize) -> OrderBookSnapshot { self.engine.snapshot(depth) }
     pub fn recent_trades(&self, limit: usize) -> Vec<Trade> { self.engine.recent_trades(limit) }
     pub fn estimate_market_cost(&self, side: Side, qty: Quantity) -> (u64, u64) { self.engine.estimate_market_cost(side, qty) }
@@ -419,8 +477,8 @@ impl SledEngine {
     fn persist(&self) -> Result<()> {
         let book = self.book.read();
         let trades = self.trades.read();
-        let book_bytes = bincode::serialize(&*book)?;
-        let trades_bytes = bincode::serialize(&*trades)?;
+        let book_bytes = bincode::serialize(&*book).map_err(|e| anyhow!("serialize book: {}", e))?;
+        let trades_bytes = bincode::serialize(&*trades).map_err(|e| anyhow!("serialize trades: {}", e))?;
         self.db.insert(SLED_KEY_BOOK, book_bytes).map_err(|e| anyhow!("sled put book: {}", e))?;
         self.db.insert(SLED_KEY_TRADES, trades_bytes).map_err(|e| anyhow!("sled put trades: {}", e))?;
         self.db.flush().map_err(|e| anyhow!("sled flush: {}", e))?;
@@ -508,6 +566,7 @@ impl OrderBookEngine for SledEngine {
         (filled, cost)
     }
     fn get_order(&self, id: OrderId) -> Option<Order> { self.book.read().find_order(id) }
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 #[cfg(test)]
@@ -557,6 +616,26 @@ mod tests {
         let snap2 = dex2.orderbook(10);
         assert_eq!(snap2.bids.iter().map(|x| x.1).sum::<u64>(), 5);
         assert_eq!(snap2.asks.iter().map(|x| x.1).sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn snapshot_persistence_inmemory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snap_path = temp_dir.path().join("orderbook.bin");
+
+        // Start with in-memory engine with snapshot
+        let dex = DexService::with_snapshot(&snap_path);
+        let (_b1, _t0) = dex.place_limit(OwnerId(1), Side::Bid, Price(150), Quantity(4)).unwrap();
+        let (_a1, _t1) = dex.place_limit(OwnerId(2), Side::Ask, Price(200), Quantity(6)).unwrap();
+
+        // Ensure snapshot file is created by an operation
+        assert!(snap_path.exists());
+
+        // Recreate service pointing to same snapshot path
+        let dex2 = DexService::with_snapshot(&snap_path);
+        let snap = dex2.orderbook(10);
+        assert_eq!(snap.bids.iter().map(|x| x.1).sum::<u64>(), 4);
+        assert_eq!(snap.asks.iter().map(|x| x.1).sum::<u64>(), 6);
     }
 }
 

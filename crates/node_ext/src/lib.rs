@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
-//! # node_ext
-//! Numan Thabit
-//! Validator / Node extension implementation for Tachyon.
-//! Verifies PCD proofs, nullifier checks, and maintains minimal state for validation.
+pub mod error;
+// # node_ext
+// Numan Thabit
+// Validator / Node extension implementation for Tachyon.
+// Verifies PCD proofs, nullifier checks, and maintains minimal state for validation.
 
 use accum_mmr::{MmrAccumulator, MmrWitness, SerializableHash, MmrDelta};
 use accum_set::{Smt16Accumulator, Smt16NonMembershipProof, Smt16Delta};
@@ -29,6 +30,19 @@ use tracing::{debug, info};
 use std::path::Path;
 use tokio::fs as async_fs;
 use rand::RngCore;
+
+/// Maximum number of recent transaction hashes to remember for replay protection
+const RECENT_TX_CACHE_LIMIT: usize = 10_000;
+
+/// Maximum concurrent validations to prevent DoS
+const MAX_CONCURRENT_VALIDATIONS: usize = 64;
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Configuration for the node extension
 #[derive(Debug, Clone)]
@@ -369,12 +383,18 @@ pub struct TachyonNode {
     pcd_verifier: Arc<dyn PcdVerifier>,
     /// Transaction pool for pending validation
     _pending_txs: Arc<RwLock<HashMap<TransactionHash, Transaction>>>,
+    /// Replay cache of recently seen tx hashes
+    recent_tx_hashes: Arc<RwLock<std::collections::VecDeque<TransactionHash>>>,
+    /// Fast set for recent tx hashes
+    recent_tx_set: Arc<RwLock<std::collections::HashSet<TransactionHash>>>,
     /// Background validation task
     validation_task: Option<JoinHandle<()>>,
     /// Shutdown channel
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
     /// Pruning task
     pruning_task: Option<JoinHandle<()>>,
+    /// Validation semaphore for concurrency limiting
+    validation_sema: Arc<tokio::sync::Semaphore>,
 }
 
 impl TachyonNode {
@@ -444,14 +464,26 @@ impl TachyonNode {
             state,
             pcd_verifier,
             _pending_txs: Arc::new(RwLock::new(HashMap::new())),
+            recent_tx_hashes: Arc::new(RwLock::new(VecDeque::new())),
+            recent_tx_set: Arc::new(RwLock::new(HashSet::new())),
             validation_task: Some(validation_task),
             shutdown_tx: Some(shutdown_tx),
             pruning_task: Some(pruning_task),
+            validation_sema: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VALIDATIONS)),
         })
     }
 
     /// Submit a transaction into the mempool
     pub fn submit_transaction(&self, tx: Transaction) -> Result<()> {
+        // Replay protection: drop if seen recently
+        {
+            let seen = self.recent_tx_set.read().unwrap();
+            if seen.contains(&tx.hash) {
+                return Err(anyhow!("replay detected"));
+            }
+        }
+
+        // Insert into mempool
         let mut pool = self._pending_txs.write().unwrap();
         pool.insert(tx.hash, tx);
         Ok(())
@@ -555,8 +587,8 @@ impl TachyonNode {
         let body = BlockBody {
             ordered_outputs,
             ordered_nullifiers,
-            mmr_deltas: bincode::serialize(&mmr_ops)?,
-            smt_deltas: bincode::serialize(&smt_ops)?,
+            mmr_deltas: bincode::serialize(&mmr_ops).map_err(|e| anyhow!("serialize mmr_deltas: {}", e))?,
+            smt_deltas: bincode::serialize(&smt_ops).map_err(|e| anyhow!("serialize smt_deltas: {}", e))?,
         };
         Ok((header, body))
     }
@@ -602,6 +634,9 @@ impl TachyonNode {
 
     /// Validate a transaction
     pub async fn validate_transaction(&self, tx: &Transaction) -> Result<ValidationResult> {
+        // Concurrency guard for DoS protection
+        let permit = self.validation_sema.acquire().await?;
+        let _permit_guard = permit;
         let start_time = Instant::now();
 
         // Basic transaction format validation
@@ -619,10 +654,7 @@ impl TachyonNode {
                     is_valid: false,
                     error_message: Some("Anchor/roots do not match canonical state".to_string()),
                     gas_used: 1000,
-                    validated_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
+                    validated_at: unix_secs(),
                 });
             }
 
@@ -632,10 +664,7 @@ impl TachyonNode {
                         is_valid: false,
                         error_message: Some("Duplicate nullifier detected".to_string()),
                         gas_used: 1000,
-                        validated_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
+                        validated_at: unix_secs(),
                     });
                 }
             }
@@ -691,14 +720,31 @@ impl TachyonNode {
             {
                 false
             } else {
-                tx.nullifiers
-                    .iter()
-                    .zip(tx.nullifier_non_membership.iter())
-                    .all(|(nf, wit)| {
-                        bincode::deserialize::<Smt16NonMembershipProof>(wit)
-                            .map(|p| p.verify_for_key(nf, &state.nullifier_root))
-                            .unwrap_or(false)
-                    })
+                #[cfg(feature = "parallel-verify")]
+                {
+                    use rayon::prelude::*;
+                    tx.nullifiers
+                        .par_iter()
+                        .zip(tx.nullifier_non_membership.par_iter())
+                        .all(|(nf, wit)| match bincode::deserialize::<Smt16NonMembershipProof>(wit) {
+                            Ok(p) => p.verify_for_key(nf, &state.nullifier_root),
+                            Err(_) => false,
+                        })
+                }
+                #[cfg(not(feature = "parallel-verify"))]
+                {
+                    // Batch verify non-membership proofs; short-circuit on first failure
+                    let mut ok = true;
+                    for (nf, wit) in tx.nullifiers.iter().zip(tx.nullifier_non_membership.iter()) {
+                        match bincode::deserialize::<Smt16NonMembershipProof>(wit) {
+                            Ok(p) => {
+                                if !p.verify_for_key(nf, &state.nullifier_root) { ok = false; break; }
+                            }
+                            Err(_) => { ok = false; break; }
+                        }
+                    }
+                    ok
+                }
             }
         };
 
@@ -714,10 +760,7 @@ impl TachyonNode {
                 is_valid: false,
                 error_message: Some("PCD proof verification failed or anchor too old".to_string()),
                 gas_used: 1000,
-                validated_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                validated_at: unix_secs(),
             });
         }
 
@@ -729,10 +772,7 @@ impl TachyonNode {
                 is_valid: false,
                 error_message: Some("Spend proof verification failed".to_string()),
                 gas_used: 1000,
-                validated_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                validated_at: unix_secs(),
             });
         }
 
@@ -742,10 +782,7 @@ impl TachyonNode {
             is_valid: true,
             error_message: None,
             gas_used,
-            validated_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            validated_at: unix_secs(),
         })
     }
 
@@ -846,11 +883,25 @@ impl TachyonNode {
             });
         }
 
-        // Compute block hash
+        // Compute block hash and update replay cache
         let block_hash = self.compute_block_hash(block)?;
         {
             let mut s = self.state.write().unwrap();
             s.last_block_hash = Some(block_hash);
+        }
+
+        // After successful block validation, record tx hashes to replay cache
+        {
+            let mut dq = self.recent_tx_hashes.write().unwrap();
+            let mut set = self.recent_tx_set.write().unwrap();
+            for tx in &block.transactions {
+                if set.insert(tx.hash) {
+                    dq.push_back(tx.hash);
+                    if dq.len() > RECENT_TX_CACHE_LIMIT {
+                        if let Some(old) = dq.pop_front() { set.remove(&old); }
+                    }
+                }
+            }
         }
 
         // Publish block-derived deltas and write pruning journal
@@ -971,16 +1022,42 @@ impl TachyonNode {
         if tx.spend_proof.len() < 16 { return Ok(false); }
 
         // Bind spend proof to anchor, nullifiers and commitments deterministically
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"spend_proof_binding:v1");
-        hasher.update(&tx.anchor_height.to_le_bytes());
-        for n in &tx.nullifiers { hasher.update(n); }
-        for c in &tx.commitments { hasher.update(c); }
-        let expected = hasher.finalize();
+        // If parallel-verify is enabled, compute binding in parallel chunks to match CPU topology
+        #[cfg(feature = "parallel-verify")]
+        {
+            use rayon::prelude::*;
+            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            // Anchor height chunk
+            chunks.push(tx.anchor_height.to_le_bytes().to_vec());
+            // Split nullifiers and commitments into chunks
+            for n in &tx.nullifiers { chunks.push(n.to_vec()); }
+            for c in &tx.commitments { chunks.push(c.to_vec()); }
+            let partials: Vec<[u8; 32]> = chunks
+                .par_iter()
+                .map(|part| {
+                    let mut h = blake3::Hasher::new();
+                    h.update(b"spend_proof_binding:v1");
+                    h.update(part);
+                    *h.finalize().as_bytes()
+                })
+                .collect();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"spend_proof_binding:reduce:v1");
+            for p in &partials { hasher.update(p); }
+            let expected = hasher.finalize();
+            return Ok(tx.spend_proof.as_slice() == expected.as_bytes());
+        }
 
-        // Proof must equal binding preimage (not just hash equality);
-        // we encode the binding digest directly as the proof in this demo.
-        Ok(tx.spend_proof.as_slice() == expected.as_bytes())
+        #[cfg(not(feature = "parallel-verify"))]
+        {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"spend_proof_binding:v1");
+            hasher.update(&tx.anchor_height.to_le_bytes());
+            for n in &tx.nullifiers { hasher.update(n); }
+            for c in &tx.commitments { hasher.update(c); }
+            let expected = hasher.finalize();
+            Ok(tx.spend_proof.as_slice() == expected.as_bytes())
+        }
     }
 
     /// Compute block hash
@@ -1048,7 +1125,7 @@ impl Drop for TachyonNode {
 pub struct TransactionHash(pub Hash);
 
 impl Serialize for TransactionHash {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -1057,7 +1134,7 @@ impl Serialize for TransactionHash {
 }
 
 impl<'de> Deserialize<'de> for TransactionHash {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -1228,15 +1305,25 @@ impl SimplePcdVerifier {
         anchor_height: &u64,
     ) -> Result<bool> {
         if proof.is_empty() { return Ok(false); }
-        let core = Halo2PcdCore::load_or_setup(std::path::Path::new("crates/node_ext/node_data/keys"), 12)?;
-        core.verify_transition_proof(
-            proof,
-            prev_state,
-            new_state,
-            mmr_root,
-            nullifier_root,
-            *anchor_height,
-        )
+        // Offload Halo2 verification to a blocking thread to avoid starving the async runtime.
+        let proof_vec = proof.to_vec();
+        let prev = *prev_state;
+        let new = *new_state;
+        let mmr = *mmr_root;
+        let nfr = *nullifier_root;
+        let height = *anchor_height;
+        let result = tokio::task::spawn_blocking(move || {
+            let core = Halo2PcdCore::load_or_setup(std::path::Path::new("crates/node_ext/node_data/keys"), 12)?;
+            core.verify_transition_proof(
+                &proof_vec,
+                &prev,
+                &new,
+                &mmr,
+                &nfr,
+                height,
+            )
+        }).await?;
+        result
     }
 }
 

@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tachyon_common::HTTP_CLIENT;
 
 /// Public representation of a pending topup that can be claimed into a wallet
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,7 +129,7 @@ pub async fn create_onramp_session(cfg: &OnrampConfig, suggested_amount_minor: u
         redirect_url: Option<String>,
     }
 
-    let http = reqwest::Client::new();
+    let http = &*HTTP_CLIENT;
     let req = CreateSessionReq {
         destination_currency: &cfg.destination_currency,
         destination_network: &cfg.destination_network,
@@ -160,7 +161,7 @@ pub async fn fetch_onramp_session_details(cfg: &OnrampConfig, session_id: &str) 
     }
 
     let url = format!("https://api.stripe.com/v1/crypto/onramp/sessions/{}", session_id);
-    let http = reqwest::Client::new();
+    let http = &*HTTP_CLIENT;
     let resp = http.get(url).bearer_auth(cfg.stripe_secret_key.clone()).send().await?;
     if !resp.status().is_success() { return Err(anyhow!("failed to fetch session: {}", resp.status())); }
     let sess: SessionData = resp.json().await?;

@@ -28,6 +28,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 use reqwest::Client;
+use tachyon_common::HTTP_CLIENT;
 
 /// Configuration for header sync
 #[derive(Debug, Clone, Default)]
@@ -530,7 +531,7 @@ pub struct HeaderSyncManager {
     /// Announcement listener task
     announce_task: Option<JoinHandle<()>>,
     /// Shutdown channel
-    shutdown_tx: Option<mpsc::UnboundedSender<()>>,
+    shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 #[derive(Debug)]
@@ -577,7 +578,7 @@ impl HeaderSyncManager {
         network.set_header_provider(Arc::new(ChainHeaderProvider { chain: chain.clone() }));
 
         // Start background sync task
-        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
         let chain_clone = chain.clone();
         let sync_state_clone = sync_state.clone();
@@ -871,10 +872,10 @@ impl HeaderSyncManager {
         // Request the next small batch via zebra HTTP if configured, then request/response protocol, fallback to announcements
         let batch_size = config.sync_config.max_batch_size.min(32) as u32;
         let mut headers: Vec<BlockHeader> = Vec::new();
-        // Try Zebra HTTP headers if configured
+        // Try Zebra HTTP headers if configured (shared reqwest client for pooling)
         if let Ok(base) = std::env::var("TACHYON_ZEBRA_HEADERS_URL") {
-            let client = Client::builder().timeout(std::time::Duration::from_secs(5)).build().ok();
-            if let Some(http) = client {
+            let http: &Client = &HTTP_CLIENT;
+            {
                 let url = format!("{}/headers?start={}&count={}", base, current_height + 1, batch_size);
                 if let Ok(resp) = http.get(url).send().await {
                     if resp.status().is_success() {
@@ -1028,7 +1029,7 @@ impl HeaderSyncManager {
     /// Shutdown the sync manager
     pub async fn shutdown(&self) -> Result<()> {
         if let Some(tx) = &self.shutdown_tx {
-            tx.send(())?;
+            tx.try_send(())?;
         }
         Ok(())
     }

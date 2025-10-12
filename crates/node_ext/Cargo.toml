@@ -24,3 +24,9 @@ pasta_curves.workspace = true
 ragu = { path = "../ragu" }
 rand = "0.8"
 bytes.workspace = true
+thiserror = "1"
+rayon = { version = "1.10", optional = true }
+
+[features]
+default = []
+parallel-verify = ["rayon"]

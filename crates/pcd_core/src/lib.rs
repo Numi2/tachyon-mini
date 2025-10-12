@@ -1504,7 +1504,7 @@ mod tests {
             auth_signature: vec![5u8; 64],
         };
 
-        let stamp = Tachystamp::new(anchor, grams.clone(), vec![action.clone()], &[action.auth_signature.clone()]).unwrap();
+        let stamp = Tachystamp::new(anchor, grams.clone(), vec![action.clone()], std::slice::from_ref(&action.auth_signature)).unwrap();
         // Basic structural integrity: aggregated commitment is 32 bytes, proof may be empty
         assert_eq!(stamp.aggregated_commitment.len(), 32);
 

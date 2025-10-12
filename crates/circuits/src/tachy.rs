@@ -358,7 +358,7 @@ mod tests {
                 // choose r and derive s according to s = r + chal*pk
                 let chal = compute_sig_challenge(leaf_new, pk);
                 let r = Fr::from(9u64);
-                let s = r + chal * pk;
+                let _s = r + chal * pk;
                 // store s in circuit field below; return r here
                 Value::known(r)
             },

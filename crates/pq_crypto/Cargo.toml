@@ -17,9 +17,10 @@ zeroize = "1"
 pqcrypto-kyber = "0.8"
 pqcrypto-traits = "0.3"
 pqcrypto-dilithium = "0.5"
+pqcrypto-mldsa = { version = "0.1.2", optional = true }
 
 [features]
 default = []
 # Declare the optional feature to silence unexpected cfg warnings.
 # When enabled by consumers, they can add the dependency as needed.
-mldsa = []
+mldsa = ["dep:pqcrypto-mldsa"]
