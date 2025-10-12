@@ -14,6 +14,7 @@ use header_sync::{HeaderSyncConfig as HsConfig, HeaderSyncManager};
 use onramp_stripe as onramp;
 use circuits::{RecursionCore, compute_tachy_digest};
 use pasta_curves::Fp as Fr;
+use pcd_core::tachyon as tachyon_api;
 
 /// Tachyon CLI application
 #[derive(Parser)]
@@ -214,6 +215,53 @@ pub enum Commands {
         /// Optional fixed seed (unused placeholder for now)
         #[arg(long)]
         seed: Option<u64>,
+    },
+    /// Build a Tachystamp from hex inputs quickly (no wallet required)
+    TachyBuildStamp {
+        /// Anchor height
+        #[arg(long)]
+        height: u64,
+        /// MMR root (32-byte hex)
+        #[arg(long)]
+        mmr: String,
+        /// Nullifier root (32-byte hex)
+        #[arg(long)]
+        nulls: String,
+        /// Comma-separated tachygrams (each 32-byte hex)
+        #[arg(long, default_value = "")]
+        grams: String,
+        /// Optional action pair: left and right gram hex; may repeat
+        #[arg(long = "action", value_parser, num_args(0..), value_delimiter = ' ')]
+        actions: Vec<String>,
+    },
+    /// Verify a Tachystamp JSON (stdin or file path) and print aggregated commitment
+    TachyVerifyStamp {
+        /// Path to tachystamp JSON (reads stdin if omitted)
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Proving parameters (SRS) management
+    Params {
+        #[command(subcommand)]
+        params_command: ParamsCommands,
+    },
+}
+#[derive(Subcommand)]
+pub enum ParamsCommands {
+    /// Generate a new SRS with specified k and write to file
+    Gen {
+        /// Output file path
+        #[arg(long)]
+        out: String,
+        /// Security parameter k (circuit size = 2^k)
+        #[arg(long, default_value_t = 12)]
+        k: u32,
+    },
+    /// Inspect an existing SRS file
+    Info {
+        /// SRS file path
+        #[arg(long)]
+        file: String,
     },
 }
 
@@ -708,6 +756,7 @@ pub async fn run() -> Result<()> {
 
     // Execute command
     match cli.command {
+        Commands::Params { params_command } => execute_params_command(params_command).await,
         Commands::Wallet { wallet_command } => {
             execute_wallet_command(wallet_command, &cli.data_dir).await
         }
@@ -785,6 +834,35 @@ pub async fn run() -> Result<()> {
             let core = RecursionCore::new()?;
             let (_proof, agg_bytes) = core.aggregate_tachy_digests(&digests)?;
             println!("final_agg_commitment=0x{}", hex::encode(agg_bytes));
+            Ok(())
+        }
+        Commands::TachyBuildStamp { height, mmr, nulls, grams, actions } => {
+            // Create builder
+            let mut builder = tachyon_api::TachystampBuilder::new(height, &mmr, &nulls)?;
+            builder = builder.add_grams_csv(&grams)?;
+            // Parse actions as repeated triples: left,right[,sig]
+            // Example: --action 0xAA.. 0xBB.. --action 0xCC.. 0xDD.. 0xSIG..
+            let mut i = 0usize;
+            while i < actions.len() {
+                let left = actions.get(i).cloned().unwrap_or_default();
+                let right = actions.get(i+1.min(actions.len().saturating_sub(1))).cloned().unwrap_or_default();
+                let sig = actions.get(i+2).cloned();
+                builder = builder.add_action_pair_hex(&left, &right, sig.as_deref())?;
+                i += if sig.is_some() { 3 } else { 2 };
+            }
+            let stamp = builder.build()?;
+            println!("{}", serde_json::to_string_pretty(&stamp)?);
+            Ok(())
+        }
+        Commands::TachyVerifyStamp { file } => {
+            let json = if let Some(path) = file { std::fs::read_to_string(path)? } else { use std::io::Read as _; let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s };
+            let stamp: pcd_core::tachyon::Tachystamp = serde_json::from_str(&json)?;
+            // Re-commit all actions' binding digests as proof payloads, aggregate, compare
+            let core = RecursionCore::new()?;
+            let mut payloads: Vec<Vec<u8>> = Vec::new();
+            for a in &stamp.actions { payloads.push(a.binding_digest.to_vec()); }
+            let (_proof, agg) = if payloads.is_empty() { (Vec::new(), [0u8; 32]) } else { core.aggregate_many_proofs(&payloads, pcd_core::tachyon::TACHY_FOLDING_FACTOR)? };
+            if agg == stamp.aggregated_commitment { println!("ok: agg=0x{}", hex::encode(agg)); } else { println!("mismatch: expected=0x{} actual=0x{}", hex::encode(stamp.aggregated_commitment), hex::encode(agg)); }
             Ok(())
         }
     }
@@ -1346,6 +1424,96 @@ async fn execute_dex_command(command: DexCommands, format: OutputFormat, non_int
     Ok(())
 }
 
+/// Execute header sync commands
+async fn execute_header_sync_command(command: HeaderSyncCommands) -> Result<()> {
+    match command {
+        HeaderSyncCommands::Bootstrap { data_dir, checkpoint_servers, min_sigs, trusted_pks } => {
+            let mut cfg = HsConfig::default();
+            cfg.network_config.data_dir = data_dir.clone();
+            if let Some(list) = checkpoint_servers.as_deref() {
+                cfg.network_config.checkpoint_servers = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
+            cfg.security_config.min_checkpoint_signatures = min_sigs;
+            if let Some(pks) = trusted_pks.as_deref() {
+                let keys = pks.split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .filter_map(|hex_str| hex::decode(hex_str.trim_start_matches("0x")).ok())
+                    .collect();
+                cfg.security_config.trusted_checkpoint_keys = keys;
+            }
+            let mgr = HeaderSyncManager::new(cfg).await?;
+            mgr.bootstrap_from_checkpoints().await?;
+            let status = mgr.get_sync_status().await;
+            println!("Bootstrapped to height {}", status.current_height);
+        }
+        HeaderSyncCommands::SyncOnce { data_dir, max_batch_size } => {
+            let mut cfg = HsConfig::default();
+            cfg.network_config.data_dir = data_dir.clone();
+            cfg.sync_config.max_batch_size = max_batch_size;
+            let mgr = HeaderSyncManager::new(cfg).await?;
+            // Use observed latest height from announcements
+            let latest = mgr.get_sync_status().await.tip_height;
+            mgr.sync_to_height(latest).await?;
+            let status = mgr.get_sync_status().await;
+            println!("Synced to height {} (target {:?})", status.current_height, status.target_height);
+        }
+    }
+    Ok(())
+}
+
+/// Execute onramp commands
+async fn execute_onramp_command(command: OnrampCommands) -> Result<()> {
+    match command {
+        OnrampCommands::CreateSession { destination, network, currency, amount } => {
+            let key = std::env::var("STRIPE_SECRET_KEY").map_err(|_| anyhow!("missing STRIPE_SECRET_KEY"))?;
+            let cfg = onramp::OnrampConfig { stripe_secret_key: key, webhook_secret: std::env::var("STRIPE_WEBHOOK_SECRET").ok(), destination_address: destination, destination_network: network, destination_currency: currency };
+            let session = onramp::create_onramp_session(&cfg, amount).await?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"id": session.session_id, "url": session.url}))?);
+        }
+        OnrampCommands::Webhook { listen, pending_file, webhook_secret } => {
+            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
+            let secret = webhook_secret.or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").ok());
+            let stripe_sk = std::env::var("STRIPE_SECRET_KEY").ok();
+            let addr: std::net::SocketAddr = listen.parse().map_err(|_| anyhow!("invalid listen addr"))?;
+            onramp::start_webhook_server(addr, store.clone(), secret, stripe_sk).await?;
+        }
+        OnrampCommands::Pending { pending_file } => {
+            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
+            let list = store.list().await?;
+            println!("{}", serde_json::to_string_pretty(&list)?);
+        }
+        OnrampCommands::Claim { session_id, db_path, password, pending_file } => {
+            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
+            let mut cfg = WalletConfig::from_env();
+            cfg.db_path = db_path.clone();
+            cfg.master_password = password.clone();
+            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
+            let wallet = TachyonWallet::new(cfg).await?;
+            onramp::claim_pending_into_wallet(&session_id, &store, &wallet).await?;
+            println!("ok");
+        }
+    }
+    Ok(())
+}
+
+async fn execute_params_command(command: ParamsCommands) -> Result<()> {
+    match command {
+        ParamsCommands::Gen { out, k } => {
+            // Generate KZG params for Pasta and write to file
+            let params = halo2_proofs::poly::commitment::Params::<pasta_curves::vesta::Affine>::new(k);
+            let mut f = std::fs::File::create(&out)?;
+            params.write(&mut f)?;
+            println!("ok: wrote SRS params (k={}) to {}", k, out);
+        }
+        ParamsCommands::Info { file } => {
+            let mut f = std::fs::File::open(&file)?;
+            let _params = halo2_proofs::poly::commitment::Params::<pasta_curves::vesta::Affine>::read(&mut f)?;
+            println!("SRS: loaded from {} (size: {} bytes)", file, f.metadata()?.len());
+        }
+    }
+    Ok(())
+}
+
 /// Extract the 0x<hex> Kyber public key from an OOB URI
 fn parse_oob_pk_hex_from_uri(uri: &str) -> Result<String> {
     let lower = uri.to_lowercase();
@@ -1436,78 +1604,6 @@ async fn execute_network_command(command: NetworkCommands) -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-/// Execute header sync commands
-async fn execute_header_sync_command(command: HeaderSyncCommands) -> Result<()> {
-    match command {
-        HeaderSyncCommands::Bootstrap { data_dir, checkpoint_servers, min_sigs, trusted_pks } => {
-            let mut cfg = HsConfig::default();
-            cfg.network_config.data_dir = data_dir.clone();
-            if let Some(list) = checkpoint_servers.as_deref() {
-                cfg.network_config.checkpoint_servers = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-            }
-            cfg.security_config.min_checkpoint_signatures = min_sigs;
-            if let Some(pks) = trusted_pks.as_deref() {
-                let keys = pks.split(',')
-                    .filter(|s| !s.trim().is_empty())
-                    .filter_map(|hex_str| hex::decode(hex_str.trim_start_matches("0x")).ok())
-                    .collect();
-                cfg.security_config.trusted_checkpoint_keys = keys;
-            }
-            let mgr = HeaderSyncManager::new(cfg).await?;
-            mgr.bootstrap_from_checkpoints().await?;
-            let status = mgr.get_sync_status().await;
-            println!("Bootstrapped to height {}", status.current_height);
-        }
-        HeaderSyncCommands::SyncOnce { data_dir, max_batch_size } => {
-            let mut cfg = HsConfig::default();
-            cfg.network_config.data_dir = data_dir.clone();
-            cfg.sync_config.max_batch_size = max_batch_size;
-            let mgr = HeaderSyncManager::new(cfg).await?;
-            // Use observed latest height from announcements
-            let latest = mgr.get_sync_status().await.tip_height;
-            mgr.sync_to_height(latest).await?;
-            let status = mgr.get_sync_status().await;
-            println!("Synced to height {} (target {:?})", status.current_height, status.target_height);
-        }
-    }
-    Ok(())
-}
-
-/// Execute onramp commands
-async fn execute_onramp_command(command: OnrampCommands) -> Result<()> {
-    match command {
-        OnrampCommands::CreateSession { destination, network, currency, amount } => {
-            let key = std::env::var("STRIPE_SECRET_KEY").map_err(|_| anyhow!("missing STRIPE_SECRET_KEY"))?;
-            let cfg = onramp::OnrampConfig { stripe_secret_key: key, webhook_secret: std::env::var("STRIPE_WEBHOOK_SECRET").ok(), destination_address: destination, destination_network: network, destination_currency: currency };
-            let session = onramp::create_onramp_session(&cfg, amount).await?;
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"id": session.session_id, "url": session.url}))?);
-        }
-        OnrampCommands::Webhook { listen, pending_file, webhook_secret } => {
-            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
-            let secret = webhook_secret.or_else(|| std::env::var("STRIPE_WEBHOOK_SECRET").ok());
-            let stripe_sk = std::env::var("STRIPE_SECRET_KEY").ok();
-            let addr: std::net::SocketAddr = listen.parse().map_err(|_| anyhow!("invalid listen addr"))?;
-            onramp::start_webhook_server(addr, store.clone(), secret, stripe_sk).await?;
-        }
-        OnrampCommands::Pending { pending_file } => {
-            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
-            let list = store.list().await?;
-            println!("{}", serde_json::to_string_pretty(&list)?);
-        }
-        OnrampCommands::Claim { session_id, db_path, password, pending_file } => {
-            let store = onramp::FilePendingStore::new(std::path::Path::new(&pending_file)).await?;
-            let mut cfg = WalletConfig::from_env();
-            cfg.db_path = db_path.clone();
-            cfg.master_password = password.clone();
-            std::env::set_var("TACHYON_ALLOW_INSECURE", "1");
-            let wallet = TachyonWallet::new(cfg).await?;
-            onramp::claim_pending_into_wallet(&session_id, &store, &wallet).await?;
-            println!("ok");
-        }
-    }
     Ok(())
 }
 

@@ -32,8 +32,12 @@ use reqwest::Client as HttpClient;
 #[cfg(feature = "pcd")]
 use accum_mmr::{MmrAccumulator, MmrWitness};
 use pcd_core::tachyon::{Tachystamp, Tachygram, Tachyaction, TachyAnchor, TachyOpKind};
+use circuits::RecursionCore as ProofRecursionCore;
 #[cfg(feature = "pcd")]
 use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, OwnerId as DexOwnerId, OrderId as DexOrderId, OrderBookSnapshot as DexSnapshot, Trade as DexTrade};
+use halo2_gadgets::poseidon::primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3};
+use pasta_curves::Fp as Fr;
+use ff::{PrimeField, FromUniformBytes};
 
 #[cfg(feature = "zcash")]
 mod zcash;
@@ -533,15 +537,31 @@ impl PcdSyncClient for WalletSyncClient {
         new_height: u64,
     ) -> Result<Option<Vec<u8>>> {
         tracing::debug!("Fetching transition proof for {} to {}", prev_height, new_height);
-        // Try to find a transition blob between these heights from the published cache
+        // Prefer the manifest to locate the transition ticket precisely
+        let anns = self.network.get_recent_announcements();
+        let mut manifests: Vec<(u64, String)> = anns
+            .into_iter()
+            .filter(|(k, _cid, h, _s, _t)| *k == BlobKind::Manifest && *h == new_height)
+            .map(|(_k, _cid, h, _s, t)| (h, t))
+            .collect();
+        manifests.sort_by_key(|(h, _)| *h);
+        for (_h, ticket) in manifests {
+            if let Ok(bytes) = self.network.fetch_blob_from_ticket(&ticket).await {
+                if let Ok(manifest) = serde_json::from_slice::<SyncManifest>(&bytes) {
+                    if let Some(item) = manifest.items.into_iter().find(|i| matches!(i.kind, BlobKind::PcdTransition)) {
+                        if let Ok(p) = self.network.fetch_blob_from_ticket(&item.ticket).await {
+                            return Ok(Some(p.to_vec()));
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: look in local published cache
         let published = self.network.get_published().await;
-        if let Some((_kind, bytes, _h)) = published
+        Ok(published
             .into_iter()
             .find(|(k, _b, h)| matches!(k, BlobKind::PcdTransition) && *h == new_height)
-        {
-            return Ok(Some(bytes));
-        }
-        Ok(None)
+            .map(|(_k, b, _h)| b))
     }
 }
 
@@ -663,8 +683,21 @@ impl TachyonWallet {
         // Anchor is the current state roots/height
         let anchor = TachyAnchor { height: state.anchor_height, mmr_root: state.mmr_root, nullifier_root: state.nullifier_root };
 
-        // Aggregate provided proofs into a Tachystamp
-        let stamp = Tachystamp::new(anchor, grams, actions, &proofs)?;
+        // Aggregate provided proofs into a Tachystamp using RecursionCore
+        let core = ProofRecursionCore::new()?;
+        // If proofs are empty, allow zero; else fold deterministically
+        let (agg_proof, agg_commit) = if proofs.is_empty() {
+            (Vec::new(), [0u8; 32])
+        } else {
+            core.aggregate_many_proofs(&proofs, pcd_core::tachyon::TACHY_FOLDING_FACTOR)?
+        };
+        let stamp = Tachystamp {
+            anchor,
+            tachygrams: grams,
+            actions,
+            aggregated_proof: agg_proof,
+            aggregated_commitment: agg_commit,
+        };
         Ok(stamp)
     }
 
@@ -908,6 +941,7 @@ impl TachyonWallet {
 
         // Optional Zebra nullifier client (chain-sourced nullifier set)
         let zebra_url_opt = std::env::var("TACHYON_ZEBRA_NULLIFIER_URL").ok();
+        let privacy_oblivious = std::env::var("TACHYON_PRIVACY_OBLIVIOUS").unwrap_or_default() == "1";
         let zebra_client = zebra_url_opt
             .as_ref()
             .map(|u| ZebraNullifierClient::new(u.clone()));
@@ -935,8 +969,9 @@ impl TachyonWallet {
                             }
                         }
 
-                        // Chain-sourced nullifier check via Zebra if configured
-                        if let Some(ref client) = zebra_client {
+                        // Chain-sourced nullifier check via Zebra if configured and privacy allows
+                        if !privacy_oblivious {
+                            if let Some(ref client) = zebra_client {
                             let unspent = database.list_unspent_notes().await;
                             // Derive NF2 for each unspent note and check against chain nullifiers
                             if let Ok(spend_secret) = database.get_or_generate_spend_secret().await {
@@ -968,6 +1003,7 @@ impl TachyonWallet {
                                     let _ = database.set_chain_nf_last_height(latest_height).await;
                                 }
                             }
+                            }
                         }
                     }
                     fetched = client.poll_and_fetch_once() => {
@@ -976,7 +1012,7 @@ impl TachyonWallet {
                                 tracing::info!("Fetched announced blob {:?} ({} bytes)", kind, bytes.len());
                                 match kind {
                                     BlobKind::PcdTransition => {
-                                        // Apply transition to local PCD state and persist
+                                        // Apply transition to local PCD state and persist; gaps are handled by periodic manifest sync
                                         match bincode::deserialize::<PcdTransition>(&bytes) {
                                             Ok(transition) => {
                                                 let mut mgr = pcd_manager.write().await;
@@ -1345,6 +1381,39 @@ impl TachyonWallet {
         Ok(wallet_notes)
     }
 
+    /// Compute Orchard-style note commitment over Pasta Poseidon2: cm = H(TAG, pk, v)
+    fn orchard_note_commitment(pk: Fr, value: Fr) -> [u8; 32] {
+        let tag = Fr::from(101u64);
+        let cm = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, pk, value]);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(cm.to_repr().as_ref());
+        out
+    }
+
+    /// Compute Orchard-style nullifier: nf = H(TAG, cm, rho)
+    fn orchard_nullifier(cm: [u8; 32], rho32: [u8; 32]) -> [u8; 32] {
+        let cm_f = {
+            let mut repr = <Fr as ff::PrimeField>::Repr::default();
+            repr.as_mut().copy_from_slice(&cm);
+            Fr::from_repr(repr).unwrap_or_else(|| {
+                // Fallback: uniform map from bytes if not canonical
+                use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:map:v1"); h.update(&cm); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap(); Fr::from_uniform_bytes(&wide)
+            })
+        };
+        let rho_f = {
+            let mut repr = <Fr as ff::PrimeField>::Repr::default();
+            repr.as_mut().copy_from_slice(&rho32);
+            Fr::from_repr(repr).unwrap_or_else(|| {
+                use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:rho:v1"); h.update(&rho32); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap(); Fr::from_uniform_bytes(&wide)
+            })
+        };
+        let tag = Fr::from(102u64);
+        let nf = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, cm_f, rho_f]);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(nf.to_repr().as_ref());
+        out
+    }
+
     /// Build a transaction (spend) from selected notes
     pub async fn build_transaction(
         &self,
@@ -1366,11 +1435,25 @@ impl TachyonWallet {
         let nullifiers: Vec<[u8; 32]> = note_commitments
             .iter()
             .map(|cm| {
-                // For demo, derive rho from commitment; in real wallet use per-note randomness
+                // For production Orchard-like, rho should be per-note randomness; derive deterministically here
                 let rho = blake3::hash(cm);
                 let mut rho32 = [0u8; 32];
                 rho32.copy_from_slice(rho.as_bytes());
+                // Keep NF2 derivation path but also compute Orchard-style nullifier for compatibility tests
+                let _nf_orch = Self::orchard_nullifier(*cm, rho32);
                 derive_nf2(cm, &rho32, &snk)
+            })
+            .collect();
+
+        // Compute output commitments via Orchard-like Poseidon2 for recipients
+        let output_commitments: Vec<[u8; 32]> = output_notes
+            .iter()
+            .map(|n| {
+                let pk_f = {
+                    use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:pk:map:v1"); h.update(&n.recipient); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap(); Fr::from_uniform_bytes(&wide)
+                };
+                let val_f = Fr::from(n.value);
+                Self::orchard_note_commitment(pk_f, val_f)
             })
             .collect();
 
@@ -1379,10 +1462,9 @@ impl TachyonWallet {
         bind_hasher.update(b"spend_proof_binding:v1");
         bind_hasher.update(&anchor_height.to_le_bytes());
         for c in &note_commitments { bind_hasher.update(c); }
-        for o in &output_notes { bind_hasher.update(&o.commitment); }
+        for c in &output_commitments { bind_hasher.update(c); }
         let spend_proof = bind_hasher.finalize().as_bytes().to_vec();
 
-        // Output proofs are omitted; node will verify commitments via spend_proof binding
         let spend_proofs = vec![spend_proof.clone()];
         let output_proofs: Vec<Vec<u8>> = Vec::new();
 
@@ -1395,11 +1477,12 @@ impl TachyonWallet {
 
         Ok(Transaction {
             inputs: note_commitments,
-            outputs: output_notes,
-            anchor_height,
-            pcd_proof,
+            outputs: output_commitments,
             spend_proofs,
             output_proofs,
+            nullifiers,
+            anchor_height,
+            pcd_proof,
         })
     }
 
@@ -1513,7 +1596,7 @@ impl TachyonWallet {
             state.anchor_height,
         )?;
 
-        let num_spent = spent_inputs.len();
+        let _num_spent = spent_inputs.len();
         let tx = _node_ext_dep_check::Transaction {
             hash: _node_ext_dep_check::TransactionHash(blake3::hash(b"wallet-tx")),
             nullifiers,
@@ -1619,15 +1702,17 @@ pub struct Transaction {
     /// Input note commitments being spent
     pub inputs: Vec<[u8; NOTE_COMMITMENT_SIZE]>,
     /// Output notes being created
-    pub outputs: Vec<WalletNote>,
-    /// Anchor height for PCD proof
-    pub anchor_height: u64,
-    /// PCD proof data
-    pub pcd_proof: Vec<u8>,
+    pub outputs: Vec<[u8; 32]>,
     /// Spend proofs for input notes
     pub spend_proofs: Vec<Vec<u8>>,
     /// Output proofs for output notes
     pub output_proofs: Vec<Vec<u8>>,
+    /// Nullifiers for input notes
+    pub nullifiers: Vec<[u8; 32]>,
+    /// Anchor height for PCD proof
+    pub anchor_height: u64,
+    /// PCD proof data
+    pub pcd_proof: Vec<u8>,
 }
 
 impl Transaction {
@@ -1647,7 +1732,7 @@ impl Transaction {
         h.update(b"spend_proof_binding:v1");
         h.update(&self.anchor_height.to_le_bytes());
         for i in &self.inputs { h.update(i); }
-        for o in &self.outputs { h.update(&o.commitment); }
+        for o in &self.outputs { h.update(o); }
         let expected = h.finalize();
         if self.spend_proofs[0].as_slice() != expected.as_bytes() {
             return Err(anyhow!("Spend proof binding mismatch"));
@@ -1666,8 +1751,7 @@ impl Transaction {
         }
 
         for output in &self.outputs {
-            hasher.update(&output.commitment);
-            hasher.update(&output.value.to_le_bytes());
+            hasher.update(output);
         }
 
         let mut hash = [0u8; 32];

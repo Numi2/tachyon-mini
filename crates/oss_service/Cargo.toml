@@ -12,6 +12,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 net_iroh.workspace = true
 pcd_core.workspace = true
+circuits.path = "../circuits"
 bincode.workspace = true
 blake3.workspace = true
 tracing.workspace = true

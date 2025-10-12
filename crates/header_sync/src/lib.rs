@@ -868,13 +868,33 @@ impl HeaderSyncManager {
         // 3. Use NiPoPoW proofs for efficient verification
         // 4. Update chain state
 
-        // Request the next small batch via header request/response protocol, falling back to announcements
+        // Request the next small batch via zebra HTTP if configured, then request/response protocol, fallback to announcements
         let batch_size = config.sync_config.max_batch_size.min(32) as u32;
         let mut headers: Vec<BlockHeader> = Vec::new();
+        // Try Zebra HTTP headers if configured
+        if let Ok(base) = std::env::var("TACHYON_ZEBRA_HEADERS_URL") {
+            let client = Client::builder().timeout(std::time::Duration::from_secs(5)).build().ok();
+            if let Some(http) = client {
+                let url = format!("{}/headers?start={}&count={}", base, current_height + 1, batch_size);
+                if let Ok(resp) = http.get(url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(list) = resp.json::<Vec<String>>().await {
+                            for hex in list {
+                    if let Ok(bytes) = ::hex::decode(hex.trim_start_matches("0x")) {
+                                    if let Some(h) = Self::decode_header_strict(&bytes, &config.pow_config) { headers.push(h); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Try request/response from any peer first
-        if let Ok(raw_headers) = network.request_headers_from_any_peer_by_height(current_height + 1, batch_size).await {
-            for (_height, raw) in raw_headers {
-                if let Some(h) = Self::decode_header_strict(&raw, &config.pow_config) { headers.push(h); }
+        if headers.is_empty() {
+            if let Ok(raw_headers) = network.request_headers_from_any_peer_by_height(current_height + 1, batch_size).await {
+                for (_height, raw) in raw_headers {
+                    if let Some(h) = Self::decode_header_strict(&raw, &config.pow_config) { headers.push(h); }
+                }
             }
         }
         // If empty, fall back to announcements-as-hints

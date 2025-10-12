@@ -16,6 +16,7 @@ bincode.workspace = true
 pq_crypto = { path = "../pq_crypto" }
 reqwest.workspace = true
 zebra-chain = { version = "1.0.0-beta.38", optional = true }
+hex.workspace = true
 
 [features]
 # Enable integration points for Zebra/Zcash header parsing and Equihash PoW verification.

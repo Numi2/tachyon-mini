@@ -30,9 +30,11 @@ use ragu::circuit as ragu_circuit;
 use ragu::circuit::Sink;
 use ragu::drivers::compute_public_inputs;
 use ragu::maybe as ragu_maybe;
-use ragu::maybe::Maybe as _;
+// use ragu::maybe::Maybe as _; // unused import
 mod sparse_merkle;
 pub mod tachy;
+pub mod orchard;
+pub mod recursion;
 
 // Re-export selected helpers for external consumers (e.g., CLI)
 pub use crate::tachy::compute_tachy_digest;

@@ -20,6 +20,9 @@ tracing.workspace = true
 bincode.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 hex = "0.4"
+ff.workspace = true
+pasta_curves.workspace = true
+halo2_gadgets.workspace = true
 accum_mmr = { path = "../accum_mmr", optional = true }
 accum_set = { path = "../accum_set", optional = true }
 dex = { path = "../dex", optional = true }

@@ -14,4 +14,12 @@ circuits.path = "../circuits"
 accum_mmr.path = "../accum_mmr"
 accum_set.path = "../accum_set"
 bincode = "1"
-ragu.path = "../ragu"
+ragu = { path = "../ragu" }
+hex = "0.4"
+ff.workspace = true
+pasta_curves.workspace = true
+
+[features]
+default = []
+# Enable Ragu mock backend for transition prove/verify
+ragu = ["ragu/ragu-backend"]

@@ -9,6 +9,7 @@ use net_iroh::{BlobKind, BlobStore, Cid, ControlMessage, TachyonNetwork, SyncMan
 use pq_crypto::{derive_nullifier, NullifierDerivationMode};
 use pq_crypto::AccessToken;
 use pcd_core::{PcdDeltaBundle, PcdState, PcdTransition};
+use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
 use accum_mmr::{MmrDelta, SerializableHash};
 use accum_set::SetDelta;
 use serde::{Deserialize, Serialize};
@@ -263,6 +264,7 @@ impl ObliviousSyncService {
         let network = self.network.clone();
         let published = self.published.clone();
 
+        let manifests_dir_clone = self.manifests_dir.clone();
         let sync_task = tokio::spawn(async move {
             let mut interval = interval(sync_interval);
 
@@ -274,6 +276,7 @@ impl ObliviousSyncService {
                             &subscriptions,
                             &network,
                             &published,
+                            manifests_dir_clone.clone(),
                         ).await {
                             tracing::error!("Sync cycle failed: {}", e);
                         }
@@ -296,6 +299,7 @@ impl ObliviousSyncService {
         _subscriptions: &Arc<RwLock<HashMap<String, WalletSubscription>>>,
         network: &Arc<TachyonNetwork>,
         published: &Arc<RwLock<Vec<PublishedBlobInfo>>>,
+        manifests_dir: std::path::PathBuf,
     ) -> Result<()> {
         // Get current state
         let current_state_opt = current_state.read().unwrap().clone();
@@ -303,29 +307,41 @@ impl ObliviousSyncService {
             return Ok(()); // No state yet
         };
 
-        // Generate delta bundle for this cycle
-        let delta_bundle = Self::generate_delta_bundle(current_state)?;
+        // Consume block-derived deltas published by nodes instead of synthesizing.
+        let height_next = current_state.anchor_height + 1;
+        let anns = network.get_recent_announcements();
+        let mut mmr_item: Option<(Cid, usize, String)> = None;
+        let mut nf_item: Option<(Cid, usize, String)> = None;
+        for (kind, cid, h, size, ticket) in anns {
+            if h == height_next {
+                match kind {
+                    BlobKind::CommitmentDelta => mmr_item = Some((cid, size, ticket)),
+                    BlobKind::NullifierDelta => nf_item = Some((cid, size, ticket)),
+                    _ => {}
+                }
+            }
+        }
 
-        // Note: we will publish MMR and Nullifier deltas separately (not the whole bundle)
+        // If required deltas are not available yet, skip this cycle
+        let (mmr_cid, mmr_size, mmr_ticket) = match mmr_item { Some(t) => t, None => return Ok(()) };
+        let (nf_cid, nf_size, nf_ticket) = match nf_item { Some(t) => t, None => return Ok(()) };
 
-        // Generate PCD transition proof
+        // Fetch delta bytes (for computing the roots and binding the proof)
+        let mmr_bytes = network.fetch_blob_from_ticket(&mmr_ticket).await?;
+        let nf_bytes = network.fetch_blob_from_ticket(&nf_ticket).await?;
+
+        // Build a delta bundle wrapper for hashing and bookkeeping
+        let delta_bundle = PcdDeltaBundle::new(
+            vec![mmr_bytes.to_vec()],
+            vec![nf_bytes.to_vec()],
+            (current_state.anchor_height, height_next),
+        );
+
+        // Generate PCD transition proof bound to these block-derived deltas
         let transition = Self::generate_pcd_transition(current_state, &delta_bundle)?;
-
-        // Serialize transition for publishing via iroh-blobs
         let transition_data = bincode::serialize(&transition)?;
 
-        // Publish via iroh-blobs and capture tickets for clients
-        let height_next = current_state.anchor_height + 1;
-        // Publish serialized Vec<MmrDelta>
-        let mmr_bytes = delta_bundle.mmr_deltas.concat();
-        let (_mmr_cid, mmr_ticket) = network
-            .publish_blob_with_ticket(BlobKind::CommitmentDelta, mmr_bytes.clone().into(), height_next)
-            .await?;
-        // Publish serialized SetDelta
-        let nf_bytes = delta_bundle.nullifier_deltas.concat();
-        let (_nf_cid, nf_ticket) = network
-            .publish_blob_with_ticket(BlobKind::NullifierDelta, nf_bytes.clone().into(), height_next)
-            .await?;
+        // Publish transition only (reuse node-published deltas)
         let (_tr_cid, transition_ticket) = network
             .publish_blob_with_ticket(BlobKind::PcdTransition, transition_data.clone().into(), height_next)
             .await?;
@@ -336,21 +352,21 @@ impl ObliviousSyncService {
             items: vec![
                 ManifestItem {
                     kind: BlobKind::CommitmentDelta,
-                    cid: _mmr_cid,
+                    cid: mmr_cid,
                     height: height_next,
-                    size: mmr_bytes.len(),
+                    size: mmr_size,
                     ticket: mmr_ticket.clone(),
                 },
                 ManifestItem {
                     kind: BlobKind::NullifierDelta,
-                    cid: _nf_cid,
+                    cid: nf_cid,
                     height: height_next,
-                    size: nf_bytes.len(),
+                    size: nf_size,
                     ticket: nf_ticket.clone(),
                 },
                 ManifestItem {
                     kind: BlobKind::PcdTransition,
-                    cid: _tr_cid,
+                    cid: net_iroh::Cid::from(blake3::hash(&transition_data)),
                     height: height_next,
                     size: transition_data.len(),
                     ticket: transition_ticket.clone(),
@@ -364,12 +380,11 @@ impl ObliviousSyncService {
 
         // Persist manifest to disk for recovery
         let fname = format!("manifest_{}.json", height_next);
-        // Prefer configured manifests_dir; fall back to env or ./manifests
-        let path = {
-            let default_dir = std::path::PathBuf::from("./manifests");
-            // We can't access self here; derive from any previously created dir via published not needed
-            std::env::var("TACHYON_MANIFEST_DIR").ok().map(std::path::PathBuf::from).unwrap_or(default_dir)
-        };
+        // Use TACHYON_MANIFEST_DIR if set; otherwise use configured manifests_dir (fallback to ./manifests)
+        let path = std::env::var("TACHYON_MANIFEST_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| if manifests_dir.as_os_str().is_empty() { std::path::PathBuf::from("./manifests") } else { manifests_dir.clone() });
         let path_file = path.join(&fname);
         let tmp = path.join(format!("{}.tmp", &fname));
         let _ = tokio::fs::write(&tmp, &manifest_bytes).await;
@@ -381,15 +396,15 @@ impl ObliviousSyncService {
             list.push(PublishedBlobInfo {
                 kind: BlobKind::CommitmentDelta,
                 height: height_next,
-                size: mmr_bytes.len(),
-                cid: net_iroh::Cid::from(blake3::hash(&mmr_bytes)),
+                size: mmr_size,
+                cid: mmr_cid,
                 ticket: mmr_ticket,
             });
             list.push(PublishedBlobInfo {
                 kind: BlobKind::NullifierDelta,
                 height: height_next,
-                size: nf_bytes.len(),
-                cid: net_iroh::Cid::from(blake3::hash(&nf_bytes)),
+                size: nf_size,
+                cid: nf_cid,
                 ticket: nf_ticket,
             });
             list.push(PublishedBlobInfo {
@@ -417,6 +432,7 @@ impl ObliviousSyncService {
     }
 
     /// Generate a delta bundle for the current state
+    #[allow(dead_code)]
     fn generate_delta_bundle(current_state: &PcdState) -> Result<PcdDeltaBundle> {
         // Use a real snapshot by deriving content from the state data and anchor height.
         // 1) Commitments: append two deterministic leaves to the MMR using anchor-bound seeds.
@@ -468,49 +484,56 @@ impl ObliviousSyncService {
         current_state: &PcdState,
         delta_bundle: &PcdDeltaBundle,
     ) -> Result<PcdTransition> {
-        // Derive new roots deterministically from deltas
+        // Derive new roots deterministically from deltas (until full block plumbing is wired)
         let new_mmr_root = blake3::hash(&delta_bundle.mmr_deltas.concat());
         let new_nf_root = blake3::hash(&delta_bundle.nullifier_deltas.concat());
 
-        // Keep block_hash stable for demo; bind proof to commitments
+        // Bind state_data to the bundle hash for forward privacy consistency
         let new_state_data = {
             let mut v = current_state.state_data.clone();
             v.extend_from_slice(&delta_bundle.bundle_hash);
             v
         };
 
-        let provisional = PcdState::new(
-            current_state.anchor_height + 1,
+        // Compute Poseidon transition digest that the Halo2 circuit enforces
+        let next_height = current_state.anchor_height + 1;
+        let new_digest = compute_transition_digest_bytes(
+            &current_state.state_commitment,
+            new_mmr_root.as_bytes(),
+            new_nf_root.as_bytes(),
+            next_height,
+        );
+
+        // Produce a real Halo2 proof for the transition
+        let halo2 = Halo2PcdCore::load_or_setup(
+            std::path::Path::new("crates/node_ext/node_data/keys"),
+            12,
+        )?;
+        let proof_bytes = halo2.prove_transition(
+            &current_state.state_commitment,
+            &new_digest,
+            new_mmr_root.as_bytes(),
+            new_nf_root.as_bytes(),
+            next_height,
+        )?;
+
+        // Construct the new state embedding the circuit proof
+        let new_state = PcdState::new(
+            next_height,
             *new_mmr_root.as_bytes(),
             *new_nf_root.as_bytes(),
             current_state.block_hash,
             new_state_data,
-            vec![],
+            proof_bytes.clone(),
         )?;
 
-        // Compute binding proofs
-        let mut trans_hasher = blake3::Hasher::new();
-        trans_hasher.update(b"pcd_transition_proof");
-        trans_hasher.update(&current_state.state_commitment);
-        trans_hasher.update(&provisional.state_commitment);
-        trans_hasher.update(&delta_bundle.bundle_hash);
-        let transition_proof = trans_hasher.finalize().as_bytes().to_vec();
-
-        let new_state = PcdState::new(
-            provisional.anchor_height,
-            provisional.mmr_root,
-            provisional.nullifier_root,
-            provisional.block_hash,
-            provisional.state_data,
-            transition_proof.clone(),
-        )?;
-
+        // Package the transition carrying the same Halo2 proof
         PcdTransition::new(
             current_state,
             &new_state,
             delta_bundle.mmr_deltas.concat(),
             delta_bundle.nullifier_deltas.concat(),
-            transition_proof,
+            proof_bytes,
         )
     }
 

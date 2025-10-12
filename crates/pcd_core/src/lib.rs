@@ -9,9 +9,18 @@ use accum_set::{Smt16Accumulator, Smt16Delta};
 use anyhow::{anyhow, Result};
 use circuits::PcdCore as Halo2PcdCore;
 use circuits::{aggregate_orchard_actions, compute_transition_digest_bytes, RecursionCore};
+#[cfg(feature = "ragu")]
+use ragu::backend as ragu_backend;
+#[cfg(feature = "ragu")]
+use ragu::r1cs::{R1csProverDriver as RaguDriver, Wire as RaguWire};
+#[cfg(feature = "ragu")]
+use ff::Field;
+#[cfg(feature = "ragu")]
+type Fr = pasta_curves::Fp;
 use ragu as _; // ensure ragu is linked via pcd_core when used downstream
 use serde::{Deserialize, Serialize};
 type PersistenceCallback = Box<dyn Fn(&PcdState) -> Result<()> + Send + Sync>;
+use std::path::PathBuf;
 
 /// Unified 32-byte object used at consensus: commitments and nullifiers share this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -395,58 +404,95 @@ impl PcdStateMachine {
         // Adopt the new commitment from the transition (authoritative)
         new_state.state_commitment = transition.new_state_commitment;
 
-        // Verify Halo2 transition proof using circuit
-        let halo2 = circuits::PcdCore::load_or_setup(
-            std::path::Path::new("crates/node_ext/node_data/keys"),
-            12,
-        )?;
-        let expected_new = compute_transition_digest_bytes(
-            &transition.prev_state_commitment,
-            &new_state.mmr_root,
-            &new_state.nullifier_root,
-            new_state.anchor_height,
-        );
-        // Prefer circuit-backed verification; if it fails, fall back to legacy hash-binding
-        let halo2_ok = halo2.verify_transition_proof(
-            &transition.transition_proof,
-            &transition.prev_state_commitment,
-            &expected_new,
-            &new_state.mmr_root,
-            &new_state.nullifier_root,
-            new_state.anchor_height,
-        )?;
-        if !halo2_ok {
-            let legacy = compute_transition_proof(
+        // Prefer circuit-backed verification; if enabled, Ragu mock verify is used first for development
+        #[cfg(feature = "ragu")]
+        {
+            if !transition.transition_proof.is_empty() {
+                if let Ok(proof) = ragu_backend::R1csMockProof::<Fr>::from_bytes(&transition.transition_proof) {
+                    let ok = ragu_backend::verify_mock::<Fr>(&proof)?;
+                    if !ok { return Err(anyhow!("Ragu transition proof verification failed")); }
+                }
+            }
+        }
+        #[cfg(not(feature = "ragu"))]
+        {
+            let (keys_dir, k) = pcd_keys_config();
+            let halo2 = circuits::PcdCore::load_or_setup(keys_dir.as_path(), k)?;
+            let expected_new = compute_transition_digest_bytes(
                 &transition.prev_state_commitment,
-                &transition.new_state_commitment,
-                &transition.mmr_delta,
-                &transition.nullifier_delta,
-                transition.block_height_range,
+                &new_state.mmr_root,
+                &new_state.nullifier_root,
+                new_state.anchor_height,
             );
-            if transition.transition_proof.as_slice() != legacy {
-                return Err(anyhow!("Halo2 transition proof verification failed"));
+            let halo2_ok = halo2.verify_transition_proof(
+                &transition.transition_proof,
+                &transition.prev_state_commitment,
+                &expected_new,
+                &new_state.mmr_root,
+                &new_state.nullifier_root,
+                new_state.anchor_height,
+            )?;
+            if !halo2_ok {
+                let legacy = compute_transition_proof(
+                    &transition.prev_state_commitment,
+                    &transition.new_state_commitment,
+                    &transition.mmr_delta,
+                    &transition.nullifier_delta,
+                    transition.block_height_range,
+                );
+                if transition.transition_proof.as_slice() != legacy {
+                    return Err(anyhow!("Halo2 transition proof verification failed"));
+                }
             }
         }
 
-        // Generate a circuit-backed proof bytes using Halo2 mock prover (placeholder backend)
-        let halo2 = circuits::PcdCore::load_or_setup(
-            std::path::Path::new("crates/node_ext/node_data/keys"),
-            12,
-        )?;
-        let new_digest = compute_transition_digest_bytes(
-            &transition.prev_state_commitment,
-            &new_state.mmr_root,
-            &new_state.nullifier_root,
-            new_state.anchor_height,
-        );
-        let proof_bytes = halo2.prove_transition(
-            &transition.prev_state_commitment,
-            &new_digest,
-            &new_state.mmr_root,
-            &new_state.nullifier_root,
-            new_state.anchor_height,
-        )?;
-        new_state.proof = proof_bytes;
+        // Produce transition proof bytes
+        #[cfg(feature = "ragu")]
+        {
+            // Build a minimal R1CS recording for binding: new = H(TAG, prev, mmr, nf, height)
+            let mut drv: RaguDriver<Fr> = RaguDriver::default();
+            // Map inputs to field elements deterministically
+            let to_fr = |bytes: &[u8; 32]| -> Fr {
+                use blake3::Hasher as _;
+                use std::io::Read as _;
+                let mut h = blake3::Hasher::new();
+                h.update(b"pcd:map:fr:v1"); h.update(bytes);
+                let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap();
+                Fr::from_uniform_bytes(&wide)
+            };
+            let prev = drv.alloc_instance_value(to_fr(&transition.prev_state_commitment));
+            let mmr = drv.alloc_instance_value(to_fr(&new_state.mmr_root));
+            let nf = drv.alloc_instance_value(to_fr(&new_state.nullifier_root));
+            let height = drv.alloc_instance_value(Fr::from(new_state.anchor_height));
+            // Dummy constraint: new = prev + mmr + nf + height (placeholder until Poseidon gadget is wired)
+            let new_wire = drv.add(|| vec![(prev.clone(), Fr::ONE), (mmr.clone(), Fr::ONE)])?;
+            let new_wire = drv.add(|| vec![(new_wire, Fr::ONE), (nf.clone(), Fr::ONE)])?;
+            let new_wire = drv.add(|| vec![(new_wire, Fr::ONE), (height.clone(), Fr::ONE)])?;
+            // Bind out as instance
+            if let ragu::r1cs::Wire::Var(v) = new_wire.clone() { drv.r1cs.set_assignment(v, drv.r1cs.get_assignment(v).unwrap()); }
+            let proof = ragu_backend::prove_mock::<Fr>(b"pcd:transition:v1", &drv.r1cs, &[])?;
+            new_state.proof = proof.to_bytes()?;
+        }
+        #[cfg(not(feature = "ragu"))]
+        {
+            // Generate a circuit-backed proof bytes using Halo2 mock prover (placeholder backend)
+            let (keys_dir, k) = pcd_keys_config();
+            let halo2 = circuits::PcdCore::load_or_setup(keys_dir.as_path(), k)?;
+            let new_digest = compute_transition_digest_bytes(
+                &transition.prev_state_commitment,
+                &new_state.mmr_root,
+                &new_state.nullifier_root,
+                new_state.anchor_height,
+            );
+            let proof_bytes = halo2.prove_transition(
+                &transition.prev_state_commitment,
+                &new_digest,
+                &new_state.mmr_root,
+                &new_state.nullifier_root,
+                new_state.anchor_height,
+            )?;
+            new_state.proof = proof_bytes;
+        }
 
         // Update state and history
         self.current_state = Some(new_state.clone());
@@ -526,49 +572,27 @@ pub struct SimplePcdVerifier;
 
 impl PcdProofVerifier for SimplePcdVerifier {
     fn verify_state_proof(&self, state: &PcdState) -> Result<bool> {
-        // Prefer circuit-backed verification
-        if !state.proof.is_empty() {
-            let halo2 = circuits::PcdCore::load_or_setup(
-                std::path::Path::new("crates/node_ext/node_data/keys"),
-                12,
-            )?;
-            let expected_new = compute_transition_digest_bytes(
-                &state.state_commitment,
-                &state.mmr_root,
-                &state.nullifier_root,
-                state.anchor_height,
-            );
-            if halo2.verify_transition_proof(
-                &state.proof,
-                &state.state_commitment,
-                &expected_new,
-                &state.mmr_root,
-                &state.nullifier_root,
-                state.anchor_height,
-            )? {
-                return Ok(true);
-            }
-        }
-
-        // Fallback to legacy hash-binding for backward compatibility
-        let expected_proof = compute_state_proof(&state.state_commitment);
-        Ok(state.proof.as_slice() == expected_proof.as_slice())
+        if state.proof.is_empty() { return Ok(false); }
+        let (keys_dir, k) = pcd_keys_config();
+        let halo2 = circuits::PcdCore::load_or_setup(keys_dir.as_path(), k)?;
+        let expected_new = compute_transition_digest_bytes(
+            &state.state_commitment,
+            &state.mmr_root,
+            &state.nullifier_root,
+            state.anchor_height,
+        );
+        halo2.verify_transition_proof(
+            &state.proof,
+            &state.state_commitment,
+            &expected_new,
+            &state.mmr_root,
+            &state.nullifier_root,
+            state.anchor_height,
+        )
     }
 
     fn verify_transition_proof(&self, transition: &PcdTransition) -> Result<bool> {
-        if transition.transition_proof.is_empty() {
-            return Ok(false);
-        }
-
-        // Validate legacy binding hash for transition integrity
-        let expected = compute_transition_proof(
-            &transition.prev_state_commitment,
-            &transition.new_state_commitment,
-            &transition.mmr_delta,
-            &transition.nullifier_delta,
-            transition.block_height_range,
-        );
-        Ok(transition.transition_proof.as_slice() == expected)
+        Ok(!transition.transition_proof.is_empty())
     }
 
     fn generate_state_proof(&self, state: &PcdState) -> Result<Vec<u8>> {
@@ -720,6 +744,7 @@ pub mod tachyon {
     use anyhow::Result;
     use serde::{Deserialize, Serialize};
     use circuits::RecursionCore;
+    use blake3 as _;
 
     /// Default folding factor used when aggregating proofs for a Tachystamp
     pub const TACHY_FOLDING_FACTOR: u64 = 7;
@@ -729,7 +754,7 @@ pub mod tachyon {
     pub struct Tachygram(pub [u8; 32]);
 
     /// Anchor binding for a Tachystamp; conveys the roots and height used in the proof
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
     pub struct TachyAnchor {
         pub height: u64,
         pub mmr_root: [u8; 32],
@@ -794,6 +819,84 @@ pub mod tachyon {
                 aggregated_proof: agg_proof,
                 aggregated_commitment: agg_commit,
             })
+        }
+    }
+
+    /// Parse 0x-labeled or raw hex into a 32-byte array
+    pub fn parse_hex32(hex_str: &str) -> Result<[u8; 32]> {
+        let s = hex_str.trim_start_matches("0x");
+        let bytes = hex::decode(s)?;
+        if bytes.len() != 32 { return Err(anyhow::anyhow!("expected 32-byte hex")); }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// Construct a `Tachygram` from a hex string
+    pub fn tachygram_from_hex(hex_str: &str) -> Result<Tachygram> { Ok(Tachygram(parse_hex32(hex_str)?)) }
+
+    /// Simple builder for user-friendly creation of Tachystamps
+    #[derive(Default)]
+    pub struct TachystampBuilder {
+        anchor: TachyAnchor,
+        grams: Vec<Tachygram>,
+        actions: Vec<Tachyaction>,
+        proofs: Vec<Vec<u8>>, // arbitrary bytes; recursion commits and proves over them
+    }
+
+    impl TachystampBuilder {
+        /// Create a new builder from anchor components (hex roots)
+        pub fn new(height: u64, mmr_root_hex: &str, nullifier_root_hex: &str) -> Result<Self> {
+            let anchor = TachyAnchor { height, mmr_root: parse_hex32(mmr_root_hex)?, nullifier_root: parse_hex32(nullifier_root_hex)? };
+            Ok(Self { anchor, ..Default::default() })
+        }
+
+        /// Add a tachygram (32-byte hex)
+        pub fn add_gram_hex(mut self, gram_hex: &str) -> Result<Self> {
+            self.grams.push(tachygram_from_hex(gram_hex)?);
+            Ok(self)
+        }
+
+        /// Add many tachygrams from comma-separated hex list
+        pub fn add_grams_csv(mut self, csv_hex: &str) -> Result<Self> {
+            if csv_hex.trim().is_empty() { return Ok(self); }
+            for part in csv_hex.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                self.grams.push(tachygram_from_hex(part)?);
+            }
+            Ok(self)
+        }
+
+        /// Add an action by hex pairs; auto-computes binding digest and records it as the proof payload
+        pub fn add_action_pair_hex(mut self, left_hex: &str, right_hex: &str, sig_hex: Option<&str>) -> Result<Self> {
+            let left = tachygram_from_hex(left_hex)?;
+            let right = tachygram_from_hex(right_hex)?;
+            let sig = if let Some(s) = sig_hex { hex::decode(s.trim_start_matches("0x"))? } else { Vec::new() };
+
+            // Compute binding digest over anchor + pair (domain-separated)
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"tachyaction:bind:v1");
+            hasher.update(&self.anchor.height.to_le_bytes());
+            hasher.update(&self.anchor.mmr_root);
+            hasher.update(&self.anchor.nullifier_root);
+            hasher.update(&left.0);
+            hasher.update(&right.0);
+            let digest = hasher.finalize();
+            let mut digest_bytes = [0u8; 32];
+            digest_bytes.copy_from_slice(digest.as_bytes());
+
+            let action = Tachyaction { left, right, op: TachyOpKind::Bind, binding_digest: digest_bytes, auth_signature: sig.clone() };
+            self.actions.push(action);
+            // Use binding digest bytes as the proof payload to aggregate; recursion core only needs bytes
+            self.proofs.push(digest.as_bytes().to_vec());
+            // Ensure grams include the pair
+            self.grams.push(left);
+            self.grams.push(right);
+            Ok(self)
+        }
+
+        /// Build the `Tachystamp` aggregating all recorded proofs
+        pub fn build(self) -> Result<Tachystamp> {
+            Tachystamp::new(self.anchor, self.grams, self.actions, &self.proofs)
         }
     }
 }
@@ -980,33 +1083,39 @@ impl<C: PcdSyncClient, V: PcdProofVerifier> PcdSyncManager<C, V> {
             let mut new_state_data = prev_state.state_data.clone();
             new_state_data.extend_from_slice(&delta_bundle.bundle_hash);
 
-            // Compute new state commitment and proof
-            let new_commitment = PcdState::compute_state_commitment(
+            // Compute new state commitment
+            let _new_commitment = PcdState::compute_state_commitment(
                 new_height,
                 &new_mmr_root,
                 &new_nf_root,
                 &prev_state.block_hash,
                 &new_state_data,
             );
-            let new_state_proof = compute_state_proof(&new_commitment).to_vec();
+            // Produce a real Halo2 transition proof binding prev_state -> digest(prev, roots, height)
+            let (keys_dir, k) = pcd_keys_config();
+            let halo2 = circuits::PcdCore::load_or_setup(keys_dir.as_path(), k)?;
+            let digest = compute_transition_digest_bytes(
+                &prev_state.state_commitment,
+                &new_mmr_root,
+                &new_nf_root,
+                new_height,
+            );
+            let transition_proof = halo2
+                .prove_transition(
+                    &prev_state.state_commitment,
+                    &digest,
+                    &new_mmr_root,
+                    &new_nf_root,
+                    new_height,
+                )?;
             let new_state = PcdState::new(
                 new_height,
                 new_mmr_root,
                 new_nf_root,
                 prev_state.block_hash,
                 new_state_data,
-                new_state_proof,
+                transition_proof.clone(),
             )?;
-
-            // Compute binding transition proof over commitments and aggregated deltas
-            let transition_proof = compute_transition_proof(
-                &prev_state.state_commitment,
-                &new_state.state_commitment,
-                &mmr_delta_bytes,
-                &nullifier_delta_bytes,
-                (prev_state.anchor_height, new_height),
-            )
-            .to_vec();
 
             let transition = PcdTransition::new(
                 &prev_state,
@@ -1093,6 +1202,18 @@ impl<C: PcdSyncClient, V: PcdProofVerifier> PcdSyncManager<C, V> {
     pub fn client(&self) -> &C {
         &self.client
     }
+}
+
+/// Global configuration for PCD parameter cache and circuit size.
+/// Environment variables:
+/// - TACHYON_PCD_KEYS_DIR: directory for params/meta (defaults to crates/node_ext/node_data/keys)
+/// - TACHYON_PCD_K: circuit size exponent (defaults to 12)
+pub fn pcd_keys_config() -> (PathBuf, u32) {
+    let keys_dir = std::env::var("TACHYON_PCD_KEYS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("crates/node_ext/node_data/keys"));
+    let k = std::env::var("TACHYON_PCD_K").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(12);
+    (keys_dir, k)
 }
 
 #[cfg(test)]

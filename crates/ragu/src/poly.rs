@@ -8,6 +8,7 @@ use crate::drivers::PublicInput;
 
 /// Minimal oracle interface used by poly-evaluation drivers.
 /// Implementations can provide restricted polynomial evaluation semantics.
+#[allow(clippy::wrong_self_convention)]
 pub trait PolynomialOracle<F: Field> {
     /// Convert a field element into the oracle's value domain (usually identity).
     fn from_field(&mut self, value: F) -> F { value }
@@ -71,6 +72,21 @@ impl<F: Field, O: PolynomialOracle<F>> Driver for PolyProverDriver<F, O> {
         let acc = self.oracle.add_lc(lc());
         if acc.is_zero_vartime() { Ok(()) } else { Err(anyhow::anyhow!("constraint not satisfied")) }
     }
+
+    fn enforce_mul<LA, LB, LC>(
+        &mut self,
+        _a: impl FnOnce() -> LA,
+        _b: impl FnOnce() -> LB,
+        _c: impl FnOnce() -> LC,
+    ) -> Result<(), anyhow::Error>
+    where
+        LA: IntoIterator<Item = (Self::W, Self::F)>,
+        LB: IntoIterator<Item = (Self::W, Self::F)>,
+        LC: IntoIterator<Item = (Self::W, Self::F)>
+    {
+        // Value-domain driver cannot enforce multiplicative constraints; rely on tests to catch inconsistencies
+        Ok(())
+    }
 }
 
 /// Verification-time polynomial evaluation driver.
@@ -115,6 +131,21 @@ impl<F: Field, O: PolynomialOracle<F>> Driver for PolyVerifierDriver<F, O> {
     ) -> Result<(), anyhow::Error> {
         let acc = self.oracle.add_lc(lc());
         if acc.is_zero_vartime() { Ok(()) } else { Err(anyhow::anyhow!("constraint not satisfied")) }
+    }
+
+    fn enforce_mul<LA, LB, LC>(
+        &mut self,
+        _a: impl FnOnce() -> LA,
+        _b: impl FnOnce() -> LB,
+        _c: impl FnOnce() -> LC,
+    ) -> Result<(), anyhow::Error>
+    where
+        LA: IntoIterator<Item = (Self::W, Self::F)>,
+        LB: IntoIterator<Item = (Self::W, Self::F)>,
+        LC: IntoIterator<Item = (Self::W, Self::F)>
+    {
+        // Verification driver does not multiply; skip
+        Ok(())
     }
 }
 

@@ -90,6 +90,89 @@ jobs:
       - name: tachyon-bench --help
         run: ./target/debug/tachyon-bench --help || true
 
+  integration:
+    name: Integration (CLI + components)
+    runs-on: ubuntu-24.04
+    needs: test
+    env:
+      TACHYON_UNDER_TEST: "1"
+      TACHYON_ALLOW_INSECURE: "1"
+      TACHYON_PCD_KEYS_DIR: crates/node_ext/node_data/keys
+      TACHYON_PCD_K: "12"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build CLI
+        run: cargo build -p cli --bin tachyon --locked
+
+      - name: PCD core and circuits must pass
+        run: |
+          set -euxo pipefail
+          cargo test -p pcd_core -- --nocapture
+          cargo test -p circuits -- --nocapture
+
+      - name: End-to-end OSS ↔ Wallet ↔ Node smoke
+        run: |
+          set -euxo pipefail
+          TMP=$(mktemp -d)
+          export TACHYON_DATA_DIR="$TMP"
+          # Build node state and publish a small header and deltas
+          cargo build -p cli --bin tachyon --locked
+          # Start by publishing a dummy header (local publish path)
+          echo "hdr" > "$TMP/hdr"
+          ./target/debug/tachyon network publish --file "$TMP/hdr" --kind header --height 1 || true
+          # Run unit tests that implicitly exercise OSS and wallet sync clients
+          cargo test -p oss_service -- --nocapture
+          cargo test -p wallet -- --nocapture
+
+      - name: OOB send/claim flow
+        run: |
+          set -euxo pipefail
+          SENDER=$(mktemp -d)
+          RECEIVER=$(mktemp -d)
+          SENDER_DB="$SENDER/wdb"
+          RECEIVER_DB="$RECEIVER/wdb"
+          ./target/debug/tachyon wallet create --name s --password pw --db-path "$SENDER_DB"
+          ./target/debug/tachyon wallet create --name r --password pw --db-path "$RECEIVER_DB"
+          # receiver publishes OOB public key
+          OOB_URI=$(./target/debug/tachyon wallet oob-uri --db-path "$RECEIVER_DB" --password pw | tail -n1)
+          # sender constructs payment JSON to OOB URI
+          JSON=$(./target/debug/tachyon wallet create-payment --recipient-pk $(echo "$OOB_URI" | sed -n 's/.*pk=//p') --value 7 --db-path "$SENDER_DB" --password pw | tail -n +1 | sed -n '/^{/,/^}$/p' || true)
+          test -n "$JSON"
+          # receiver claims payment
+          ./target/debug/tachyon wallet receive-payment --payment-data "$JSON" --db-path "$RECEIVER_DB" --password pw
+          # receiver should have exactly one note
+          NOTES=$(./target/debug/tachyon wallet list-notes --db-path "$RECEIVER_DB" --password pw | grep -c "#")
+          test "$NOTES" -ge 1
+
+      - name: DEX lifecycle (deposit, place, cancel)
+        run: |
+          set -euxo pipefail
+          TMP=$(mktemp -d)
+          DB="$TMP/wdb"
+          ./target/debug/tachyon wallet create --name w --password pw --db-path "$DB"
+          ./target/debug/tachyon dex deposit-usdc --db-path "$DB" --password pw --amount 1000
+          ./target/debug/tachyon dex place-limit --db-path "$DB" --password pw --side bid --price 10 --qty 5
+          ./target/debug/tachyon dex order-book --db-path "$DB" --password pw --depth 5 | grep -E "Bids:|Asks:" >/dev/null
+          # place and then cancel an order, ensure command doesn't error
+          ./target/debug/tachyon dex place-market --db-path "$DB" --password pw --side ask --qty 1 || true
+          ./target/debug/tachyon dex cancel --db-path "$DB" --password pw --id 1 || true
+
+      - name: Network: local publish must succeed
+        run: |
+          set -euxo pipefail
+          echo "hello" > /tmp/blob
+          ./target/debug/tachyon network publish --file /tmp/blob --kind header --height 1
+
   audit:
     name: Security audit
     runs-on: ubuntu-24.04

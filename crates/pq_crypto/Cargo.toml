@@ -17,3 +17,9 @@ zeroize = "1"
 pqcrypto-kyber = "0.8"
 pqcrypto-traits = "0.3"
 pqcrypto-dilithium = "0.5"
+
+[features]
+default = []
+# Declare the optional feature to silence unexpected cfg warnings.
+# When enabled by consumers, they can add the dependency as needed.
+mldsa = []

@@ -10,6 +10,12 @@ serde.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 ff.workspace = true
+halo2_gadgets.workspace = true
+pasta_curves.workspace = true
+halo2_proofs.workspace = true
+blake3.workspace = true
+bincode.workspace = true
+rand.workspace = true
 
 
 [features]

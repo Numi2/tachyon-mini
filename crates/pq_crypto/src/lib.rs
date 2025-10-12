@@ -772,11 +772,13 @@ impl OutOfBandPayment {
     pub fn decrypt(&self, recipient_sk: &KyberSecretKey) -> Result<Vec<u8>> {
         let mut shared_secret = SimpleKem::decapsulate(recipient_sk, &self.kem_ciphertext)?;
 
-        SimpleAead::decrypt(
+        let result = SimpleAead::decrypt(
             &shared_secret,
             &self.encrypted_metadata,
             &self.associated_data,
-        ).map(|pt| { shared_secret.zeroize(); pt })
+        );
+        shared_secret.zeroize();
+        result
     }
 
     /// Verify the payment structure is well-formed
@@ -883,13 +885,13 @@ impl SuiteB {
             // ML-DSA65 ~ Dilithium3 level
             use pqcrypto_mldsa::mldsa65;
             let (pk, sk) = mldsa65::keypair();
-            return Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())));
+            Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())))
         }
         #[cfg(not(feature = "mldsa"))]
         {
             use pqcrypto_dilithium::dilithium3;
             let (pk, sk) = dilithium3::keypair();
-            return Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())));
+            Ok((SuiteBPublicKey::new(pk.as_bytes().to_vec()), SuiteBSecretKey::new(sk.as_bytes().to_vec())))
         }
     }
 
@@ -901,7 +903,7 @@ impl SuiteB {
             let sk = mldsa65::SecretKey::from_bytes(secret_key.as_bytes())
                 .map_err(|_| anyhow!("Invalid Suite B secret key bytes"))?;
             let sig = mldsa65::detached_sign(digest32, &sk);
-            return Ok(SuiteBSignature::new(sig.as_bytes().to_vec()));
+            Ok(SuiteBSignature::new(sig.as_bytes().to_vec()))
         }
         #[cfg(not(feature = "mldsa"))]
         {
@@ -909,7 +911,7 @@ impl SuiteB {
             let sk = dilithium3::SecretKey::from_bytes(secret_key.as_bytes())
                 .map_err(|_| anyhow!("Invalid Suite B secret key bytes"))?;
             let sig = dilithium3::detached_sign(digest32, &sk);
-            return Ok(SuiteBSignature::new(sig.as_bytes().to_vec()));
+            Ok(SuiteBSignature::new(sig.as_bytes().to_vec()))
         }
     }
 
@@ -926,7 +928,7 @@ impl SuiteB {
                 Ok(sig) => sig,
                 Err(_) => return false,
             };
-            return mldsa65::verify_detached_signature(&sig, digest32, &pk).is_ok();
+            mldsa65::verify_detached_signature(&sig, digest32, &pk).is_ok()
         }
         #[cfg(not(feature = "mldsa"))]
         {
@@ -939,7 +941,7 @@ impl SuiteB {
                 Ok(sig) => sig,
                 Err(_) => return false,
             };
-            return dilithium3::verify_detached_signature(&sig, digest32, &pk).is_ok();
+            dilithium3::verify_detached_signature(&sig, digest32, &pk).is_ok()
         }
     }
 

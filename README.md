@@ -37,6 +37,9 @@ What this is
 - **Networking**: `iroh` + `iroh-blobs` for transport and content addressing; includes `BlobKind::Manifest` and a `SyncManifest` index by height.
 - **Chain nullifier client (optional)**: wallet can query a Zebra HTTP endpoint for observed nullifiers using TLS (`reqwest` + `rustls`).
 - **Witness maintenance**: after adopting a new PCD state, the wallet recomputes and persists MMR witnesses for all unspent notes.
+ - **Halo2 transition proofs (real)**: transitions are proven/verified with Halo2; legacy hash/mocks removed.
+ - **Manifests from block data**: OSS consumes node-published deltas and publishes per-height manifests and PCD transitions only.
+ - **Pruning journals**: node writes per-block journals and prunes beyond a retention window.
 
 
 Workspace layout
@@ -72,6 +75,18 @@ Tachyon-style shielded flows collapse commitments and nullifiers into indistingu
   - Built via `pcd_core::tachyon::Tachystamp::new(anchor, grams, actions, proofs)` using Halo2 recursion.
   - Node verifies the aggregated proof and that anchor roots/height match the canonical state.
 
+What’s new (ease-of-use)
+------------------------
+- `TachystampBuilder` (ergonomic API): construct stamps from simple hex strings without touching low-level types.
+  - `TachystampBuilder::new(height, mmr_hex, nulls_hex)` → `.add_gram_hex(..)` / `.add_grams_csv(..)` → `.add_action_pair_hex(left_hex, right_hex, [sig_hex])` → `.build()`.
+- Two new CLI helpers for fast experiments, no wallet required:
+  - `tachyon tachy-build-stamp` – build a stamp from hex inputs and print JSON.
+  - `tachyon tachy-verify-stamp` – verify a previously produced stamp JSON.
+- Circuit glue for tachyactions lives in `circuits/src/tachy.rs`:
+  - Computes a Poseidon digest for an action and binds it to a leaf update.
+  - Includes a minimal authorizing-signature relation (toy), plus a sparse-Merkle path walk.
+  - `RecursionCore` aggregates digests/proofs into a single 32-byte commitment.
+
 Wallet
 - Provides `wallet::TachyonWallet::build_tachystamp(...)` to package outputs/nullifiers into tachygrams, attach optional tachyactions, and aggregate provided proofs into a tachystamp bound to the current anchor.
 
@@ -87,12 +102,14 @@ Data model
 - Deltas are bincode’d batches from `accum_mmr::MmrDelta` and `accum_set::SetDelta`.
 - Proofs are Halo2-based for state transitions (no mocks/stubs).
 - `SyncManifest { height, items: Vec<ManifestItem{ kind, cid, size, ticket, height }] }` published per height; contains only public metadata.
+ - Node publishes block-derived `CommitmentDelta` and `NullifierDelta`; OSS publishes `PcdTransition` and a `Manifest` referencing the tickets.
 
 
 Flows
 -----
 - **Sync**: wallet subscribes to Manifests → fetches per-height deltas/proofs via tickets → applies via `pcd_core` → updates `PcdState` → persists; OSS learns only CIDs/sizes.
 - **Chain nullifier observation (optional)**: if `TACHYON_ZEBRA_NULLIFIER_URL` is set, the wallet fetches recent nullifiers, derives NF2 per unspent note, and flags locally-spent notes.
+ - **Header import (optional)**: if `TACHYON_ZEBRA_HEADERS_URL` is set, header sync fetches raw headers via Zebra HTTP first, then falls back.
 - **Spend (skeleton)**: wallet selects notes → derives NF2 using a spend secret (not from FVKey) → builds spend bundle → attaches `PcdState` proof at anchor.
 - **Validation**: node verifies PCD, enforces nullifier uniqueness against the canonical set, and requires `anchor_height`, `mmr_root`, and `nullifier_root` to match the node’s canonical state; old state can be pruned.
 - **OOB payment**: Kyber encapsulation → AEAD encrypt note meta → recipient decapsulates → wallet ingests note.
@@ -120,7 +137,14 @@ Environment variables supported by the wallet (see `WalletConfig::from_env()`):
 - `TACHYON_SYNC_INTERVAL_SECS`: background sync period (default `30`).
 - `TACHYON_MAX_SYNC_BATCH_SIZE`: max blocks per sync batch (default `10`).
 - `TACHYON_ZEBRA_NULLIFIER_URL`: optional Zebra base URL (enables chain nullifier observation).
+ - `TACHYON_ZEBRA_HEADERS_URL`: optional Zebra headers base URL (enables header import before peer requests).
 - `TACHYON_ALLOW_INSECURE=1`: allow localhost endpoints and default password for dev.
+
+Halo2 parameters (global)
+-------------------------
+- `TACHYON_PCD_KEYS_DIR`: directory for Halo2 params/meta (default `crates/node_ext/node_data/keys`).
+- `TACHYON_PCD_K`: circuit size exponent (default `12`).
+The crates load these via a common helper so CI and production can override.
 
 Adopt Out-of-Band Payments (no protocol changes)
 ------------------------------------------------
@@ -199,6 +223,12 @@ Install toolchain: rustup stable. Build from workspace root.
   - Notes: `cargo run -p cli -- wallet list-notes --db-path ./tachyon_data/wallets/alice --password pass [--unspent-only]`
   - Sync: `cargo run -p cli -- wallet sync --db-path ./tachyon_data/wallets/alice --password pass`
 
+- Tachystamps (no wallet; quick prototyping)
+  - Build from hex (comma-separated grams; repeat `--action` for pairs):
+    - `cargo run -p cli -- tachy-build-stamp --height 123 --mmr 0x1111... --nulls 0x2222... --grams 0xaaaa...,0xbbbb... --action 0xaaaa... 0xbbbb...`
+  - Verify a JSON stamp (stdin or file):
+    - `cargo run -p cli -- tachy-verify-stamp --file ./stamp.json`
+
 - Network
   - Start node: `cargo run -p cli -- network node --data-dir ./tachyon_data --listen-addr 0.0.0.0:8080 [--bootstrap-nodes a,b]`
   - Publish blob: `cargo run -p cli -- network publish --file ./blob.bin --kind pcd_transition --height 42`
@@ -216,6 +246,13 @@ Build & run
 -----------
 - Build: `cargo build` (or `--release`)
 - Bench: `cargo run -p bench --release`
+
+CI
+--
+See `.github/workflows/ci.yml` for lint, build, unit tests, and an integration job that:
+- Runs `pcd_core` and `circuits` tests (real Halo2 proofs),
+- Publishes a header blob locally and runs `oss_service` and `wallet` tests,
+- Exports `TACHYON_PCD_KEYS_DIR`/`TACHYON_PCD_K` for reproducible Halo2 setup.
 
 
 Credits

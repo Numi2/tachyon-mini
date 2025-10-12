@@ -19,3 +19,8 @@ accum_set = { path = "../accum_set" }
 pq_crypto = { path = "../pq_crypto" }
 circuits = { path = "../circuits" }
 bincode.workspace = true
+ff.workspace = true
+pasta_curves.workspace = true
+ragu = { path = "../ragu" }
+rand = "0.8"
+bytes.workspace = true

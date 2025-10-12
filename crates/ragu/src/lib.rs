@@ -121,6 +121,7 @@ pub mod maybe {
 }
 
 pub mod circuit {
+    #![allow(clippy::wrong_self_convention, clippy::type_complexity)]
     use ff::Field;
     use super::maybe::{MaybeKind};
     // Bring trait methods (including associated fns) into scope for Maybe
@@ -146,15 +147,28 @@ pub mod circuit {
             values: impl FnOnce() -> Result<(Self::F, Self::F, Self::F), anyhow::Error>,
         ) -> Result<(Self::W, Self::W, Self::W), anyhow::Error>;
 
-        fn add<L: IntoIterator<Item = (Self::W, Self::F)>>(
+        fn add<L: IntoIterator<Item = (Self::W, Self::F)>>( 
             &mut self,
-            lc: impl FnOnce() -> L,
+            _lc: impl FnOnce() -> L,
         ) -> Result<Self::W, anyhow::Error>;
 
-        fn enforce_zero<L: IntoIterator<Item = (Self::W, Self::F)>>(
+        fn enforce_zero<L: IntoIterator<Item = (Self::W, Self::F)>>( 
             &mut self,
-            lc: impl FnOnce() -> L,
+            _lc: impl FnOnce() -> L,
         ) -> Result<(), anyhow::Error>;
+
+        /// Enforce a multiplication relation between three linear combinations A, B and C:
+        /// <A, x> * <B, x> = <C, x>
+        fn enforce_mul<LA, LB, LC>(
+            &mut self,
+            _a: impl FnOnce() -> LA,
+            _b: impl FnOnce() -> LB,
+            _c: impl FnOnce() -> LC,
+        ) -> Result<(), anyhow::Error>
+        where
+            LA: IntoIterator<Item = (Self::W, Self::F)>,
+            LB: IntoIterator<Item = (Self::W, Self::F)>,
+            LC: IntoIterator<Item = (Self::W, Self::F)> { Ok(()) }
 
         /// Convenience: obtain a representation of the field-one constant in the driver's wire domain
         #[inline(always)]
@@ -203,6 +217,7 @@ pub mod circuit {
 }
 
 pub mod drivers {
+    #![allow(clippy::wrong_self_convention)]
     use ff::Field;
     use crate::circuit::{Circuit, Driver, Sink};
     use crate::maybe::{Always};
@@ -296,7 +311,7 @@ pub mod drivers {
 
         fn add<L: IntoIterator<Item = (Self::W, Self::F)>>( 
             &mut self,
-            lc: impl FnOnce() -> L,
+            _lc: impl FnOnce() -> L,
         ) -> Result<Self::W, anyhow::Error> {
             // In proving path, we avoid evaluating the linear combination eagerly
             let out = self.next_index;
@@ -306,7 +321,7 @@ pub mod drivers {
 
         fn enforce_zero<L: IntoIterator<Item = (Self::W, Self::F)>>( 
             &mut self,
-            lc: impl FnOnce() -> L,
+            _lc: impl FnOnce() -> L,
         ) -> Result<(), anyhow::Error> {
             // In proving path, constraints are recorded by the backend; no eager evaluation
             Ok(())
@@ -397,6 +412,10 @@ pub mod drivers {
 }
 
 pub mod poly;
+pub mod r1cs;
+pub mod gadgets;
+pub mod backend;
+pub mod backend_halo2;
 
 #[cfg(test)]
 mod tests {

@@ -30,8 +30,10 @@ dirs-next = "2"
 onramp_stripe = { path = "../onramp_stripe" }
 dex = { path = "../dex" }
 circuits = { path = "../circuits" }
+pcd_core = { path = "../pcd_core" }
 rand.workspace = true
 pasta_curves.workspace = true
+halo2_proofs.workspace = true
 
 [features]
 default = []
