@@ -8,7 +8,7 @@
 
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, keygen_pk, keygen_vk, create_proof, verify_proof, SingleVerifier};
-use halo2_proofs::poly::commitment::Params;
+use halo2_proofs::poly::ipa::commitment::{ParamsIPA, IPACommitmentScheme};
 use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
 use pasta_curves::vesta::Affine as G1Affine;
 use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
@@ -129,28 +129,28 @@ pub fn compute_rec_agg(prev: Fr, state_root: Fr, link: Fr) -> Fr {
 
 /// Prove a Poseidon recursion bind: agg = H(TAG, prev, cur). Returns (proof_bytes, agg_value).
 pub fn prove_poseidon_bind(prev: Fr, state_root: Fr, link: Fr, k: u32) -> anyhow::Result<(Vec<u8>, Fr)> {
-    let params = Params::<G1Affine>::new(k);
+    let params = ParamsIPA::<G1Affine>::new(k);
     let agg = compute_rec_agg(prev, state_root, link);
     let circuit = RecPoseidonCircuit { prev: Value::known(prev), state_root: Value::known(state_root), link: Value::known(link), agg: Value::known(agg) };
     let vk = keygen_vk(&params, &circuit)?;
     let pk = keygen_pk(&params, vk, &circuit)?;
     let inst = [agg];
     let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
-    create_proof(&params, &pk, &[circuit], &[&[&inst[..]]], rand::rngs::OsRng, &mut transcript)?;
+    create_proof::<IPACommitmentScheme<G1Affine>, _, _, _, _>(&params, &pk, &[circuit], &[&[&inst[..]]], rand::rngs::OsRng, &mut transcript)?;
     Ok((transcript.finalize(), agg))
 }
 
 /// Verify a Poseidon recursion bind proof given (agg, cur) public inputs.
 pub fn verify_poseidon_bind(proof: &[u8], agg: Fr, k: u32) -> anyhow::Result<bool> {
     if proof.is_empty() { return Ok(false); }
-    let params = Params::<G1Affine>::new(k);
+    let params = ParamsIPA::<G1Affine>::new(k);
     // Rebuild vk from empty circuit with unknowns
     let empty = RecPoseidonCircuit { prev: Value::unknown(), state_root: Value::unknown(), link: Value::unknown(), agg: Value::unknown() };
     let vk = keygen_vk(&params, &empty)?;
     let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<G1Affine>>::init(std::io::Cursor::new(proof));
     let strategy = SingleVerifier::new(&params);
     let inst = [agg];
-    Ok(verify_proof(&params, &vk, strategy, &[&[&inst[..]]], &mut transcript).is_ok())
+    Ok(verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(&params, &vk, strategy, &[&[&inst[..]]], &mut transcript).is_ok())
 }
 
 /// Compute the tagged seed agg_0 = H(TAG_INIT_V1, 0, 0)

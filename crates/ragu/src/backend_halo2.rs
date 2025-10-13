@@ -15,7 +15,7 @@ use ff::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value, AssignedCell},
     plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, keygen_pk, keygen_vk, create_proof, VerifyingKey, ProvingKey},
-    poly::{commitment::Params, Rotation},
+    poly::{ipa::commitment::{ParamsIPA, IPACommitmentScheme}, Rotation},
     transcript::{Blake2bRead, Blake2bWrite, Challenge255},
 };
 use pasta_curves::{Fp as Fr, vesta::Affine as G1Affine};
@@ -185,7 +185,7 @@ impl Circuit<Fr> for R1csCircuit {
 
 /// Halo2 KZG backend driver for R1CS.
 pub struct R1csHalo2Backend {
-    pub params: Params<G1Affine>,
+    pub params: ParamsIPA<G1Affine>,
     pub vk: VerifyingKey<G1Affine>,
     pub pk: ProvingKey<G1Affine>,
     pub max_terms: usize,
@@ -194,7 +194,7 @@ pub struct R1csHalo2Backend {
 impl R1csHalo2Backend {
     pub fn new(k: u32, recorder_shape_hint_terms: usize) -> Result<Self> {
         let max_terms = recorder_shape_hint_terms.max(1);
-        let params = Params::<G1Affine>::new(k);
+        let params = ParamsIPA::<G1Affine>::new(k);
         // Build an empty circuit to derive keys with the chosen shape
         let empty = R1csCircuit { recorder: R1csRecorder::new(), max_terms, instance_vars: Vec::new() };
         let vk = keygen_vk(&params, &empty)?;
@@ -212,7 +212,7 @@ impl R1csHalo2Backend {
         let circuit = R1csCircuit { recorder, max_terms: self.max_terms, instance_vars };
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
         let public_inputs: Vec<Fr> = instance_values;
-        create_proof(
+        create_proof::<IPACommitmentScheme<G1Affine>, _, _, _, _>(
             &self.params,
             &self.pk,
             &[circuit],
@@ -226,7 +226,7 @@ impl R1csHalo2Backend {
     pub fn verify(&self, proof: &[u8], public_inputs: &[Fr]) -> Result<bool> {
         let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<G1Affine>>::init(std::io::Cursor::new(proof));
         let strategy = halo2_proofs::plonk::SingleVerifier::new(&self.params);
-        Ok(halo2_proofs::plonk::verify_proof(&self.params, &self.vk, strategy, &[&[public_inputs]], &mut transcript).is_ok())
+        Ok(halo2_proofs::plonk::verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(&self.params, &self.vk, strategy, &[&[public_inputs]], &mut transcript).is_ok())
     }
 }
 

@@ -13,7 +13,7 @@ use halo2_proofs::{
         keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column, ConstraintSystem, Error,
         Fixed, Instance, ProvingKey, Selector, SingleVerifier, VerifyingKey,
     },
-    poly::{commitment::Params, Rotation},
+    poly::{ipa::commitment::{ParamsIPA, IPACommitmentScheme}, Rotation},
     transcript::{Blake2bRead, Blake2bWrite, Challenge255},
 };
 use pasta_curves::{Fp as Fr, vesta::Affine as G1Affine};
@@ -860,8 +860,8 @@ pub struct PcdCore {
     pub initialized: bool,
     /// Circuit size parameter (security level), e.g., 12..=20 typically
     pub proving_k: u32,
-    /// KZG parameters (SRS)
-    pub params: Params<G1Affine>,
+    /// IPA parameters (Pasta/Vesta)
+    pub params: ParamsIPA<G1Affine>,
     /// Verifying key for transition circuit
     pub vk: VerifyingKey<G1Affine>,
     /// Proving key for transition circuit
@@ -872,7 +872,7 @@ impl PcdCore {
     /// Create a new PCD core instance
     pub fn new() -> Result<Self> {
         let proving_k = 12;
-        let params = Params::<G1Affine>::new(proving_k);
+        let params = ParamsIPA::<G1Affine>::new(proving_k);
         let empty = PcdTransitionCircuit {
             prev_state: Value::unknown(),
             new_state: Value::unknown(),
@@ -894,7 +894,7 @@ impl PcdCore {
 
     /// Create a new PCD core instance with explicit circuit parameter k
     pub fn with_k(k: u32) -> Result<Self> {
-        let params = Params::<G1Affine>::new(k);
+        let params = ParamsIPA::<G1Affine>::new(k);
         let empty = PcdTransitionCircuit {
             prev_state: Value::unknown(),
             new_state: Value::unknown(),
@@ -926,7 +926,7 @@ impl PcdCore {
         Ok(())
     }
 
-    /// Prove a PCD transition using Halo2 PLONK with KZG commitments (BN256)
+    /// Prove a PCD transition using Halo2 PLONK with IPA commitments (Pasta)
     pub fn prove_transition(
         &self,
         prev_state: &[u8; 32],
@@ -987,7 +987,7 @@ impl PcdCore {
 
         // Build proof
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
-        halo2_proofs::plonk::create_proof(
+        halo2_proofs::plonk::create_proof::<IPACommitmentScheme<G1Affine>, _, _, _, _>(
             &self.params,
             &self.pk,
             &[circuit],
@@ -1046,7 +1046,7 @@ impl PcdCore {
             Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
         let strategy = SingleVerifier::new(&self.params);
 
-        let ok = verify_proof(
+        let ok = verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(
             &self.params,
             &self.vk,
             strategy,
@@ -1063,8 +1063,8 @@ impl PcdCore {
 pub struct RecursionCore {
     /// Recursion circuit size
     pub proving_k: u32,
-    /// KZG params
-    pub params: Params<G1Affine>,
+    /// IPA params
+    pub params: ParamsIPA<G1Affine>,
     /// Verifying key for recursion circuit
     pub vk: VerifyingKey<G1Affine>,
     /// Proving key for recursion circuit
@@ -1088,7 +1088,7 @@ impl RecursionCore {
 
     /// Create with explicit k
     pub fn with_k(k: u32) -> Result<Self> {
-        let params = Params::<G1Affine>::new(k);
+        let params = ParamsIPA::<G1Affine>::new(k);
         // Empty circuit to derive keys
         let empty = PcdRecursionCircuit {
             prev_proof_commitment: Value::unknown(),
@@ -1147,7 +1147,7 @@ impl RecursionCore {
 
         let inst_agg = [agg_fr];
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
-        halo2_proofs::plonk::create_proof(
+        halo2_proofs::plonk::create_proof::<IPACommitmentScheme<G1Affine>, _, _, _, _>(
             &self.params,
             &self.pk,
             &[circuit],
@@ -1169,7 +1169,7 @@ impl RecursionCore {
         let inst_agg = [agg_fr];
         let mut transcript = Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
         let strategy = SingleVerifier::new(&self.params);
-        let ok = verify_proof(
+        let ok = verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(
             &self.params,
             &self.vk,
             strategy,
@@ -1287,7 +1287,7 @@ impl RecursionCore {
         let inst_out = [out_fr];
         let inst_ctx = [ctx_fr];
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
-        halo2_proofs::plonk::create_proof(
+        halo2_proofs::plonk::create_proof::<IPACommitmentScheme<G1Affine>, _, _, _, _>(
             &self.params,
             &pk,
             &[circuit],
@@ -1334,7 +1334,7 @@ impl RecursionCore {
 
         let mut transcript = Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
         let strategy = SingleVerifier::new(&self.params);
-        let ok = verify_proof(
+        let ok = verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(
             &self.params,
             &vk,
             strategy,

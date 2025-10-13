@@ -437,14 +437,14 @@ impl<const DEPTH: usize> Circuit<Fr> for SpendLinkCircuit<DEPTH> {
 #[derive(Clone)]
 pub struct SpendLinkCore<const DEPTH: usize> {
     pub proving_k: u32,
-    pub params: halo2_proofs::poly::commitment::Params<pasta_curves::vesta::Affine>,
+    pub params: halo2_proofs::poly::ipa::commitment::ParamsIPA<pasta_curves::vesta::Affine>,
     pub vk: halo2_proofs::plonk::VerifyingKey<pasta_curves::vesta::Affine>,
     pub pk: halo2_proofs::plonk::ProvingKey<pasta_curves::vesta::Affine>,
 }
 
 impl<const DEPTH: usize> SpendLinkCore<DEPTH> {
     pub fn with_k(k: u32) -> anyhow::Result<Self> {
-        let params = halo2_proofs::poly::commitment::Params::<pasta_curves::vesta::Affine>::new(k);
+        let params = halo2_proofs::poly::ipa::commitment::ParamsIPA::<pasta_curves::vesta::Affine>::new(k);
         let empty = SpendLinkCircuit::<DEPTH> {
             ak: Value::unknown(),
             nk: Value::unknown(),
@@ -481,7 +481,7 @@ impl<const DEPTH: usize> SpendLinkCore<DEPTH> {
         let inst_link = match to_fr_opt(link) { Some(fr) => [fr], None => return Ok(false) };
         let mut transcript = Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
         let strategy = SingleVerifier::new(&self.params);
-        let ok = halo2_proofs::plonk::verify_proof(
+        let ok = halo2_proofs::plonk::verify_proof::<halo2_proofs::poly::ipa::commitment::IPACommitmentScheme<pasta_curves::vesta::Affine>, _, _, _>(
             &self.params,
             &self.vk,
             strategy,
@@ -587,7 +587,7 @@ pub fn prove_spend_link<const DEPTH: usize>(
 
     // Create proof
     let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(Vec::new());
-    create_proof(
+    create_proof::<halo2_proofs::poly::ipa::commitment::IPACommitmentScheme<pasta_curves::vesta::Affine>, _, _, _, _>(
         &core.params,
         &core.pk,
         &[circuit],

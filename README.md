@@ -36,7 +36,7 @@ In this repo, the core building blocks are implemented and integrated :
   - Escape events (recorded in `ragu::r1cs`) allow backends to implement native membership/non-membership checks without leaking role in circuit shape
   - `ragu::accum_unified::verify_unified_accum` and `update_unified_accum` emit a single foreign event with a private selector bit
 
-- Recursive proving on Pasta (Halo2/KZG)
+- Recursive proving on Pasta (Halo2/IPA)
   - `circuits::recursion`: Poseidon binder circuit and helpers
     - `prove_poseidon_bind(prev, cur, k)` → proof, `agg = H(tag, prev, cur)`
     - `verify_poseidon_bind(proof, agg, cur, k)` → bool
@@ -53,7 +53,7 @@ High-level architecture
 -----------------------
 1) Encoding: commitments and nullifiers become Tachygrams (32 bytes). Nullifiers derive via a keyed PRF and flavor tag; commitments via a Poseidon commitment.
 2) Accumulator: a single domain of Tachygrams. In-circuit, a private boolean selector determines membership vs non-membership and is enforced as boolean, but the verifier sees only one path.
-3) Recursion: each block proves correctness relative to the previous state and proof using small KZG-backed Halo2 circuits over Pasta (Vesta). Verification is O(1), independent of chain length.
+3) Recursion: each block proves correctness relative to the previous state and proof using small IPA-backed Halo2 circuits over Pasta (Vesta). Verification is O(1), independent of chain length.
 
 
 Minimal usage (Rust)
@@ -117,10 +117,10 @@ Module map
 
 Design choices
 --------------
-- Curves: Pasta (Vesta G1, scalar Fp). Proofs use Halo2 PLONK + KZG over Pasta params.
+- Curves: Pasta (Vesta G1, scalar Fp). Proofs use Halo2 PLONK + IPA over Pasta params.
 - Hash: Poseidon2 (t=3, rate=2) with explicit domain tags for binding operations.
 - Privacy: single escape-based verification path hides commitment vs nullifier role; selector bit is private and enforced as boolean.
-- Accumulator backends: start with Poseidon-based folding; can swap to Merkle or vector commitments (KZG) with the same unified API.
+- Accumulator backends: start with Poseidon-based folding; can swap to Merkle or vector commitments (IPA) with the same unified API.
 
 
 
@@ -178,7 +178,7 @@ Practical Choices
 	•	Recursive backend: Halo2 recursion (Plonk-in-Plonk over Pasta), with optional folding schemes (Nova/SuperNova) for efficiency.
 	•	Accumulator:
 	•	Merkle over Tachygrams (transparent, slightly larger proofs), or
-	•	Vector commitment (KZG/Pasta-cycle, constant size, requires SRS).
+	•	Vector commitment (IPA/Pasta-cycle, constant size, requires SRS).
 	•	Data availability: Tachygrams themselves must remain available; the proof only certifies correctness of state transitions.
 
 Advantages

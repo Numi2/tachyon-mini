@@ -5,7 +5,7 @@ use anyhow::Result;
 use ff::Field;
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, keygen_pk, keygen_vk, create_proof, verify_proof, SingleVerifier};
-use halo2_proofs::poly::commitment::Params;
+use halo2_proofs::poly::ipa::commitment::{ParamsIPA, IPACommitmentScheme};
 use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
 use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
@@ -141,7 +141,7 @@ impl<const U: usize> Circuit<Fr> for UnifiedBlockCircuit<U> {
 
 /// Prove a unified block step, returning proof bytes and next state.
 pub fn prove_unified_block<const U: usize>(k: u32, prev_bind_agg: Fr, prev_state: Fr, grams: [Fr; U], is_member: [bool; U]) -> Result<(Vec<u8>, Fr)> {
-    let params = Params::<G1Affine>::new(k);
+    let params = ParamsIPA::<G1Affine>::new(k);
     let grams_v = grams.map(Value::known);
     let flags_v = is_member.map(|b| Value::known(if b { Fr::ONE } else { Fr::ZERO }));
     let circuit = UnifiedBlockCircuit::<U> { prev_bind_agg: Value::known(prev_bind_agg), prev_state: Value::known(prev_state), grams: grams_v, is_member: flags_v };
@@ -161,14 +161,14 @@ pub fn prove_unified_block<const U: usize>(k: u32, prev_bind_agg: Fr, prev_state
     let inst_next = [state];
 
     let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
-    create_proof(&params, &pk, &[circuit], &[&[&inst_prev_bind[..], &inst_prev_state[..], &inst_next[..]]], rand::rngs::OsRng, &mut transcript)?;
+    create_proof::<IPACommitmentScheme<G1Affine>, _, _, _, _>(&params, &pk, &[circuit], &[&[&inst_prev_bind[..], &inst_prev_state[..], &inst_next[..]]], rand::rngs::OsRng, &mut transcript)?;
     Ok((transcript.finalize(), state))
 }
 
 /// Verify a unified block step proof given (prev_bind_agg, prev_state, next_state) public inputs.
 pub fn verify_unified_block(k: u32, proof: &[u8], prev_bind_agg: Fr, prev_state: Fr, next_state: Fr) -> Result<bool> {
     if proof.is_empty() { return Ok(false); }
-    let params = Params::<G1Affine>::new(k);
+    let params = ParamsIPA::<G1Affine>::new(k);
     let empty = UnifiedBlockCircuit::<1> { prev_bind_agg: Value::unknown(), prev_state: Value::unknown(), grams: [Value::unknown()], is_member: [Value::unknown()] };
     let vk = keygen_vk(&params, &empty)?;
     let inst_prev_bind = [prev_bind_agg];
@@ -176,5 +176,5 @@ pub fn verify_unified_block(k: u32, proof: &[u8], prev_bind_agg: Fr, prev_state:
     let inst_next = [next_state];
     let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<G1Affine>>::init(std::io::Cursor::new(proof));
     let strategy = SingleVerifier::new(&params);
-    Ok(verify_proof(&params, &vk, strategy, &[&[&inst_prev_bind[..], &inst_prev_state[..], &inst_next[..]]], &mut transcript).is_ok())
+    Ok(verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(&params, &vk, strategy, &[&[&inst_prev_bind[..], &inst_prev_state[..], &inst_next[..]]], &mut transcript).is_ok())
 }
