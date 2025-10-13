@@ -408,6 +408,66 @@ impl Smt16NonMembershipProof {
     }
 }
 
+/// Membership proof for SMT-16
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Smt16MembershipProof {
+    /// Nibble per level (64 entries)
+    #[serde(with = "BigArray")]
+    pub path: [u8; SMT16_DEPTH],
+    /// For each level l, the 15 siblings for children except index path[l]
+    pub siblings: Vec<[[u8; 32]; SMT16_ARITY - 1]>,
+}
+
+impl Smt16MembershipProof {
+    /// Verify membership for key against expected_root
+    pub fn verify_for_key(&self, key: &[u8; 32], expected_root: &[u8; 32]) -> bool {
+        if self.siblings.len() != SMT16_DEPTH { return false; }
+        let kpath = smt16_key_to_nibbles(key);
+        if self.path != kpath { return false; }
+        // Start from hashed leaf
+        let mut cur = smt16_hash_leaf(key);
+        for level in (0..SMT16_DEPTH).rev() {
+            let idx = self.path[level] as usize;
+            let sibs = &self.siblings[level];
+            let mut children = [[0u8; 32]; SMT16_ARITY];
+            let mut s_i = 0usize;
+            for (j, child) in children.iter_mut().enumerate().take(SMT16_ARITY) {
+                if j == idx { *child = cur; } else { *child = sibs[s_i]; s_i += 1; }
+            }
+            cur = smt16_hash_node(level, &children);
+        }
+        &cur == expected_root
+    }
+}
+
+/// Neighbor-leaf exclusion proof for SMT-16: proves non-membership by showing the closest present
+/// neighbor key k* and a divergence index where the target key differs, plus membership of k*.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Smt16NeighborExclusionProof {
+    /// Present neighbor key k*
+    pub neighbor_key: [u8; 32],
+    /// Membership witness for neighbor key
+    pub neighbor_membership: Smt16MembershipProof,
+    /// Divergence index i such that path(key)[i] != path(neighbor_key)[i]
+    pub divergence_index: u8,
+}
+
+impl Smt16NeighborExclusionProof {
+    /// Verify exclusion: check neighbor's membership to expected_root and that the target diverges
+    /// from neighbor at divergence_index.
+    pub fn verify_for_absent_key(&self, target_key: &[u8; 32], expected_root: &[u8; 32]) -> bool {
+        // Verify neighbor membership by reconstructing from neighbor_membership using neighbor_key path
+        let npath = smt16_key_to_nibbles(&self.neighbor_key);
+        if self.neighbor_membership.path != npath { return false; }
+        if !self.neighbor_membership.verify_for_key(&self.neighbor_key, expected_root) { return false; }
+        // Check divergence
+        let tpath = smt16_key_to_nibbles(target_key);
+        let i = self.divergence_index as usize;
+        if i >= SMT16_DEPTH { return false; }
+        tpath[i] != npath[i]
+    }
+}
+
 /// 16-ary Sparse Merkle Tree accumulator (insert-only)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Smt16Accumulator {

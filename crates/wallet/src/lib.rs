@@ -14,11 +14,16 @@ use pcd_core::{
     PcdState, PcdStateManager, PcdSyncClient, PcdSyncManager, SimplePcdVerifier, PcdTransition,
 };
 #[cfg(feature = "pcd")]
-use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
+use circuits::{
+    PcdCore as Halo2PcdCore,
+    compute_transition_digest_bytes,
+    compute_wallet_state_root_bytes_checked,
+    compute_wallet_agg_final_bytes_checked,
+};
 #[cfg(feature = "pcd")]
 use pq_crypto::{
     derive_nf2, derive_spend_nullifier_key, KyberPublicKey, KyberSecretKey,
-    OutOfBandPayment, SimpleKem,
+    OutOfBandPayment, SimpleKem, SuiteB,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -40,6 +45,8 @@ use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, Ow
 use halo2_gadgets::poseidon::primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3};
 use pasta_curves::Fp as Fr;
 use ff::{PrimeField, FromUniformBytes};
+#[cfg(feature = "pcd")]
+use circuits::orchard::prove_spend_link;
 
 #[cfg(feature = "zcash")]
 mod zcash;
@@ -1617,6 +1624,143 @@ impl TachyonWallet {
         )?;
 
         let _num_spent = spent_inputs.len();
+
+        // Helper: map arbitrary bytes deterministically into canonical field encoding
+        #[inline]
+        fn to_canonical_fr_bytes(src: &[u8]) -> [u8; 32] {
+            if src.len() >= 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&src[..32]);
+                if let Some(fr) = Option::<Fr>::from(Fr::from_repr(arr)) {
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(fr.to_repr().as_ref());
+                    return out;
+                }
+            }
+            use std::io::Read as _;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"wallet:uniform_fr:v1");
+            hasher.update(src);
+            let mut wide = [0u8; 64];
+            hasher.finalize_xof().read_exact(&mut wide).expect("xof read");
+            let fr = Fr::from_uniform_bytes(&wide);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(fr.to_repr().as_ref());
+            out
+        }
+
+        // Precompute canonical state_root once
+        let state_root = compute_wallet_state_root_bytes_checked(&state.mmr_root, &state.nullifier_root)
+            .ok_or_else(|| anyhow!("non-canonical state roots for wallet actions"))?;
+
+        // For each spend input/nullifier, generate SpendLink proof and a SuiteB signature
+        let mut action_links: Vec<[u8; 32]> = Vec::with_capacity(nullifiers.len());
+        let mut actions: Vec<_node_ext_dep_check::Action> = Vec::with_capacity(nullifiers.len());
+
+        // Generate a single SuiteB keypair to authorize all spends in this tx (prototype)
+        let (suite_pk, suite_sk) = SuiteB::generate_keypair()?;
+        // Compress/derive 32-byte rk_bytes from SuiteB pk deterministically for the prototype
+        let rk_bytes32 = {
+            let h = blake3::hash(suite_pk.as_bytes());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(h.as_bytes());
+            out
+        };
+
+        for (i, nf) in nullifiers.iter().copied().enumerate() {
+            // cmx ties to spent commitment at same index
+            let mut cmx32 = [0u8; 32];
+            if let Some(cmx_src) = spent_inputs.get(i) { cmx32.copy_from_slice(cmx_src); }
+
+            // Derive per-note randomness rho consistent with NF derivation
+            let rho32 = {
+                let h = blake3::hash(&cmx32);
+                let mut out = [0u8; 32];
+                out.copy_from_slice(h.as_bytes());
+                out
+            };
+
+            // Choose a value commitment cv deterministically (canonical field encoding)
+            let cv32 = to_canonical_fr_bytes(&{
+                let mut buf = Vec::with_capacity(32 + 32 + 8);
+                buf.extend_from_slice(&cmx32);
+                buf.extend_from_slice(&state.mmr_root);
+                buf.extend_from_slice(&state.nullifier_root);
+                buf
+            });
+
+            // EPK placeholder: canonical field encoding derived from (cmx || i)
+            let epk32 = to_canonical_fr_bytes(&{
+                let mut buf = vec![0u8; 4];
+                buf[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                let mut all = Vec::with_capacity(36);
+                all.extend_from_slice(&cmx32);
+                all.extend_from_slice(&buf);
+                all
+            });
+
+            // Produce a SpendLink proof binding (state_root, link)
+            let (proof_bytes, _sr, link_bytes) = prove_spend_link::<64>(
+                12,
+                &state.mmr_root,
+                &state.nullifier_root,
+                &rk_bytes32,
+                &snk,
+                &rho32,
+                &cmx32,
+                &cv32,
+            )?;
+
+            action_links.push(link_bytes);
+
+            // Aggregate links with state_root to form agg_final (later used in sighash)
+            // We'll compute the final aggregation after the loop once we know all links.
+
+            // Fill action (ciphertexts left empty in this prototype)
+            actions.push(_node_ext_dep_check::Action {
+                cv: cv32,
+                nf,
+                rk_bytes: rk_bytes32,
+                cmx: cmx32,
+                epk: epk32,
+                proof: proof_bytes,
+                spend_auth_sig: Vec::new(), // filled after computing agg_final
+                enc_ciphertext: Vec::new(),
+                out_ciphertext: Vec::new(),
+            });
+        }
+
+        // Compute aggregation binding commitment across all actions
+        let pairs: Vec<([u8; 32], [u8; 32])> = action_links.iter().map(|l| (state_root, *l)).collect();
+        let agg_final = compute_wallet_agg_final_bytes_checked(&pairs)
+            .ok_or_else(|| anyhow!("failed to compute wallet agg_final"))?;
+
+        let actions_len = actions.len() as u32;
+        // Sign each action digest under SuiteB to populate spend_auth_sig
+        for (i, action) in actions.iter_mut().enumerate() {
+            let digest32 = SuiteB::blake3_prehash_with_domain(
+                b"sighash:orchard:action:v1",
+                &[
+                    &1u32.to_le_bytes(),
+                    &(i as u32).to_le_bytes(),
+                    &state.mmr_root,
+                    &state.nullifier_root,
+                    &agg_final,
+                    &actions_len.to_le_bytes(),
+                    &action.nf,
+                    &action.rk_bytes,
+                    &action.cmx,
+                    &action.cv,
+                    &action.epk,
+                    &action.enc_ciphertext,
+                    &action.out_ciphertext,
+                    &[0u8; 1],
+                ],
+            );
+            let sig = SuiteB::sign_prehash(&suite_sk, &digest32)?;
+            action.spend_auth_sig = sig.as_bytes().to_vec();
+        }
+
         let tx = _node_ext_dep_check::Transaction {
             hash: _node_ext_dep_check::TransactionHash(blake3::hash(b"wallet-tx")),
             nullifiers,
@@ -1631,6 +1775,7 @@ impl TachyonWallet {
             anchor_height: state.anchor_height,
             spend_proof,
             nullifier_non_membership,
+            actions,
         };
 
         Ok(tx)

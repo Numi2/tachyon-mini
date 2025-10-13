@@ -132,12 +132,16 @@ impl PcdState {
         block_hash: &[u8; 32],
         state_data: &[u8],
     ) -> PcdStateCommitment {
+        // Structured hashing with explicit domain and length-prefixing
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pcd_state_commitment");
+        hasher.update(b"pcd_state:v1");
         hasher.update(&anchor_height.to_le_bytes());
-        hasher.update(mmr_root);
-        hasher.update(nullifier_root);
-        hasher.update(block_hash);
+        // Length-prefix each fixed-size field for clarity, though they are 32 bytes
+        hasher.update(&(32u64.to_le_bytes())); hasher.update(mmr_root);
+        hasher.update(&(32u64.to_le_bytes())); hasher.update(nullifier_root);
+        hasher.update(&(32u64.to_le_bytes())); hasher.update(block_hash);
+        // Length-prefix variable data
+        hasher.update(&(state_data.len() as u64).to_le_bytes());
         hasher.update(state_data);
 
         let mut commitment = [0u8; PCD_STATE_COMMITMENT_SIZE];
@@ -1056,9 +1060,26 @@ impl<C: PcdSyncClient, V: PcdProofVerifier> PcdSyncManager<C, V> {
             }
             let nullifier_delta_bytes = bincode::serialize(&nf_ops)?;
 
-            // Derive new roots deterministically from aggregated deltas (mirrors OSS)
-            let new_mmr_root = *blake3::hash(&mmr_delta_bytes).as_bytes();
-            let new_nf_root = *blake3::hash(&nullifier_delta_bytes).as_bytes();
+            // Derive new roots by applying deltas to cached accumulators (do not trust bytes blindly)
+            let mut mmr_acc: MmrAccumulator = if let Some(bytes) = self
+                .state_manager
+                .current_state()
+                .and_then(|s| if s.mmr_raw().is_empty() { None } else { Some(s.mmr_raw().to_vec()) }) {
+                bincode::deserialize(&bytes).unwrap_or_else(|_| MmrAccumulator::new())
+            } else { MmrAccumulator::new() };
+            let ops: Vec<MmrDelta> = bincode::deserialize(&mmr_delta_bytes).unwrap_or_default();
+            if !ops.is_empty() { mmr_acc.apply_deltas(&ops)?; }
+            let new_mmr_root = mmr_acc.root().map(|h| *h.as_bytes()).unwrap_or([0u8; 32]);
+
+            let mut nf_acc: Smt16Accumulator = if let Some(bytes) = self
+                .state_manager
+                .current_state()
+                .and_then(|s| if s.nullifier_raw().is_empty() { None } else { Some(s.nullifier_raw().to_vec()) }) {
+                bincode::deserialize(&bytes).unwrap_or_else(|_| Smt16Accumulator::new())
+            } else { Smt16Accumulator::new() };
+            let nf_ops: Vec<Smt16Delta> = bincode::deserialize(&nullifier_delta_bytes).unwrap_or_default();
+            for d in nf_ops { nf_acc.apply_delta(d)?; }
+            let new_nf_root = nf_acc.root();
 
             // Advance height to bundle end and bind state to bundle hash
             let new_height = delta_bundle.block_range.1;

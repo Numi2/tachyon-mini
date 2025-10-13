@@ -12,7 +12,9 @@ use blake3::Hash;
 use net_iroh::{TachyonNetwork, BlobKind};
 use bytes::Bytes;
 use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
+use circuits::orchard::SpendLinkCore;
 use pcd_core::tachyon::{Tachystamp, Tachygram, TachyAnchor, Tachyaction};
+use pq_crypto::SuiteB;
 use pcd_core::aggregation::aggregate_action_proofs;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -87,6 +89,10 @@ pub struct ValidationConfig {
     pub max_transactions_per_block: usize,
     /// PCD verification timeout in milliseconds
     pub pcd_verification_timeout_ms: u64,
+    /// Maximum nullifiers allowed per transaction (DoS guardrail)
+    pub max_nullifiers_per_tx: usize,
+    /// Maximum commitments allowed per transaction (DoS guardrail)
+    pub max_commitments_per_tx: usize,
 }
 
 impl Default for ValidationConfig {
@@ -95,6 +101,8 @@ impl Default for ValidationConfig {
             nullifier_window_size: 1000,
             max_transactions_per_block: 100,
             pcd_verification_timeout_ms: 5000,
+            max_nullifiers_per_tx: 1024,
+            max_commitments_per_tx: 1024,
         }
     }
 }
@@ -143,6 +151,8 @@ pub struct NodeState {
     recent_nullifiers: VecDeque<Vec<[u8; 32]>>,
     /// Fast membership set for recent nullifiers
     recent_nullifiers_set: HashSet<[u8; 32]>,
+    /// Ring buffer of recent roots (height, mmr_root, nullifier_root) for anchor window checks
+    recent_roots: VecDeque<(u64, [u8; 32], [u8; 32])>,
     /// Last pruning timestamp
     pub last_pruned: Instant,
     /// Storage usage tracking
@@ -173,6 +183,7 @@ impl NodeState {
             tachygram_root: [0u8; 32],
             recent_nullifiers: VecDeque::new(),
             recent_nullifiers_set: HashSet::new(),
+            recent_roots: VecDeque::new(),
             last_pruned: Instant::now(),
             storage_size: 0,
             last_block_hash: None,
@@ -263,6 +274,19 @@ impl NodeState {
         }
     }
 
+    /// Record recent roots for the provided height and enforce a ring buffer size
+    pub fn record_recent_roots(&mut self, height: u64, window_size: usize) {
+        self.recent_roots.push_back((height, self.mmr_root, self.nullifier_root));
+        while self.recent_roots.len() > window_size.max(1) {
+            let _ = self.recent_roots.pop_front();
+        }
+    }
+
+    /// Get roots at a specific height from the recent ring buffer, if present.
+    pub fn roots_at_height(&self, height: u64) -> Option<([u8; 32], [u8; 32])> {
+        self.recent_roots.iter().rev().find_map(|(h, mmr, nf)| if *h == height { Some((*mmr, *nf)) } else { None })
+    }
+
     /// Attempt to load state from disk; returns None if not present
     pub async fn load_from_disk<P: AsRef<Path>>(data_dir: P) -> Option<Self> {
         let path = data_dir.as_ref().join("node_state.bin");
@@ -343,6 +367,7 @@ impl From<PersistedNodeState> for NodeState {
             tachygram_root: p.tachygram_root,
             recent_nullifiers: VecDeque::new(),
             recent_nullifiers_set: HashSet::new(),
+            recent_roots: VecDeque::new(),
             last_pruned: Instant::now(),
             storage_size: 0,
             last_block_hash: None,
@@ -720,6 +745,39 @@ impl TachyonNode {
         // Basic transaction format validation
         tx.validate_format()?;
 
+        // DoS guardrails: cap per-tx sizes
+        if tx.nullifiers.len() > self.config.validation_config.max_nullifiers_per_tx {
+            return Ok(ValidationResult {
+                is_valid: false,
+                error_message: Some("Too many nullifiers in transaction".to_string()),
+                gas_used: 1000,
+                validated_at: unix_secs(),
+            });
+        }
+        if tx.commitments.len() > self.config.validation_config.max_commitments_per_tx {
+            return Ok(ValidationResult {
+                is_valid: false,
+                error_message: Some("Too many commitments in transaction".to_string()),
+                gas_used: 1000,
+                validated_at: unix_secs(),
+            });
+        }
+
+        // Enforce TX-level nullifier uniqueness to prevent intra-tx duplicates
+        {
+            let mut set = std::collections::HashSet::new();
+            for nf in &tx.nullifiers {
+                if !set.insert(*nf) {
+                    return Ok(ValidationResult {
+                        is_valid: false,
+                        error_message: Some("Duplicate nullifier within transaction".to_string()),
+                        gas_used: 1000,
+                        validated_at: unix_secs(),
+                    });
+                }
+            }
+        }
+
         // Enforce anchor/roots match canonical state and nullifier uniqueness (full-history)
         let membership_ok = {
             let state = self.state.read()
@@ -816,24 +874,34 @@ impl TachyonNode {
                     // Batch verify non-membership proofs; short-circuit on first failure
                     let mut ok = true;
                     for (nf, wit) in tx.nullifiers.iter().zip(tx.nullifier_non_membership.iter()) {
-                        match bincode::deserialize::<Smt16NonMembershipProof>(wit) {
-                            Ok(p) => {
-                                if !p.verify_for_key(nf, &state.nullifier_root) { ok = false; break; }
-                            }
-                            Err(_) => { ok = false; break; }
+                        // Accept either default non-membership or neighbor exclusion proof
+                        if let Ok(p) = bincode::deserialize::<Smt16NonMembershipProof>(wit) {
+                            if !p.verify_for_key(nf, &state.nullifier_root) { ok = false; break; }
+                            continue;
                         }
+                        // Attempt neighbor exclusion proof type from accum_set
+                        if let Ok(p2) = bincode::deserialize::<accum_set::Smt16NeighborExclusionProof>(wit) {
+                            if !p2.verify_for_absent_key(nf, &state.nullifier_root) { ok = false; break; }
+                            continue;
+                        }
+                        ok = false; break;
                     }
                     ok
                 }
             }
         };
 
-        // Enforce anchor recency: tx.anchor_height must be within recent window
+        // Enforce anchor recency window and equality of roots at that height via ring buffer.
         let is_anchor_recent = {
             let state = self.state.read()
                 .map_err(|_| anyhow!("Failed to acquire read lock on state"))?;
             let window = self.config.validation_config.nullifier_window_size.max(1);
-            tx.anchor_height <= state.current_height && state.current_height - tx.anchor_height <= window
+            let within = tx.anchor_height <= state.current_height && state.current_height - tx.anchor_height <= window;
+            let roots_match = state
+                .roots_at_height(tx.anchor_height)
+                .map(|(mmr, nf)| mmr == tx.pcd_mmr_root && nf == tx.pcd_nullifier_root)
+                .unwrap_or(false);
+            within && roots_match
         };
 
         if !(pcd_valid || (membership_ok && nullifier_absent_ok)) || !is_anchor_recent {
@@ -847,11 +915,13 @@ impl TachyonNode {
 
         // Verify spend proof (Orchard-like)
         let spend_valid = self.verify_spend_proof(tx).await?;
+        // Verify per-action linkage proofs and signatures under rk_bytes
+        let actions_valid = self.verify_actions(tx)?;
 
-        if !spend_valid {
+        if !spend_valid || !actions_valid {
             return Ok(ValidationResult {
                 is_valid: false,
-                error_message: Some("Spend proof verification failed".to_string()),
+                error_message: Some("Spend proof or action linkage verification failed".to_string()),
                 gas_used: 1000,
                 validated_at: unix_secs(),
             });
@@ -887,7 +957,19 @@ impl TachyonNode {
         }
 
         // Validate each transaction in the block
+        // Block-level: reject if two txs share a nullifier
+        let mut seen_nullifiers: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for tx in &block.transactions {
+            for nf in &tx.nullifiers {
+                if !seen_nullifiers.insert(*nf) {
+                    return Ok(BlockValidationResult {
+                        is_valid: false,
+                        transaction_results: Vec::new(),
+                        block_hash: None,
+                        total_gas_used: 0,
+                    });
+                }
+            }
             let result = self.validate_transaction(tx).await?;
             total_gas_used += result.gas_used;
             transaction_results.push(result.clone());
@@ -952,6 +1034,11 @@ impl TachyonNode {
                 state.current_height,
             );
             state.state_digest = new_digest;
+
+            // Record recent roots for anchor window checks
+            let window_size = self.config.validation_config.nullifier_window_size as usize;
+            let height_snapshot = state.current_height;
+            state.record_recent_roots(height_snapshot, window_size);
 
             // Persist best-effort
             let data_dir = self.config.network_config.data_dir.clone();
@@ -1185,6 +1272,70 @@ impl TachyonNode {
         }
     }
 
+    /// Verify per-action spend linkage proofs and signatures
+    fn verify_actions(&self, tx: &Transaction) -> Result<bool> {
+        // Precompute canonical state_root once and all link values to bind aggregation
+        let state_root = circuits::compute_wallet_state_root_bytes_checked(&tx.pcd_mmr_root, &tx.pcd_nullifier_root)
+            .ok_or_else(|| anyhow!("non-canonical state_root inputs"))?;
+        let mut links: Vec<[u8; 32]> = Vec::with_capacity(tx.actions.len());
+        for action in &tx.actions {
+            let link = circuits::compute_wallet_link_bytes_checked(&action.rk_bytes, &action.nf, &action.cmx, &action.cv)
+                .ok_or_else(|| anyhow!("non-canonical link inputs"))?;
+            links.push(link);
+        }
+        let pairs: Vec<([u8; 32], [u8; 32])> = links.iter().map(|l| (state_root, *l)).collect();
+        let agg_final = circuits::compute_wallet_agg_final_bytes_checked(&pairs)
+            .ok_or_else(|| anyhow!("failed to compute agg_final"))?;
+
+        // Verify each action proof binds (state_root, link) and the signature under rk_bytes
+        for (i, action) in tx.actions.iter().enumerate() {
+            // Nullifier consistency
+            if action.nf != tx.nullifiers[i] { return Ok(false); }
+            // Commitment consistency: bind cmx to the corresponding spent commitment
+            if action.cmx != tx.spent_commitments.get(i).copied().unwrap_or([0u8; 32]) { return Ok(false); }
+
+            let link = links[i];
+
+            // ZK proof verify against SpendLinkCircuit public inputs [state_root, link]
+            let ok_zk = SpendLinkCore::<64>::with_k(12)
+                .and_then(|core| core.verify(&action.proof, &state_root, &link))
+                .unwrap_or(false);
+            if !ok_zk { return Ok(false); }
+
+            // Domain-separated per-action SigHash covering roots/action data, bind aggregation and spend_count
+            let digest32 = pq_crypto::SuiteB::blake3_prehash_with_domain(
+                b"sighash:orchard:action:v1",
+                &[
+                    // Version and action index
+                    &1u32.to_le_bytes(),
+                    &(i as u32).to_le_bytes(),
+                    // Anchor/state roots
+                    &tx.pcd_mmr_root,
+                    &tx.pcd_nullifier_root,
+                    // Aggregation binding (recomputed agg_final) and spend_count
+                    &agg_final,
+                    &(tx.actions.len() as u32).to_le_bytes(),
+                    // Per-action bindings
+                    &action.nf,
+                    &action.rk_bytes,
+                    &action.cmx,
+                    &action.cv,
+                    &action.epk,
+                    &action.enc_ciphertext,
+                    &action.out_ciphertext,
+                    // Value flags placeholder (0 = default)
+                    &[0u8; 1],
+                ],
+            );
+
+            // Signature verify under rk_bytes (treat rk_bytes as SuiteB public key bytes in this prototype)
+            let pk = pq_crypto::SuiteBPublicKey::new(action.rk_bytes.to_vec());
+            let sig = pq_crypto::SuiteBSignature::new(action.spend_auth_sig.clone());
+            if !SuiteB::verify_prehash(&pk, &digest32, &sig) { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// Compute block hash
     fn compute_block_hash(&self, block: &Block) -> Result<TransactionHash> {
         let mut hasher = blake3::Hasher::new();
@@ -1214,6 +1365,7 @@ impl TachyonNode {
             tachygram_root: guard.tachygram_root,
             recent_nullifiers: VecDeque::new(),
             recent_nullifiers_set: HashSet::new(),
+            recent_roots: VecDeque::new(),
             last_pruned: guard.last_pruned,
             storage_size: guard.storage_size,
             last_block_hash: guard.last_block_hash,
@@ -1319,6 +1471,8 @@ pub struct Transaction {
     pub spend_proof: Vec<u8>,
     /// Non-membership proofs for each nullifier (bincode(Smt16NonMembershipProof))
     pub nullifier_non_membership: Vec<Vec<u8>>,
+    /// Per-spend actions binding nullifier to randomized validating key
+    pub actions: Vec<Action>,
 }
 
 impl Transaction {
@@ -1333,11 +1487,17 @@ impl Transaction {
         if self.spent_commitments.len() != self.membership_witnesses.len() {
             return Err(anyhow!("Spent commitments/witnesses length mismatch"));
         }
+        if self.spent_commitments.len() != self.actions.len() {
+            return Err(anyhow!("Actions/spent_commitments length mismatch"));
+        }
         if self.pcd_proof.is_empty() {
             return Err(anyhow!("Transaction must have PCD proof"));
         }
         if self.nullifier_non_membership.len() != self.nullifiers.len() {
             return Err(anyhow!("Nullifier non-membership proofs length mismatch"));
+        }
+        if self.actions.len() != self.nullifiers.len() {
+            return Err(anyhow!("Actions/nullifiers length mismatch"));
         }
         // Basic consistency: new state matches circuit digest
         let expected_new = compute_transition_digest_bytes(
@@ -1351,6 +1511,28 @@ impl Transaction {
         }
         Ok(())
     }
+}
+
+/// Per-spend action containing ZK proof and spend authorization binding
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Action {
+    /// Value commitment (placeholder)
+    pub cv: [u8; 32],
+    /// Nullifier (must match tx.nullifiers[i])
+    pub nf: [u8; 32],
+    /// Randomized validating key bytes (compressed point) from circuit
+    pub rk_bytes: [u8; 32],
+    /// Note commitment x-coordinate (placeholder)
+    pub cmx: [u8; 32],
+    /// Ephemeral pk (placeholder)
+    pub epk: [u8; 32],
+    /// ZK proof bytes for SpendLinkCircuit
+    pub proof: Vec<u8>,
+    /// Spend authorization signature over SigHash under rk (Suite B or RedPallas analog)
+    pub spend_auth_sig: Vec<u8>,
+    /// Encrypted note payloads
+    pub enc_ciphertext: Vec<u8>,
+    pub out_ciphertext: Vec<u8>,
 }
 
 /// Block representation for validation

@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use blake3::Hasher as Blake3Hasher;
-use ff::{PrimeField, FromUniformBytes};
+use ff::{PrimeField, FromUniformBytes, Field};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
@@ -60,12 +60,12 @@ fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr,
         .hash([tag_d3, d1, d2])
 }
 
-/// Poseidon-based Fiat–Shamir challenge (native) for recursion chaining.
-/// Uses width-3, rate-2 Poseidon (same spec as transition) with a domain tag.
-fn compute_fs_challenge_poseidon(prev: Fr, cur: Fr) -> Fr {
-    let tag_fs = Fr::from(11u64);
+/// Poseidon-based Fiat–Shamir challenge (native) for recursion chaining with context binding.
+/// Uses width-3, rate-2 Poseidon (same spec as transition) with a context "tag" value derived from
+/// a transcript-like binding (vk/circuit id). Callers should pass a stable context element.
+fn compute_fs_challenge_poseidon_ctx(ctx: Fr, prev: Fr, cur: Fr) -> Fr {
     poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
-        .hash([tag_fs, prev, cur])
+        .hash([ctx, prev, cur])
 }
 
 // -----------------------------
@@ -181,13 +181,100 @@ pub fn compute_transition_digest_bytes(
     out
 }
 
+/// Wallet domain tags (v1) for state_root and link
+pub mod wallet_tags {
+    pub const TAG_STATE_V1: u64 = 201;
+    pub const TAG_LINK_V1: u64 = 202;
+    pub const TAG_INIT_V1: u64 = 301;
+    pub const TAG_STEP_V1: u64 = 302;
+    pub const TAG_FOLD_V1: u64 = 303;
+}
+
+/// Compute wallet state_root bytes: Poseidon(TAG_STATE_V1, mmr_root, nf_root)
+pub fn compute_wallet_state_root_bytes(mmr_root: &[u8; 32], nf_root: &[u8; 32]) -> [u8; 32] {
+    // Convert 32-byte encodings to field elements; canonical-only
+    fn to_fr(bytes: &[u8; 32]) -> Option<Fr> { Option::<Fr>::from(Fr::from_repr(*bytes)) }
+    let tag = Fr::from(wallet_tags::TAG_STATE_V1);
+    let mmr = match to_fr(mmr_root) { Some(x) => x, None => return [0u8; 32] };
+    let nfr = match to_fr(nf_root) { Some(x) => x, None => return [0u8; 32] };
+    let out_fr = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, mmr, nfr]);
+    let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); out
+}
+
+/// Compute wallet link bytes: Poseidon(TAG_LINK_V1, rk_bytes, nf, cmx, cv)
+pub fn compute_wallet_link_bytes(rk_bytes: &[u8; 32], nf: &[u8; 32], cmx: &[u8; 32], cv: &[u8; 32]) -> [u8; 32] {
+    fn to_fr(bytes: &[u8; 32]) -> Option<Fr> { Option::<Fr>::from(Fr::from_repr(*bytes)) }
+    let tag = Fr::from(wallet_tags::TAG_LINK_V1);
+    // Compose in two rounds with t=3 rate=2 sponge: ((tag, rk, nf) -> d1), then (d1, cmx, cv) -> out
+    let rkf = match to_fr(rk_bytes) { Some(x) => x, None => return [0u8; 32] };
+    let nff = match to_fr(nf) { Some(x) => x, None => return [0u8; 32] };
+    let cmxf = match to_fr(cmx) { Some(x) => x, None => return [0u8; 32] };
+    let cvf = match to_fr(cv) { Some(x) => x, None => return [0u8; 32] };
+    let d1 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([tag, rkf, nff]);
+    let out_fr = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([d1, cmxf, cvf]);
+    let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); out
+}
+
+/// Checked variant: returns None if any input is non-canonical field encoding
+pub fn compute_wallet_state_root_bytes_checked(mmr_root: &[u8; 32], nf_root: &[u8; 32]) -> Option<[u8; 32]> {
+    let tag = Fr::from(wallet_tags::TAG_STATE_V1);
+    let mmr = Option::<Fr>::from(Fr::from_repr(*mmr_root))?;
+    let nfr = Option::<Fr>::from(Fr::from_repr(*nf_root))?;
+    let out_fr = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, mmr, nfr]);
+    let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); Some(out)
+}
+
+/// Checked variant: returns None if any input is non-canonical field encoding
+pub fn compute_wallet_link_bytes_checked(rk_bytes: &[u8; 32], nf: &[u8; 32], cmx: &[u8; 32], cv: &[u8; 32]) -> Option<[u8; 32]> {
+    let tag = Fr::from(wallet_tags::TAG_LINK_V1);
+    let rkf = Option::<Fr>::from(Fr::from_repr(*rk_bytes))?;
+    let nff = Option::<Fr>::from(Fr::from_repr(*nf))?;
+    let cmxf = Option::<Fr>::from(Fr::from_repr(*cmx))?;
+    let cvf = Option::<Fr>::from(Fr::from_repr(*cv))?;
+    let d1 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, rkf, nff]);
+    let out_fr = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([d1, cmxf, cvf]);
+    let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); Some(out)
+}
+
+/// Compute one wallet step commitment: Poseidon(TAG_STEP_V1, state_root, link); returns None if non-canonical
+pub fn compute_wallet_step_bytes_checked(state_root: &[u8; 32], link: &[u8; 32]) -> Option<[u8; 32]> {
+    let tag = Fr::from(wallet_tags::TAG_STEP_V1);
+    let s = Option::<Fr>::from(Fr::from_repr(*state_root))?;
+    let l = Option::<Fr>::from(Fr::from_repr(*link))?;
+    let out_fr = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, s, l]);
+    let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); Some(out)
+}
+
+/// Compute final aggregation: agg_0 = Poseidon(TAG_INIT_V1, 0, 0); agg_{i+1} = Poseidon(TAG_FOLD_V1, agg_i, step_i)
+pub fn compute_wallet_agg_final_bytes_checked(pairs: &[( [u8; 32], [u8; 32] )]) -> Option<[u8; 32]> {
+    use halo2_gadgets::poseidon::primitives as p;
+    let mut acc = p::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([
+        Fr::from(wallet_tags::TAG_INIT_V1),
+        Fr::ZERO,
+        Fr::ZERO,
+    ]);
+    for (state_root, link) in pairs.iter() {
+        let s = Option::<Fr>::from(Fr::from_repr(*state_root))?;
+        let l = Option::<Fr>::from(Fr::from_repr(*link))?;
+        let step = p::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([
+            Fr::from(wallet_tags::TAG_STEP_V1), s, l
+        ]);
+        acc = p::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([
+            Fr::from(wallet_tags::TAG_FOLD_V1), acc, step
+        ]);
+    }
+    let mut out = [0u8; 32]; out.copy_from_slice(acc.to_repr().as_ref()); Some(out)
+}
+
 /// PCD transition circuit configuration
 #[derive(Clone, Debug)]
 pub struct PcdTransitionConfig {
     /// Advice columns for witness data
     pub advice: [Column<Advice>; 6],
     /// Instance columns for public inputs/outputs (prev, new, mmr, nul, anchor)
-    pub instance: [Column<Instance>; 5],
+    pub instance: [Column<Instance>; 6],
     /// Fixed columns for constants
     pub fixed: [Column<Fixed>; 2],
     /// Selector for the transition logic
@@ -213,14 +300,19 @@ pub struct PcdTransitionCircuit {
     pub delta_commitments: Vec<Value<Fr>>,
 }
 
-/// Compute state commitment using BLAKE3 reduced modulo field order.
+/// Compute state commitment using BLAKE3 reduced modulo field order (structured hashing).
 pub fn compute_state_commitment(components: &[Fr]) -> Fr {
     let mut hasher = Blake3Hasher::new();
-    hasher.update(b"pcd_state_commitment");
+    // Domain separation and layout versioning
+    hasher.update(b"pcd_state:v1");
+    // Length-prefix each component to avoid ambiguity
+    let num = components.len() as u64;
+    hasher.update(&num.to_le_bytes());
     for c in components {
         let mut bytes = [0u8; 32];
-        // Convert field element to canonical little-endian bytes
         bytes.copy_from_slice(c.to_repr().as_ref());
+        // Prefix length (always 32) before the bytes
+        hasher.update(&(32u64.to_le_bytes()));
         hasher.update(&bytes);
     }
     let digest = hasher.finalize();
@@ -273,6 +365,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             meta.instance_column(),
             meta.instance_column(),
             meta.instance_column(),
+            meta.instance_column(), // PI_VERSION
         ];
 
         let fixed = [meta.fixed_column(), meta.fixed_column()];
@@ -436,6 +529,17 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         layouter.constrain_instance(nullifier_root_cell.cell(), config.instance[3], 0)?;
         layouter.constrain_instance(anchor_height_cell.cell(), config.instance[4], 0)?;
 
+        // Expose PI_VERSION = 1 and bind as public input index 5
+        let ver_cell = layouter.assign_region(
+            || "assign pi_version",
+            |mut region| {
+                let c = region.assign_advice(|| "pi_version", config.advice[4], 1, || Value::known(Fr::from(1u64)))?;
+                region.constrain_constant(c.cell(), Fr::from(1u64))?;
+                Ok(c)
+            },
+        )?;
+        layouter.constrain_instance(ver_cell.cell(), config.instance[5], 0)?;
+
         Ok(())
     }
 }
@@ -592,12 +696,14 @@ pub struct FsRecursionCircuit {
     pub current_commit: Value<Fr>,
     /// Aggregated commitment output (public input)
     pub aggregated_out: Value<Fr>,
+    /// Transcript-binding context element (public input)
+    pub context: Value<Fr>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FsRecursionConfig {
     pub advice: [Column<Advice>; 6],
-    pub instance: [Column<Instance>; 3],
+    pub instance: [Column<Instance>; 4],
     pub selector: Selector,
     pub poseidon: Pow5Config<Fr, 3, 2>,
 }
@@ -611,6 +717,7 @@ impl Circuit<Fr> for FsRecursionCircuit {
             prev_agg: Value::unknown(),
             current_commit: Value::unknown(),
             aggregated_out: Value::unknown(),
+            context: Value::unknown(),
         }
     }
 
@@ -624,6 +731,7 @@ impl Circuit<Fr> for FsRecursionCircuit {
             meta.advice_column(), // extra/tag
         ];
         let instance = [
+            meta.instance_column(),
             meta.instance_column(),
             meta.instance_column(),
             meta.instance_column(),
@@ -683,7 +791,11 @@ impl Circuit<Fr> for FsRecursionCircuit {
                     || self.current_commit,
                 )?;
 
-                let ch_witness = self.prev_agg.zip(self.current_commit).map(|(p, c)| compute_fs_challenge_poseidon(p, c));
+                let ch_witness = self
+                    .prev_agg
+                    .zip(self.current_commit)
+                    .zip(self.context)
+                    .map(|((p, c), ctx)| compute_fs_challenge_poseidon_ctx(ctx, p, c));
                 let ch_local = region.assign_advice(
                     || "challenge (local copy)",
                     config.advice[4],
@@ -702,24 +814,25 @@ impl Circuit<Fr> for FsRecursionCircuit {
             },
         )?;
 
-        // Compute Poseidon-based FS challenge in-circuit: H(TAG_FS, prev, cur)
+        // Compute Poseidon-based FS challenge in-circuit: H(context, prev, cur)
         let chip = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
         let h = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
             chip,
             layouter.namespace(|| "poseidon fs challenge init"),
         )?;
-        // Assign tag as a constant
-        let tag_cell = layouter.assign_region(
-            || "assign fs tag",
+        // Assign context as an advice cell and bind it to instance column 3
+        let ctx_cell = layouter.assign_region(
+            || "assign fs context",
             |mut region| {
-                let c = region.assign_advice(|| "tag_fs", config.advice[5], 0, || Value::known(Fr::from(11u64)))?;
-                region.constrain_constant(c.cell(), Fr::from(11u64))?;
+                let c = region.assign_advice(|| "fs_context", config.advice[5], 0, || self.context)?;
                 Ok(c)
             },
         )?;
+        // Expose context as public input index 3
+        layouter.constrain_instance(ctx_cell.cell(), config.instance[3], 0)?;
         let ch_cell = h.hash(
             layouter.namespace(|| "poseidon h(tag,prev,cur)"),
-            [tag_cell, prev_cell.clone(), cur_cell.clone()],
+            [ctx_cell.clone(), prev_cell.clone(), cur_cell.clone()],
         )?;
 
         // Bind local challenge copy to the computed Poseidon output
@@ -731,10 +844,11 @@ impl Circuit<Fr> for FsRecursionCircuit {
             },
         )?;
 
-        // Expose public inputs (prev, current, aggregated)
+        // Expose public inputs (prev, current, aggregated, context)
         layouter.constrain_instance(prev_cell.cell(), config.instance[0], 0)?;
         layouter.constrain_instance(cur_cell.cell(), config.instance[1], 0)?;
         layouter.constrain_instance(out_cell.cell(), config.instance[2], 0)?;
+        // context exposed above
 
         Ok(())
     }
@@ -862,13 +976,14 @@ impl PcdCore {
             delta_commitments: vec![],
         };
 
-        // Prepare instance columns (prev, new, mmr, nul, anchor)
+        // Prepare instance columns (prev, new, mmr, nul, anchor, pi_version)
         let [inst_prev, inst_new, inst_mmr, inst_nul, inst_anchor] = [prev_fr, expected_new_fr, mmr_fr, nul_fr, anchor_fr];
         let inst_prev = [inst_prev];
         let inst_new = [inst_new];
         let inst_mmr = [inst_mmr];
         let inst_nul = [inst_nul];
         let inst_anchor = [inst_anchor];
+        let inst_version = [Fr::from(1u64)];
 
         // Build proof
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
@@ -876,7 +991,7 @@ impl PcdCore {
             &self.params,
             &self.pk,
             &[circuit],
-            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..], &inst_nul[..], &inst_anchor[..]]],
+            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..], &inst_nul[..], &inst_anchor[..], &inst_version[..]]],
             OsRng,
             &mut transcript,
         )?;
@@ -919,12 +1034,13 @@ impl PcdCore {
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
 
-        // Prepare instance columns directly (prev, new, mmr, nul, anchor)
+        // Prepare instance columns directly (prev, new, mmr, nul, anchor, pi_version)
         let inst_prev = [prev_fr];
         let inst_new = [new_fr];
         let inst_mmr = [mmr_fr];
         let inst_nul = [nul_fr];
         let inst_anchor = [anchor_fr];
+        let inst_version = [Fr::from(1u64)];
 
         let mut transcript =
             Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
@@ -934,7 +1050,7 @@ impl PcdCore {
             &self.params,
             &self.vk,
             strategy,
-            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..], &inst_nul[..], &inst_anchor[..]]],
+            &[&[&inst_prev[..], &inst_new[..], &inst_mmr[..], &inst_nul[..], &inst_anchor[..], &inst_version[..]]],
             &mut transcript,
         )
         .is_ok();
@@ -959,6 +1075,14 @@ pub struct RecursionCore {
 pub type FsAggregateWitness = (Vec<u8>, [u8; 32], [u8; 32], [u8; 32]);
 
 impl RecursionCore {
+    /// Stable context element for FS challenge
+    fn fs_context_element(&self) -> Fr {
+        // Bind to circuit params k and a fixed domain tag for stability
+        use halo2_gadgets::poseidon::primitives as p;
+        let tag = Fr::from(0x46534358u64); // 'FSCX'
+        let k_fr = Fr::from(self.proving_k as u64);
+        p::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, k_fr, Fr::ZERO])
+    }
     /// Create a new recursion core with default k=12
     pub fn new() -> Result<Self> { Self::with_k(12) }
 
@@ -1137,13 +1261,15 @@ impl RecursionCore {
             .unwrap_or_else(|| Self::to_fr_from_bytes(prev_commitment));
         let cur_fr = Fr::from_repr(*current_commitment)
             .unwrap_or_else(|| Self::to_fr_from_bytes(current_commitment));
-        let ch = compute_fs_challenge_poseidon(prev_fr, cur_fr);
+        let ctx_fr = self.fs_context_element();
+        let ch = compute_fs_challenge_poseidon_ctx(ctx_fr, prev_fr, cur_fr);
         let out_fr = prev_fr * ch + cur_fr;
 
         let circuit = FsRecursionCircuit {
             prev_agg: Value::known(prev_fr),
             current_commit: Value::known(cur_fr),
             aggregated_out: Value::known(out_fr),
+            context: Value::known(ctx_fr),
         };
 
         // Derive keys for FS circuit shape on demand
@@ -1151,6 +1277,7 @@ impl RecursionCore {
             prev_agg: Value::unknown(),
             current_commit: Value::unknown(),
             aggregated_out: Value::unknown(),
+            context: Value::unknown(),
         };
         let vk = keygen_vk(&self.params, &empty)?;
         let pk = keygen_pk(&self.params, vk, &empty)?;
@@ -1158,12 +1285,13 @@ impl RecursionCore {
         let inst_prev = [prev_fr];
         let inst_cur = [cur_fr];
         let inst_out = [out_fr];
+        let inst_ctx = [ctx_fr];
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
         halo2_proofs::plonk::create_proof(
             &self.params,
             &pk,
             &[circuit],
-            &[&[&inst_prev[..], &inst_cur[..], &inst_out[..]]],
+            &[&[&inst_prev[..], &inst_cur[..], &inst_out[..], &inst_ctx[..]]],
             OsRng,
             &mut transcript,
         )?;
@@ -1188,16 +1316,19 @@ impl RecursionCore {
             .unwrap_or_else(|| Self::to_fr_from_bytes(current_commitment));
         let out_fr = Fr::from_repr(*aggregated_commitment)
             .unwrap_or_else(|| Self::to_fr_from_bytes(aggregated_commitment));
+        let ctx_fr = self.fs_context_element();
 
         let inst_prev = [prev_fr];
         let inst_cur = [cur_fr];
         let inst_out = [out_fr];
+        let inst_ctx = [ctx_fr];
 
         // Recreate verifying key for the FS circuit
         let empty = FsRecursionCircuit {
             prev_agg: Value::unknown(),
             current_commit: Value::unknown(),
             aggregated_out: Value::unknown(),
+            context: Value::unknown(),
         };
         let vk = keygen_vk(&self.params, &empty)?;
 
@@ -1207,7 +1338,7 @@ impl RecursionCore {
             &self.params,
             &vk,
             strategy,
-            &[&[&inst_prev[..], &inst_cur[..], &inst_out[..]]],
+            &[&[&inst_prev[..], &inst_cur[..], &inst_out[..], &inst_ctx[..]]],
             &mut transcript,
         )
         .is_ok();
