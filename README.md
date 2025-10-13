@@ -178,7 +178,7 @@ Practical Choices
 	•	Recursive backend: Halo2 recursion (Plonk-in-Plonk over Pasta), with optional folding schemes (Nova/SuperNova) for efficiency.
 	•	Accumulator:
 	•	Merkle over Tachygrams (transparent, slightly larger proofs), or
-	•	Vector commitment (IPA/Pasta-cycle, constant size, requires SRS).
+	•	Vector commitment (IPA/Pasta-cycle, constant size, no trusted setup).
 	•	Data availability: Tachygrams themselves must remain available; the proof only certifies correctness of state transitions.
 
 Advantages

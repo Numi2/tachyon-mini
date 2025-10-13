@@ -1,4 +1,4 @@
-//! Halo2 + KZG backend for R1CS recorder.
+//! Halo2 + IPA backend for R1CS recorder.
 //! Numan Thabit 2025
 //! This backend compiles a recorded R1CS (with linear-combination terms and constants)
 //! into a Halo2 circuit that enforces, for each constraint row i:
@@ -183,7 +183,7 @@ impl Circuit<Fr> for R1csCircuit {
     }
 }
 
-/// Halo2 KZG backend driver for R1CS.
+/// Halo2 IPA backend driver for R1CS.
 pub struct R1csHalo2Backend {
     pub params: ParamsIPA<G1Affine>,
     pub vk: VerifyingKey<G1Affine>,
@@ -249,7 +249,7 @@ impl R1csHalo2Proof {
     /// Prove a recorder using an ephemeral backend; keys derived on the given recorder shape.
     pub fn prove(recorder: R1csRecorder<Fr>, instance_vars: Vec<Var>, k: u32, max_terms: usize) -> Result<Self> {
         // Build params and keys from the concrete circuit shape
-        let params = Params::<G1Affine>::new(k);
+        let params = ParamsIPA::<G1Affine>::new(k);
         let circuit = R1csCircuit { recorder: recorder.clone(), max_terms, instance_vars: instance_vars.clone() };
         let vk = keygen_vk(&params, &circuit)?;
         let pk = keygen_pk(&params, vk, &circuit)?;
@@ -261,7 +261,7 @@ impl R1csHalo2Proof {
         }
         // Create proof
         let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
-        create_proof(&params, &pk, &[circuit], &[&[&public_inputs[..]]], rand::rngs::OsRng, &mut transcript)?;
+        create_proof::<IPACommitmentScheme<G1Affine>, _, _, _, _>(&params, &pk, &[circuit], &[&[&public_inputs[..]]], rand::rngs::OsRng, &mut transcript)?;
         let proof_bytes = transcript.finalize();
         // Bundle
         let constraints_bytes = recorder.serialize_constraints();
@@ -272,7 +272,7 @@ impl R1csHalo2Proof {
 
     /// Verify by reconstructing the circuit shape from constraints and checking the proof.
     pub fn verify(&self, public_inputs: &[Fr]) -> Result<bool> {
-        let params = Params::<G1Affine>::new(self.k);
+        let params = ParamsIPA::<G1Affine>::new(self.k);
         let rec = R1csRecorder::<Fr>::deserialize_constraints(&self.constraints_bytes)?;
         let instance_vars: Vec<Var> = self.instance_vars.iter().copied().map(Var).collect();
         let circuit = R1csCircuit { recorder: rec.clone(), max_terms: self.max_terms, instance_vars };
@@ -280,7 +280,7 @@ impl R1csHalo2Proof {
         let vk = keygen_vk(&params, &circuit)?;
         let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<G1Affine>>::init(std::io::Cursor::new(&self.proof));
         let strategy = halo2_proofs::plonk::SingleVerifier::new(&params);
-        Ok(halo2_proofs::plonk::verify_proof(&params, &vk, strategy, &[&[public_inputs]], &mut transcript).is_ok())
+        Ok(halo2_proofs::plonk::verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(&params, &vk, strategy, &[&[public_inputs]], &mut transcript).is_ok())
     }
 }
 

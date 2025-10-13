@@ -1460,7 +1460,7 @@ impl PcdCore {
 
             // Read params
             let mut pf = File::open(&params_path)?;
-            let params = Params::<G1Affine>::read(&mut pf)?;
+            let params = ParamsIPA::<G1Affine>::read(&mut pf)?;
 
             // Always regenerate vk/pk from params and the empty circuit
             let empty = PcdTransitionCircuit {
