@@ -166,7 +166,9 @@ pub fn compute_transition_digest_bytes(
         hasher.update(bytes);
         let mut xof = hasher.finalize_xof();
         let mut wide = [0u8; 64];
-        xof.read_exact(&mut wide).unwrap();
+        // XOF read from BLAKE3 should never fail with a fixed-size buffer
+        xof.read_exact(&mut wide)
+            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
         Fr::from_uniform_bytes(&wide)
     }
     let prev_fr = to_fr(prev_state);
@@ -231,7 +233,9 @@ pub fn compute_state_commitment(components: &[Fr]) -> Fr {
         h.update(digest.as_bytes());
         let mut xof = h.finalize_xof();
         let mut wide = [0u8; 64];
-        xof.read_exact(&mut wide).unwrap();
+        // XOF read from BLAKE3 should never fail with a fixed-size buffer
+        xof.read_exact(&mut wide)
+            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
         Fr::from_uniform_bytes(&wide)
     }
 }
@@ -827,7 +831,10 @@ impl PcdCore {
             hasher.update(bytes);
             let mut xof = hasher.finalize_xof();
             let mut wide = [0u8; 64];
-            xof.read_exact(&mut wide).unwrap();
+            // XOF read from BLAKE3 should never fail with a fixed-size buffer
+            if xof.read_exact(&mut wide).is_err() {
+                wide = [0u8; 64];
+            }
             Fr::from_uniform_bytes(&wide)
         }
 
@@ -899,7 +906,10 @@ impl PcdCore {
             hasher.update(bytes);
             let mut xof = hasher.finalize_xof();
             let mut wide = [0u8; 64];
-            xof.read_exact(&mut wide).unwrap();
+            // XOF read from BLAKE3 should never fail with a fixed-size buffer
+            if xof.read_exact(&mut wide).is_err() {
+                wide = [0u8; 64];
+            }
             Fr::from_uniform_bytes(&wide)
         }
 
@@ -976,7 +986,9 @@ impl RecursionCore {
         hasher.update(bytes);
         let mut xof = hasher.finalize_xof();
         let mut wide = [0u8; 64];
-        xof.read_exact(&mut wide).unwrap();
+        // XOF read from BLAKE3 should never fail with a fixed-size buffer
+        xof.read_exact(&mut wide)
+            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
         Fr::from_uniform_bytes(&wide)
     }
 
@@ -1093,11 +1105,13 @@ impl RecursionCore {
                 use std::io::Read as _;
                 let mut hasher = Hasher::new();
                 hasher.update(b"pcd:rec:fr:uniform:v1");
-                hasher.update(&new_agg_bytes);
-                let mut xof = hasher.finalize_xof();
-                let mut wide = [0u8; 64];
-                xof.read_exact(&mut wide).unwrap();
-                Fr::from_uniform_bytes(&wide)
+        hasher.update(&new_agg_bytes);
+        let mut xof = hasher.finalize_xof();
+        let mut wide = [0u8; 64];
+        // XOF read from BLAKE3 should never fail with a fixed-size buffer
+        xof.read_exact(&mut wide)
+            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+        Fr::from_uniform_bytes(&wide)
             });
         }
         let mut out = [0u8; 32];
@@ -1759,7 +1773,10 @@ pub fn aggregate_orchard_actions(proofs: &[Vec<u8>]) -> Result<Vec<u8>> {
         h.update(p);
         let mut xof = h.finalize_xof();
         let mut wide = [0u8; 64];
-        xof.read_exact(&mut wide).unwrap();
+        // XOF read from BLAKE3 should never fail with a fixed-size buffer
+        if xof.read_exact(&mut wide).is_err() {
+            wide = [0u8; 64];
+        }
         let it_fr = Fr::from_uniform_bytes(&wide);
         acc = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
             .hash([tag, acc, it_fr]);

@@ -14,7 +14,9 @@ use ragu::backend as ragu_backend;
 #[cfg(feature = "ragu")]
 use ragu::r1cs::{R1csProverDriver as RaguDriver, Wire as RaguWire};
 #[cfg(feature = "ragu")]
-use ff::Field;
+use ragu::circuit::Driver as _;
+#[cfg(feature = "ragu")]
+use ff::{Field, FromUniformBytes};
 #[cfg(feature = "ragu")]
 type Fr = pasta_curves::Fp;
 use ragu as _; // ensure ragu is linked via pcd_core when used downstream
@@ -317,7 +319,8 @@ impl PcdStateMachine {
         }
 
         // Create new state from transition
-        let mut new_state = self.current_state.as_ref().unwrap().clone();
+        let current = self.current_state.as_ref().ok_or_else(|| anyhow!("No current state to apply transition"))?;
+        let mut new_state = current.clone();
         new_state.anchor_height = transition.block_height_range.1;
 
         // Apply MMR deltas using accum_mmr
@@ -424,7 +427,10 @@ impl PcdStateMachine {
                 use std::io::Read as _;
                 let mut h = blake3::Hasher::new();
                 h.update(b"pcd:map:fr:v1"); h.update(bytes);
-                let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap();
+                let mut xof = h.finalize_xof(); let mut wide = [0u8; 64];
+                // XOF read from BLAKE3 should never fail with a fixed-size buffer
+                xof.read_exact(&mut wide)
+                    .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
                 Fr::from_uniform_bytes(&wide)
             };
             let prev = drv.alloc_instance_value(to_fr(&transition.prev_state_commitment));
@@ -436,7 +442,11 @@ impl PcdStateMachine {
             let new_wire = drv.add(|| vec![(new_wire, Fr::ONE), (nf.clone(), Fr::ONE)])?;
             let new_wire = drv.add(|| vec![(new_wire, Fr::ONE), (height.clone(), Fr::ONE)])?;
             // Bind out as instance
-            if let ragu::r1cs::Wire::Var(v) = new_wire.clone() { drv.r1cs.set_assignment(v, drv.r1cs.get_assignment(v).unwrap()); }
+            if let ragu::r1cs::Wire::Var(v) = new_wire.clone() {
+                if let Some(val) = drv.r1cs.get_assignment(v) {
+                    drv.r1cs.set_assignment(v, val);
+                }
+            }
             let proof = ragu_backend::prove_mock::<Fr>(b"pcd:transition:v1", &drv.r1cs, &[])?;
             new_state.proof = proof.to_bytes()?;
         }
@@ -492,7 +502,7 @@ impl PcdStateMachine {
                 .state_history
                 .iter()
                 .position(|s| s.anchor_height == height)
-                .unwrap();
+                .ok_or_else(|| anyhow!("Target height not found in history during rollback"))?;
             self.state_history.truncate(target_index + 1);
             self.current_state = Some(target_state);
             Ok(())

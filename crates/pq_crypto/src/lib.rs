@@ -159,7 +159,7 @@ impl EpochTag {
     pub fn current() -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
         // Simple epoch calculation (every 24 hours)
         let epoch = timestamp / (24 * 60 * 60);
@@ -461,7 +461,7 @@ impl AccessToken {
         OsRng.fill_bytes(&mut token_id);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
 
         Self {
@@ -479,7 +479,7 @@ impl AccessToken {
     pub fn is_valid(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
 
         now < self.expires_at && self.usage_count < self.max_uses
@@ -493,7 +493,7 @@ impl AccessToken {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
 
         // Reset rate window if needed (24 hour windows)
@@ -511,7 +511,7 @@ impl AccessToken {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
 
         // Reset rate window if needed

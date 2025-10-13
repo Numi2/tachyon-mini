@@ -66,7 +66,7 @@ impl EncryptedNote {
             is_spent: false,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(std::time::Duration::from_secs(0))
                 .as_secs(),
         })
     }
@@ -133,7 +133,7 @@ impl PcdStateRecord {
             proof,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(std::time::Duration::from_secs(0))
                 .as_secs(),
         })
     }
@@ -201,7 +201,7 @@ impl WitnessRecord {
             last_update_height: 0,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(std::time::Duration::from_secs(0))
                 .as_secs(),
         })
     }
@@ -309,12 +309,12 @@ impl WalletDatabase {
         // migrate all encrypted records to the new master key and persist.
         if let Some(mut legacy_key) = maybe_legacy_key {
             let has_existing = {
-                let notes = db.note_cache.read().unwrap();
-                let pcd = db.pcd_state_cache.read().unwrap();
-                let wits = db.witness_cache.read().unwrap();
-                let oob = db.oob_keys_cache.read().unwrap();
-                let spend = db.spend_secret_cache.read().unwrap();
-                let zseed = db.zcash_seed_cache.read().unwrap();
+                let notes = db.note_cache.read().map_err(|_| anyhow!("Lock poisoned: note_cache"))?;
+                let pcd = db.pcd_state_cache.read().map_err(|_| anyhow!("Lock poisoned: pcd_state_cache"))?;
+                let wits = db.witness_cache.read().map_err(|_| anyhow!("Lock poisoned: witness_cache"))?;
+                let oob = db.oob_keys_cache.read().map_err(|_| anyhow!("Lock poisoned: oob_keys_cache"))?;
+                let spend = db.spend_secret_cache.read().map_err(|_| anyhow!("Lock poisoned: spend_secret_cache"))?;
+                let zseed = db.zcash_seed_cache.read().map_err(|_| anyhow!("Lock poisoned: zcash_seed_cache"))?;
                 !notes.is_empty() || pcd.is_some() || !wits.is_empty() || oob.is_some() || spend.is_some() || zseed.is_some()
             };
 
@@ -322,7 +322,9 @@ impl WalletDatabase {
                 // Migrate notes
                 {
                     let mut new_map: HashMap<[u8; NOTE_COMMITMENT_SIZE], EncryptedNote> = HashMap::new();
-                    let old_map = db.note_cache.read().unwrap().clone();
+                    let old_map = db.note_cache.read()
+                        .map_err(|_| anyhow!("Lock poisoned: note_cache during migration"))?
+                        .clone();
                     for (cm, enc) in old_map.into_iter() {
                         if let Ok(plaintext) = enc.decrypt(&legacy_key) {
                             if let Ok(new_rec) = EncryptedNote::new(enc.position, enc.block_height, &plaintext, &db.master_key) {
@@ -334,11 +336,14 @@ impl WalletDatabase {
                             new_map.insert(cm, enc);
                         }
                     }
-                    *db.note_cache.write().unwrap() = new_map;
+                    *db.note_cache.write()
+                        .map_err(|_| anyhow!("Lock poisoned: note_cache write during migration"))? = new_map;
                 }
 
                 // Migrate PCD state
-                if let Some(rec) = db.pcd_state_cache.read().unwrap().clone() {
+                if let Some(rec) = db.pcd_state_cache.read()
+                    .map_err(|_| anyhow!("Lock poisoned: pcd_state_cache during migration"))?
+                    .clone() {
                     if let Ok(state_bytes) = rec.decrypt_state(&legacy_key) {
                         let new_rec = PcdStateRecord::new(
                             rec.anchor_height,
@@ -347,14 +352,17 @@ impl WalletDatabase {
                             rec.proof.clone(),
                             &db.master_key,
                         )?;
-                        *db.pcd_state_cache.write().unwrap() = Some(new_rec);
+                        *db.pcd_state_cache.write()
+                            .map_err(|_| anyhow!("Lock poisoned: pcd_state_cache write during migration"))? = Some(new_rec);
                     }
                 }
 
                 // Migrate witnesses
                 {
                     let mut new_wits: HashMap<u64, WitnessRecord> = HashMap::new();
-                    let old_wits = db.witness_cache.read().unwrap().clone();
+                    let old_wits = db.witness_cache.read()
+                        .map_err(|_| anyhow!("Lock poisoned: witness_cache during migration"))?
+                        .clone();
                     for (pos, enc) in old_wits.into_iter() {
                         if let Ok(plaintext) = enc.decrypt_witness(&legacy_key) {
                             if let Ok(new_rec) = WitnessRecord::new(pos, &plaintext, &db.master_key) {
@@ -366,32 +374,42 @@ impl WalletDatabase {
                             new_wits.insert(pos, enc);
                         }
                     }
-                    *db.witness_cache.write().unwrap() = new_wits;
+                    *db.witness_cache.write()
+                        .map_err(|_| anyhow!("Lock poisoned: witness_cache write during migration"))? = new_wits;
                 }
 
                 // Migrate OOB keys
-                if let Some(keys) = db.oob_keys_cache.read().unwrap().clone() {
+                if let Some(keys) = db.oob_keys_cache.read()
+                    .map_err(|_| anyhow!("Lock poisoned: oob_keys_cache during migration"))?
+                    .clone() {
                     if let Ok(sk_bytes) = keys.decrypt_secret(&legacy_key) {
                         let pk = KyberPublicKey::new(keys.public_key.clone());
                         let sk = KyberSecretKey::new(sk_bytes);
                         let new_keys = OobKeysRecord::new(&pk, &sk, &db.master_key)?;
-                        *db.oob_keys_cache.write().unwrap() = Some(new_keys);
+                        *db.oob_keys_cache.write()
+                            .map_err(|_| anyhow!("Lock poisoned: oob_keys_cache write during migration"))? = Some(new_keys);
                     }
                 }
 
                 // Migrate spend secret
-                if let Some(spend) = db.spend_secret_cache.read().unwrap().clone() {
+                if let Some(spend) = db.spend_secret_cache.read()
+                    .map_err(|_| anyhow!("Lock poisoned: spend_secret_cache during migration"))?
+                    .clone() {
                     if let Ok(sec) = spend.decrypt(&legacy_key) {
                         let new_rec = SpendSecretRecord::new(&sec, &db.master_key)?;
-                        *db.spend_secret_cache.write().unwrap() = Some(new_rec);
+                        *db.spend_secret_cache.write()
+                            .map_err(|_| anyhow!("Lock poisoned: spend_secret_cache write during migration"))? = Some(new_rec);
                     }
                 }
 
                 // Migrate Zcash seed
-                if let Some(zrec) = db.zcash_seed_cache.read().unwrap().clone() {
+                if let Some(zrec) = db.zcash_seed_cache.read()
+                    .map_err(|_| anyhow!("Lock poisoned: zcash_seed_cache during migration"))?
+                    .clone() {
                     if let Ok(mnemonic) = zrec.decrypt_mnemonic(&legacy_key) {
                         let new_rec = ZcashSeedRecord::new(&mnemonic, zrec.birthday_height, &db.master_key)?;
-                        *db.zcash_seed_cache.write().unwrap() = Some(new_rec);
+                        *db.zcash_seed_cache.write()
+                            .map_err(|_| anyhow!("Lock poisoned: zcash_seed_cache write during migration"))? = Some(new_rec);
                     }
                 }
 
@@ -511,7 +529,8 @@ impl WalletDatabase {
             let data = fs::read(&notes_path).await?;
             let notes: HashMap<[u8; NOTE_COMMITMENT_SIZE], EncryptedNote> =
                 bincode::deserialize(&data)?;
-            *self.note_cache.write().unwrap() = notes;
+            *self.note_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: note_cache during load"))? = notes;
         }
 
         // Load PCD state
@@ -519,7 +538,8 @@ impl WalletDatabase {
         if pcd_path.exists() {
             let data = fs::read(&pcd_path).await?;
             let pcd_state: PcdStateRecord = bincode::deserialize(&data)?;
-            *self.pcd_state_cache.write().unwrap() = Some(pcd_state);
+            *self.pcd_state_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: pcd_state_cache during load"))? = Some(pcd_state);
         }
 
         // Load witnesses
@@ -527,7 +547,8 @@ impl WalletDatabase {
         if witnesses_path.exists() {
             let data = fs::read(&witnesses_path).await?;
             let witnesses: HashMap<u64, WitnessRecord> = bincode::deserialize(&data)?;
-            *self.witness_cache.write().unwrap() = witnesses;
+            *self.witness_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: witness_cache during load"))? = witnesses;
         }
 
         // Load OOB keys
@@ -535,7 +556,8 @@ impl WalletDatabase {
         if keys_path.exists() {
             let data = fs::read(&keys_path).await?;
             let keys: OobKeysRecord = bincode::deserialize(&data)?;
-            *self.oob_keys_cache.write().unwrap() = Some(keys);
+            *self.oob_keys_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: oob_keys_cache during load"))? = Some(keys);
         }
 
         // Load spend secret
@@ -543,7 +565,8 @@ impl WalletDatabase {
         if spend_path.exists() {
             let data = fs::read(&spend_path).await?;
             let rec: SpendSecretRecord = bincode::deserialize(&data)?;
-            *self.spend_secret_cache.write().unwrap() = Some(rec);
+            *self.spend_secret_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: spend_secret_cache during load"))? = Some(rec);
         }
 
         // Load Zcash seed
@@ -551,7 +574,8 @@ impl WalletDatabase {
         if zcash_seed_path.exists() {
             let data = fs::read(&zcash_seed_path).await?;
             let rec: ZcashSeedRecord = bincode::deserialize(&data)?;
-            *self.zcash_seed_cache.write().unwrap() = Some(rec);
+            *self.zcash_seed_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: zcash_seed_cache during load"))? = Some(rec);
         }
 
         // Load token ledger v2 (preferred), or migrate legacy balances if present
@@ -559,7 +583,8 @@ impl WalletDatabase {
         if ledger_v2_path.exists() {
             let data = fs::read(&ledger_v2_path).await?;
             let ledger: TokenLedger = bincode::deserialize(&data)?;
-            *self.token_ledger.write().unwrap() = ledger;
+            *self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger during load"))? = ledger;
         } else {
             let legacy_path = self.db_path.join("balances.bin");
             if legacy_path.exists() {
@@ -570,10 +595,12 @@ impl WalletDatabase {
                     ledger.set_meta(TOKEN_BASE.to_string(), TokenMeta { decimals: 0 });
                     ledger.set_balance(TOKEN_USDC, legacy.usdc, legacy.usdc_locked);
                     ledger.set_balance(TOKEN_BASE, legacy.base, legacy.base_locked);
-                    *self.token_ledger.write().unwrap() = ledger;
+                    *self.token_ledger.write()
+                        .map_err(|_| anyhow!("Lock poisoned: token_ledger during migration"))? = ledger;
                     // Persist migrated v2
                     let tmp = self.db_path.join("balances_v2.bin.tmp");
-                    let data = bincode::serialize(&*self.token_ledger.read().unwrap())?;
+                    let data = bincode::serialize(&*self.token_ledger.read()
+                        .map_err(|_| anyhow!("Lock poisoned: token_ledger during migration"))?)?;
                     fs::write(&tmp, &data).await?;
                     fs::rename(&tmp, &ledger_v2_path).await?;
                 }
@@ -585,7 +612,8 @@ impl WalletDatabase {
         if dex_owner_path.exists() {
             let data = fs::read(&dex_owner_path).await?;
             if let Ok(id) = bincode::deserialize::<u64>(&data) {
-                *self.dex_owner_id.write().unwrap() = Some(id);
+                *self.dex_owner_id.write()
+                    .map_err(|_| anyhow!("Lock poisoned: dex_owner_id during load"))? = Some(id);
             }
         }
 
@@ -594,7 +622,8 @@ impl WalletDatabase {
         if nf_h_path.exists() {
             let data = fs::read(&nf_h_path).await?;
             if let Ok(h) = bincode::deserialize::<u64>(&data) {
-                *self.last_chain_nf_height.write().unwrap() = h;
+                *self.last_chain_nf_height.write()
+                    .map_err(|_| anyhow!("Lock poisoned: last_chain_nf_height during load"))? = h;
             }
         }
 
@@ -609,7 +638,8 @@ impl WalletDatabase {
         let notes_path = self.db_path.join("notes.bin");
         let notes_tmp = self.db_path.join("notes.bin.tmp");
         let notes_data = {
-            let notes = self.note_cache.read().unwrap();
+            let notes = self.note_cache.read()
+                .map_err(|_| anyhow!("Lock poisoned: note_cache"))?;
             bincode::serialize(&*notes)?
         };
         fs::write(&notes_tmp, &notes_data).await?;
@@ -617,7 +647,11 @@ impl WalletDatabase {
 
         // Save PCD state atomically
         let pcd_path = self.db_path.join("pcd_state.bin");
-        let pcd_state_opt = { self.pcd_state_cache.read().unwrap().clone() };
+        let pcd_state_opt = {
+            self.pcd_state_cache.read()
+                .map_err(|_| anyhow!("Lock poisoned: pcd_state_cache"))?
+                .clone()
+        };
         if let Some(pcd_state) = pcd_state_opt {
             let pcd_tmp = self.db_path.join("pcd_state.bin.tmp");
             let pcd_data = bincode::serialize(&pcd_state)?;
@@ -629,7 +663,8 @@ impl WalletDatabase {
         let witnesses_path = self.db_path.join("witnesses.bin");
         let witnesses_tmp = self.db_path.join("witnesses.bin.tmp");
         let witnesses_data = {
-            let witnesses = self.witness_cache.read().unwrap();
+            let witnesses = self.witness_cache.read()
+                .map_err(|_| anyhow!("Lock poisoned: witness_cache"))?;
             bincode::serialize(&*witnesses)?
         };
         fs::write(&witnesses_tmp, &witnesses_data).await?;
@@ -637,7 +672,11 @@ impl WalletDatabase {
 
         // Save OOB keys if present atomically
         let keys_path = self.db_path.join("oob_keys.bin");
-        let keys_opt = { self.oob_keys_cache.read().unwrap().clone() };
+        let keys_opt = {
+            self.oob_keys_cache.read()
+                .map_err(|_| anyhow!("Lock poisoned: oob_keys_cache"))?
+                .clone()
+        };
         if let Some(keys) = keys_opt {
             let keys_tmp = self.db_path.join("oob_keys.bin.tmp");
             let keys_data = bincode::serialize(&keys)?;
@@ -647,7 +686,11 @@ impl WalletDatabase {
 
         // Save spend secret if present atomically
         let spend_path = self.db_path.join("spend_secret.bin");
-        let spend_opt = { self.spend_secret_cache.read().unwrap().clone() };
+        let spend_opt = {
+            self.spend_secret_cache.read()
+                .map_err(|_| anyhow!("Lock poisoned: spend_secret_cache"))?
+                .clone()
+        };
         if let Some(rec) = spend_opt {
             let tmp = self.db_path.join("spend_secret.bin.tmp");
             let data = bincode::serialize(&rec)?;
@@ -657,7 +700,11 @@ impl WalletDatabase {
 
         // Save Zcash seed if present atomically
         let zcash_seed_path = self.db_path.join("zcash_seed.bin");
-        let zcash_seed_opt = { self.zcash_seed_cache.read().unwrap().clone() };
+        let zcash_seed_opt = {
+            self.zcash_seed_cache.read()
+                .map_err(|_| anyhow!("Lock poisoned: zcash_seed_cache"))?
+                .clone()
+        };
         if let Some(rec) = zcash_seed_opt {
             let tmp = self.db_path.join("zcash_seed.bin.tmp");
             let data = bincode::serialize(&rec)?;
@@ -669,14 +716,18 @@ impl WalletDatabase {
         let ledger_v2_path = self.db_path.join("balances_v2.bin");
         let ledger_tmp = self.db_path.join("balances_v2.bin.tmp");
         let ledger_data = {
-            let ledger = self.token_ledger.read().unwrap();
+            let ledger = self.token_ledger.read()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             bincode::serialize(&*ledger)?
         };
         fs::write(&ledger_tmp, &ledger_data).await?;
         fs::rename(&ledger_tmp, &ledger_v2_path).await?;
 
         // Save DEX owner id if present atomically
-        let dex_owner_opt = { *self.dex_owner_id.read().unwrap() };
+        let dex_owner_opt = {
+            *self.dex_owner_id.read()
+                .map_err(|_| anyhow!("Lock poisoned: dex_owner_id"))?
+        };
         if let Some(id) = dex_owner_opt {
             let dex_owner_path = self.db_path.join("dex_owner_id.bin");
             let dex_owner_tmp = self.db_path.join("dex_owner_id.bin.tmp");
@@ -686,7 +737,10 @@ impl WalletDatabase {
         }
 
         // Save last chain nullifier height atomically
-        let nf_h = { *self.last_chain_nf_height.read().unwrap() };
+        let nf_h = {
+            *self.last_chain_nf_height.read()
+                .map_err(|_| anyhow!("Lock poisoned: last_chain_nf_height"))?
+        };
         let nf_h_path = self.db_path.join("last_chain_nf_height.bin");
         let nf_h_tmp = self.db_path.join("last_chain_nf_height.bin.tmp");
         let data = bincode::serialize(&nf_h)?;
@@ -698,14 +752,16 @@ impl WalletDatabase {
 
     /// Get or create a persistent DEX owner id for this wallet
     pub async fn get_or_create_dex_owner_id(&self) -> Result<u64> {
-        if let Some(id) = *self.dex_owner_id.read().unwrap() {
+        if let Some(id) = *self.dex_owner_id.read()
+            .map_err(|_| anyhow!("Lock poisoned: dex_owner_id"))? {
             return Ok(id);
         }
         let mut rng = rand::thread_rng();
         let mut id: u64 = rng.next_u64();
         if id == 0 { id = 1; }
         {
-            *self.dex_owner_id.write().unwrap() = Some(id);
+            *self.dex_owner_id.write()
+                .map_err(|_| anyhow!("Lock poisoned: dex_owner_id"))? = Some(id);
         }
         // Persist immediately
         self.save_to_disk().await?;
@@ -714,13 +770,16 @@ impl WalletDatabase {
 
     /// Read the last chain nullifier scan height
     pub async fn get_chain_nf_last_height(&self) -> u64 {
-        *self.last_chain_nf_height.read().unwrap()
+        self.last_chain_nf_height.read()
+            .map(|guard| *guard)
+            .unwrap_or(0)
     }
 
     /// Set and persist the last chain nullifier scan height
     pub async fn set_chain_nf_last_height(&self, height: u64) -> Result<()> {
         {
-            *self.last_chain_nf_height.write().unwrap() = height;
+            *self.last_chain_nf_height.write()
+                .map_err(|_| anyhow!("Lock poisoned: last_chain_nf_height"))? = height;
         }
         self.save_to_disk().await
     }
@@ -745,7 +804,8 @@ impl WalletDatabase {
         note: EncryptedNote,
     ) -> Result<()> {
         {
-            let mut notes = self.note_cache.write().unwrap();
+            let mut notes = self.note_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: note_cache"))?;
             notes.insert(commitment, note);
         }
 
@@ -757,23 +817,22 @@ impl WalletDatabase {
 
     /// Get a note by commitment
     pub async fn get_note(&self, commitment: &[u8; NOTE_COMMITMENT_SIZE]) -> Option<EncryptedNote> {
-        self.note_cache.read().unwrap().get(commitment).cloned()
+        self.note_cache.read().ok()?.get(commitment).cloned()
     }
 
     /// List all notes
     pub async fn list_notes(&self) -> Vec<EncryptedNote> {
-        self.note_cache.read().unwrap().values().cloned().collect()
+        self.note_cache.read()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_else(|_| Vec::new())
     }
 
     /// List unspent notes
     pub async fn list_unspent_notes(&self) -> Vec<EncryptedNote> {
         self.note_cache
             .read()
-            .unwrap()
-            .values()
-            .filter(|note| !note.is_spent)
-            .cloned()
-            .collect()
+            .map(|guard| guard.values().filter(|note| !note.is_spent).cloned().collect())
+            .unwrap_or_else(|_| Vec::new())
     }
 
     /// Update note spent status
@@ -783,7 +842,8 @@ impl WalletDatabase {
         is_spent: bool,
     ) -> Result<()> {
         {
-            let mut notes = self.note_cache.write().unwrap();
+            let mut notes = self.note_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: note_cache"))?;
             if let Some(note) = notes.get_mut(commitment) {
                 note.is_spent = is_spent;
             }
@@ -797,7 +857,8 @@ impl WalletDatabase {
     /// Set PCD state
     pub async fn set_pcd_state(&self, pcd_state: PcdStateRecord) -> Result<()> {
         {
-            *self.pcd_state_cache.write().unwrap() = Some(pcd_state);
+            *self.pcd_state_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: pcd_state_cache"))? = Some(pcd_state);
         }
 
         self.save_to_disk().await?;
@@ -807,13 +868,14 @@ impl WalletDatabase {
 
     /// Get current PCD state
     pub async fn get_pcd_state(&self) -> Option<PcdStateRecord> {
-        self.pcd_state_cache.read().unwrap().clone()
+        self.pcd_state_cache.read().ok()?.clone()
     }
 
     /// Add or update witness
     pub async fn upsert_witness(&self, position: u64, witness: WitnessRecord) -> Result<()> {
         {
-            let mut witnesses = self.witness_cache.write().unwrap();
+            let mut witnesses = self.witness_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: witness_cache"))?;
             witnesses.insert(position, witness);
         }
 
@@ -824,23 +886,22 @@ impl WalletDatabase {
 
     /// Get witness by position
     pub async fn get_witness(&self, position: u64) -> Option<WitnessRecord> {
-        self.witness_cache.read().unwrap().get(&position).cloned()
+        self.witness_cache.read().ok()?.get(&position).cloned()
     }
 
     /// Get all witnesses
     pub async fn list_witnesses(&self) -> Vec<WitnessRecord> {
         self.witness_cache
             .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_else(|_| Vec::new())
     }
 
     /// Delete a note (for spent notes cleanup)
     pub async fn delete_note(&self, commitment: &[u8; NOTE_COMMITMENT_SIZE]) -> Result<()> {
         {
-            let mut notes = self.note_cache.write().unwrap();
+            let mut notes = self.note_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: note_cache"))?;
             notes.remove(commitment);
         }
 
@@ -851,22 +912,36 @@ impl WalletDatabase {
 
     /// Get database statistics
     pub async fn get_stats(&self) -> DatabaseStats {
-        let notes = self.note_cache.read().unwrap();
-        let unspent_notes = notes.values().filter(|note| !note.is_spent).count();
-        let spent_notes = notes.len() - unspent_notes;
+        let (total_notes, unspent_notes, spent_notes) = self.note_cache.read()
+            .map(|notes| {
+                let unspent = notes.values().filter(|note| !note.is_spent).count();
+                let total = notes.len();
+                (total, unspent, total - unspent)
+            })
+            .unwrap_or((0, 0, 0));
+
+        let has_pcd_state = self.pcd_state_cache.read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        
+        let witness_count = self.witness_cache.read()
+            .map(|guard| guard.len())
+            .unwrap_or(0);
 
         DatabaseStats {
-            total_notes: notes.len(),
+            total_notes,
             unspent_notes,
             spent_notes,
-            has_pcd_state: self.pcd_state_cache.read().unwrap().is_some(),
-            witness_count: self.witness_cache.read().unwrap().len(),
+            has_pcd_state,
+            witness_count,
         }
     }
 
     /// Get persisted OOB keypair, if any
     pub async fn get_oob_keypair(&self) -> Result<Option<(KyberPublicKey, KyberSecretKey)>> {
-        if let Some(keys) = self.oob_keys_cache.read().unwrap().as_ref() {
+        if let Some(keys) = self.oob_keys_cache.read()
+            .map_err(|_| anyhow!("Lock poisoned: oob_keys_cache"))?
+            .as_ref() {
             let sk_bytes = keys.decrypt_secret(&self.master_key)?;
             let pk = KyberPublicKey::new(keys.public_key.clone());
             let sk = KyberSecretKey::new(sk_bytes);
@@ -879,7 +954,8 @@ impl WalletDatabase {
     pub async fn set_oob_keypair(&self, pk: &KyberPublicKey, sk: &KyberSecretKey) -> Result<()> {
         let keys = OobKeysRecord::new(pk, sk, &self.master_key)?;
         {
-            *self.oob_keys_cache.write().unwrap() = Some(keys);
+            *self.oob_keys_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: oob_keys_cache"))? = Some(keys);
         }
         self.save_to_disk().await?;
         Ok(())
@@ -897,7 +973,9 @@ impl WalletDatabase {
 
     /// Get or generate a spend secret (32 bytes) encrypted at rest
     pub async fn get_or_generate_spend_secret(&self) -> Result<[u8; 32]> {
-        if let Some(rec) = self.spend_secret_cache.read().unwrap().as_ref() {
+        if let Some(rec) = self.spend_secret_cache.read()
+            .map_err(|_| anyhow!("Lock poisoned: spend_secret_cache"))?
+            .as_ref() {
             return rec.decrypt(&self.master_key);
         }
         // Generate new random spend secret
@@ -905,7 +983,8 @@ impl WalletDatabase {
         OsRng.fill_bytes(&mut sec);
         let rec = SpendSecretRecord::new(&sec, &self.master_key)?;
         {
-            *self.spend_secret_cache.write().unwrap() = Some(rec);
+            *self.spend_secret_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: spend_secret_cache"))? = Some(rec);
         }
         self.save_to_disk().await?;
         Ok(sec)
@@ -1062,30 +1141,35 @@ impl TokenLedger {
     fn locked_of(&self, token: &str) -> u64 { self.balances.get(token).map(|b| b.locked).unwrap_or(0) }
     fn credit_available(&mut self, token: &str, amount: u64) {
         self.ensure_token(token);
-        let e = self.balances.get_mut(token).unwrap();
-        e.available = e.available.saturating_add(amount);
+        if let Some(e) = self.balances.get_mut(token) {
+            e.available = e.available.saturating_add(amount);
+        }
     }
     fn debit_available(&mut self, token: &str, amount: u64) -> Result<()> {
         self.ensure_token(token);
-        let e = self.balances.get_mut(token).unwrap();
+        let e = self.balances.get_mut(token)
+            .ok_or_else(|| anyhow!("Token not found: {}", token))?;
         if e.available < amount { return Err(anyhow!("insufficient available balance for {}", token)); }
         e.available -= amount; Ok(())
     }
     fn lock(&mut self, token: &str, amount: u64) -> Result<()> {
         self.ensure_token(token);
-        let e = self.balances.get_mut(token).unwrap();
+        let e = self.balances.get_mut(token)
+            .ok_or_else(|| anyhow!("Token not found: {}", token))?;
         if e.available < amount { return Err(anyhow!("insufficient available to lock for {}", token)); }
         e.available -= amount; e.locked = e.locked.saturating_add(amount); Ok(())
     }
     fn unlock(&mut self, token: &str, amount: u64) -> Result<()> {
         self.ensure_token(token);
-        let e = self.balances.get_mut(token).unwrap();
+        let e = self.balances.get_mut(token)
+            .ok_or_else(|| anyhow!("Token not found: {}", token))?;
         if e.locked < amount { return Err(anyhow!("unlock exceeds locked for {}", token)); }
         e.locked -= amount; e.available = e.available.saturating_add(amount); Ok(())
     }
     fn spend_locked(&mut self, token: &str, amount: u64) -> Result<()> {
         self.ensure_token(token);
-        let e = self.balances.get_mut(token).unwrap();
+        let e = self.balances.get_mut(token)
+            .ok_or_else(|| anyhow!("Token not found: {}", token))?;
         if e.locked < amount { return Err(anyhow!("spend exceeds locked for {}", token)); }
         e.locked -= amount; Ok(())
     }
@@ -1137,7 +1221,8 @@ impl WalletDatabase {
     /// Atomic settlement for a bid fill: spend locked USDC and credit base.
     pub async fn settle_bid_fill(&self, base_qty: u64, quote_cost: u64) -> Result<()> {
         {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             ledger.spend_locked(TOKEN_USDC, quote_cost)?;
             ledger.credit_available(TOKEN_BASE, base_qty);
         }
@@ -1147,7 +1232,8 @@ impl WalletDatabase {
     /// Atomic settlement for an ask fill: spend locked base and credit USDC.
     pub async fn settle_ask_fill(&self, base_qty: u64, quote_gain: u64) -> Result<()> {
         {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             ledger.spend_locked(TOKEN_BASE, base_qty)?;
             ledger.credit_available(TOKEN_USDC, quote_gain);
         }
@@ -1158,7 +1244,8 @@ impl WalletDatabase {
     pub async fn credit_token(&self, token: &str, amount: u64) -> Result<()> {
         if amount == 0 { return Ok(()); }
         {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             ledger.credit_available(token, amount);
         }
         self.save_to_disk().await
@@ -1167,7 +1254,8 @@ impl WalletDatabase {
     pub async fn debit_token(&self, token: &str, amount: u64) -> Result<()> {
         if amount == 0 { return Ok(()); }
         {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             ledger.debit_available(token, amount)?;
         }
         self.save_to_disk().await
@@ -1176,7 +1264,8 @@ impl WalletDatabase {
     pub async fn lock_token(&self, token: &str, amount: u64) -> Result<()> {
         if amount == 0 { return Ok(()); }
         {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             ledger.lock(token, amount)?;
         }
         self.save_to_disk().await
@@ -1185,7 +1274,8 @@ impl WalletDatabase {
     pub async fn unlock_token(&self, token: &str, amount: u64) -> Result<()> {
         if amount == 0 { return Ok(()); }
         {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             ledger.unlock(token, amount)?;
         }
         self.save_to_disk().await
@@ -1194,32 +1284,40 @@ impl WalletDatabase {
     pub async fn spend_locked_token(&self, token: &str, amount: u64) -> Result<()> {
         if amount == 0 { return Ok(()); }
         {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write()
+                .map_err(|_| anyhow!("Lock poisoned: token_ledger"))?;
             ledger.spend_locked(token, amount)?;
         }
         self.save_to_disk().await
     }
 
     pub async fn get_token_available(&self, token: &str) -> u64 {
-        self.token_ledger.read().unwrap().available_of(token)
+        self.token_ledger.read()
+            .map(|guard| guard.available_of(token))
+            .unwrap_or(0)
     }
 
     pub async fn get_token_locked(&self, token: &str) -> u64 {
-        self.token_ledger.read().unwrap().locked_of(token)
+        self.token_ledger.read()
+            .map(|guard| guard.locked_of(token))
+            .unwrap_or(0)
     }
 
     /// Persist Zcash mnemonic and birthday height (encrypted at rest)
     pub async fn set_zcash_seed(&self, mnemonic: &str, birthday_height: u64) -> Result<()> {
         let rec = ZcashSeedRecord::new(mnemonic, birthday_height, &self.master_key)?;
         {
-            *self.zcash_seed_cache.write().unwrap() = Some(rec);
+            *self.zcash_seed_cache.write()
+                .map_err(|_| anyhow!("Lock poisoned: zcash_seed_cache"))? = Some(rec);
         }
         self.save_to_disk().await
     }
 
     /// Retrieve Zcash mnemonic and birthday height if present
     pub async fn get_zcash_seed(&self) -> Option<(String, u64)> {
-        let rec_opt = { self.zcash_seed_cache.read().unwrap().clone() };
+        let rec_opt = {
+            self.zcash_seed_cache.read().ok()?.clone()
+        };
         if let Some(rec) = rec_opt {
             if let Ok(m) = rec.decrypt_mnemonic(&self.master_key) {
                 return Some((m, rec.birthday_height));
@@ -1230,7 +1328,9 @@ impl WalletDatabase {
 
     /// Check if a Zcash seed is stored
     pub async fn has_zcash_seed(&self) -> bool {
-        self.zcash_seed_cache.read().unwrap().is_some()
+        self.zcash_seed_cache.read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 }
 

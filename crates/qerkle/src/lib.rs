@@ -45,7 +45,9 @@ fn hash_pair(choice: HashChoice, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] 
             h_l.update(left);
             let mut xof_l = h_l.finalize_xof();
             let mut wide_l = [0u8; 64];
-            xof_l.read_exact(&mut wide_l).unwrap();
+            // XOF read from BLAKE3 should never fail with a fixed-size buffer
+            xof_l.read_exact(&mut wide_l)
+                .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
             let lf = Fr::from_uniform_bytes(&wide_l);
 
             let mut h_r = Blake3Hasher::new();
@@ -53,7 +55,9 @@ fn hash_pair(choice: HashChoice, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] 
             h_r.update(right);
             let mut xof_r = h_r.finalize_xof();
             let mut wide_r = [0u8; 64];
-            xof_r.read_exact(&mut wide_r).unwrap();
+            // XOF read from BLAKE3 should never fail with a fixed-size buffer
+            xof_r.read_exact(&mut wide_r)
+                .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
             let rf = Fr::from_uniform_bytes(&wide_r);
             let digest = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
                 .hash([lf, rf]);

@@ -792,7 +792,7 @@ impl TachyonWallet {
     /// Get a Unified Address (UA) for receiving on mainnet/testnet based on stored seed.
     pub async fn zcash_get_unified_address(&mut self) -> Result<String> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.get_ua().await
     }
 
@@ -800,7 +800,7 @@ impl TachyonWallet {
     /// Connect to lightwalletd and scan up to the given height. Returns scanned height and balance (zatoshi).
     pub async fn zcash_sync_to_height(&mut self, target_height: u64) -> Result<(u64, u64)> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_mut().unwrap();
+        let ctx = self.zcash.as_mut().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.sync_to_height(target_height).await
     }
 
@@ -808,7 +808,7 @@ impl TachyonWallet {
     /// Get current Orchard spendable balance (zatoshi) per derived account 0.
     pub async fn zcash_get_balance(&mut self) -> Result<u64> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.get_balance().await
     }
 
@@ -821,7 +821,7 @@ impl TachyonWallet {
         memo: Option<String>,
     ) -> Result<(String, u64)> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_mut().unwrap();
+        let ctx = self.zcash.as_mut().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.send_shielded(to_ua, amount_zat, memo.as_deref()).await
     }
 
@@ -829,7 +829,7 @@ impl TachyonWallet {
     /// Multi-account: set default account id
     pub async fn zcash_set_default_account(&mut self, account: u32) -> Result<()> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.set_default_account(account)
     }
 
@@ -837,7 +837,7 @@ impl TachyonWallet {
     /// List accounts with UAs (best-effort)
     pub async fn zcash_list_accounts(&mut self) -> Result<Vec<(u32, String)>> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.list_accounts().await
     }
 
@@ -845,7 +845,7 @@ impl TachyonWallet {
     /// Rescan from a height to a target height
     pub async fn zcash_rescan(&mut self, start_height: u64, target_height: u64) -> Result<u64> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_mut().unwrap();
+        let ctx = self.zcash.as_mut().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.rescan_from_height(start_height, target_height).await
     }
 
@@ -853,7 +853,7 @@ impl TachyonWallet {
     /// Set a local checkpoint height for faster future scans
     pub async fn zcash_set_checkpoint(&mut self, height: u64) -> Result<()> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.set_checkpoint(height).await
     }
 
@@ -861,7 +861,7 @@ impl TachyonWallet {
     /// Export Zcash wallet backup to directory
     pub async fn zcash_export_backup(&mut self, dst_dir: &str) -> Result<()> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.export_backup(dst_dir).await
     }
 
@@ -869,7 +869,7 @@ impl TachyonWallet {
     /// Import Zcash wallet backup from directory
     pub async fn zcash_import_backup(&mut self, src_dir: &str) -> Result<()> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.import_backup(src_dir).await
     }
 
@@ -898,7 +898,7 @@ impl TachyonWallet {
     /// Export UFVK for an account (ZIP-32)
     pub async fn zcash_export_ufvk(&mut self, account: u32) -> Result<String> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.export_ufvk(account).await
     }
 
@@ -906,7 +906,7 @@ impl TachyonWallet {
     /// Export USK for an account (ZIP-32)
     pub async fn zcash_export_usk(&mut self, account: u32) -> Result<String> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.export_usk(account).await
     }
 
@@ -919,7 +919,7 @@ impl TachyonWallet {
         memo: Option<String>,
     ) -> Result<String> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.generate_payment_uri(to_ua, amount_zat, memo.as_deref()).map_err(Into::into)
     }
 
@@ -927,7 +927,7 @@ impl TachyonWallet {
     /// Parse a ZIP-321 payment URI -> (ua, amount_zat, memo)
     pub async fn zcash_parse_payment_uri(&mut self, uri: &str) -> Result<(String, u64, Option<String>)> {
         self.ensure_zcash_context_initialized().await?;
-        let ctx = self.zcash.as_ref().unwrap();
+        let ctx = self.zcash.as_ref().ok_or_else(|| anyhow!("Zcash context not initialized"))?;
         ctx.parse_payment_uri(uri)
     }
 
@@ -1322,7 +1322,11 @@ impl TachyonWallet {
             pk
         } else {
             // Should not happen; fallback to ephemeral for continuity
-            let (pk, _sk) = SimpleKem::generate_keypair().unwrap();
+            let (pk, _sk) = SimpleKem::generate_keypair().unwrap_or_else(|_| {
+                // If key generation fails, return a zero key (should never happen)
+                (KyberPublicKey::new(vec![0u8; pq_crypto::KYBER_PUBLIC_KEY_SIZE]),
+                 KyberSecretKey::new(vec![0u8; pq_crypto::KYBER_SECRET_KEY_SIZE]))
+            });
             pk
         }
     }
@@ -1404,14 +1408,20 @@ impl TachyonWallet {
             repr.as_mut().copy_from_slice(&cm);
             Fr::from_repr(repr).unwrap_or_else(|| {
                 // Fallback: uniform map from bytes if not canonical
-                use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:map:v1"); h.update(&cm); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap(); Fr::from_uniform_bytes(&wide)
+                use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:map:v1"); h.update(&cm); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64];
+                // XOF read from BLAKE3 should never fail with a fixed-size buffer
+                xof.read_exact(&mut wide).expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+                Fr::from_uniform_bytes(&wide)
             })
         };
         let rho_f = {
             let mut repr = <Fr as ff::PrimeField>::Repr::default();
             repr.as_mut().copy_from_slice(&rho32);
             Fr::from_repr(repr).unwrap_or_else(|| {
-                use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:rho:v1"); h.update(&rho32); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap(); Fr::from_uniform_bytes(&wide)
+                use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:rho:v1"); h.update(&rho32); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64];
+                // XOF read from BLAKE3 should never fail with a fixed-size buffer
+                xof.read_exact(&mut wide).expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+                Fr::from_uniform_bytes(&wide)
             })
         };
         let tag = Fr::from(102u64);
@@ -1457,7 +1467,10 @@ impl TachyonWallet {
             .iter()
             .map(|n| {
                 let pk_f = {
-                    use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:pk:map:v1"); h.update(&n.recipient); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64]; xof.read_exact(&mut wide).unwrap(); Fr::from_uniform_bytes(&wide)
+                    use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:pk:map:v1"); h.update(&n.recipient); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64];
+                    // XOF read from BLAKE3 should never fail with a fixed-size buffer
+                    xof.read_exact(&mut wide).expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+                    Fr::from_uniform_bytes(&wide)
                 };
                 let val_f = Fr::from(n.value);
                 Self::orchard_note_commitment(pk_f, val_f)

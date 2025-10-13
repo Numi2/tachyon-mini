@@ -499,14 +499,16 @@ impl TachyonNode {
     pub fn submit_transaction(&self, tx: Transaction) -> Result<()> {
         // Replay protection: drop if seen recently
         {
-            let seen = self.recent_tx_set.read().unwrap();
+            let seen = self.recent_tx_set.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on recent_tx_set"))?;
             if seen.contains(&tx.hash) {
                 return Err(anyhow!("replay detected"));
             }
         }
 
         // Insert into mempool
-        let mut pool = self._pending_txs.write().unwrap();
+        let mut pool = self._pending_txs.write()
+            .map_err(|_| anyhow!("Failed to acquire write lock on pending_txs"))?;
         pool.insert(tx.hash, tx);
         Ok(())
     }
@@ -522,7 +524,10 @@ impl TachyonNode {
 
     /// Select up to `max` transactions from the mempool using incentive ordering
     pub fn select_transactions_for_block(&self, max: usize) -> Vec<Transaction> {
-        let pool = self._pending_txs.read().unwrap();
+        let pool = match self._pending_txs.read() {
+            Ok(p) => p,
+            Err(_) => return Vec::new(), // Return empty on lock failure
+        };
         let mut txs: Vec<Transaction> = pool.values().cloned().collect();
         txs.sort_by_key(|t| std::cmp::Reverse(Self::compute_incentive_score(t)));
         txs.truncate(max);
@@ -534,7 +539,8 @@ impl TachyonNode {
     /// - Aggregated proof must verify against aggregated_commitment (recursion verifier)
     /// - All tachygrams must be well-formed (just size/type in this prototype)
     pub fn validate_tachystamp(&self, stamp: &Tachystamp) -> Result<bool> {
-        let state = self.state.read().unwrap();
+        let state = self.state.read()
+            .map_err(|_| anyhow!("Failed to acquire read lock on state"))?;
         // Enforce anchor freshness: must be at most nullifier_window_size blocks old
         let max_age = self.config.validation_config.nullifier_window_size.max(1);
         if stamp.anchor.height > state.current_height {
@@ -570,7 +576,11 @@ impl TachyonNode {
     /// Build a block package: returns header (with proof commit) and body (deltas for wallets)
     pub fn build_block_package(&self, block: &Block) -> Result<(BlockHeader, BlockBody)> {
         // Snapshot previous digest
-        let prev_digest = { self.state.read().unwrap().state_digest };
+        let prev_digest = {
+            self.state.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on state"))?
+                .state_digest
+        };
 
         // Compute ordered outputs and nullifiers
         let ordered_outputs: Vec<[u8; 32]> = block
@@ -587,14 +597,22 @@ impl TachyonNode {
         ordered_nullifiers.dedup();
 
         // Apply to clones to get new roots and deltas
-        let mut mmr = { self.state.read().unwrap().commitment_mmr.clone() };
+        let mut mmr = {
+            self.state.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on state"))?
+                .commitment_mmr.clone()
+        };
         let mut mmr_hashes: Vec<SerializableHash> = Vec::new();
         for cm in &ordered_outputs { mmr_hashes.push(SerializableHash(NodeState::leaf_hash(cm))); }
         let mmr_ops = if mmr_hashes.is_empty() { Vec::<MmrDelta>::new() } else { vec![MmrDelta::BatchAppend { hashes: mmr_hashes }] };
         if !mmr_ops.is_empty() { mmr.apply_deltas(&mmr_ops)?; }
         let new_mmr_root = mmr.root().map(|h| *h.as_bytes()).unwrap_or([0u8; 32]);
 
-        let mut smt = { self.state.read().unwrap().nullifier_set.clone() };
+        let mut smt = {
+            self.state.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on state"))?
+                .nullifier_set.clone()
+        };
         let smt_ops = if ordered_nullifiers.is_empty() { Vec::<Smt16Delta>::new() } else { vec![Smt16Delta::BatchInsert { keys: ordered_nullifiers.clone() }] };
         for d in &smt_ops { smt.apply_delta(d.clone())?; }
         let new_smt_root = smt.root();
@@ -674,7 +692,8 @@ impl TachyonNode {
         }
 
         // Anchor binds to the current node state roots at this height
-        let s = self.state.read().unwrap();
+        let s = self.state.read()
+            .map_err(|_| anyhow!("Failed to acquire read lock on state"))?;
         let anchor = TachyAnchor { height: block.height, mmr_root: s.mmr_root, nullifier_root: s.nullifier_root };
         drop(s);
 
@@ -703,7 +722,8 @@ impl TachyonNode {
 
         // Enforce anchor/roots match canonical state and nullifier uniqueness (full-history)
         let membership_ok = {
-            let state = self.state.read().unwrap();
+            let state = self.state.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on state"))?;
             // Anchor and roots must match canonical state at current height
             if tx.anchor_height != state.current_height
                 || tx.pcd_mmr_root != state.mmr_root
@@ -773,7 +793,8 @@ impl TachyonNode {
 
         // Check nullifier non-membership proofs against anchor nullifier root
         let nullifier_absent_ok = {
-            let state = self.state.read().unwrap();
+            let state = self.state.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on state"))?;
             if state.nullifier_root != tx.pcd_nullifier_root
                 || tx.nullifier_non_membership.len() != tx.nullifiers.len()
             {
@@ -809,7 +830,8 @@ impl TachyonNode {
 
         // Enforce anchor recency: tx.anchor_height must be within recent window
         let is_anchor_recent = {
-            let state = self.state.read().unwrap();
+            let state = self.state.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on state"))?;
             let window = self.config.validation_config.nullifier_window_size.max(1);
             tx.anchor_height <= state.current_height && state.current_height - tx.anchor_height <= window
         };
@@ -852,7 +874,8 @@ impl TachyonNode {
 
         // Simple reorg/sequence guard: require strict height increment
         {
-            let s = self.state.read().unwrap();
+            let s = self.state.read()
+                .map_err(|_| anyhow!("Failed to acquire read lock on state"))?;
             if block.height != s.current_height.saturating_add(1) {
                 return Ok(BlockValidationResult {
                     is_valid: false,
@@ -881,7 +904,8 @@ impl TachyonNode {
 
         // Update node state with new nullifiers and commitments; advance anchor
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write()
+                .map_err(|_| anyhow!("Failed to acquire write lock on state"))?;
 
             // Apply all nullifiers into the canonical SMT-16 after sorting/deduping
             let mut new_nullifiers = Vec::new();
@@ -955,14 +979,17 @@ impl TachyonNode {
         // Compute block hash and update replay cache
         let block_hash = self.compute_block_hash(block)?;
         {
-            let mut s = self.state.write().unwrap();
+            let mut s = self.state.write()
+                .map_err(|_| anyhow!("Failed to acquire write lock on state"))?;
             s.last_block_hash = Some(block_hash);
         }
 
         // After successful block validation, record tx hashes to replay cache
         {
-            let mut dq = self.recent_tx_hashes.write().unwrap();
-            let mut set = self.recent_tx_set.write().unwrap();
+            let mut dq = self.recent_tx_hashes.write()
+                .map_err(|_| anyhow!("Failed to acquire write lock on recent_tx_hashes"))?;
+            let mut set = self.recent_tx_set.write()
+                .map_err(|_| anyhow!("Failed to acquire write lock on recent_tx_set"))?;
             for tx in &block.transactions {
                 if set.insert(tx.hash) {
                     dq.push_back(tx.hash);
@@ -1051,12 +1078,20 @@ impl TachyonNode {
     ) {
         // Placeholder: background can later pull from network gossip
         debug!("Processing pending transactions");
-        let _current_height = { state.read().unwrap().current_height };
+        let _current_height = {
+            state.read().map(|s| s.current_height).unwrap_or(0)
+        };
     }
 
     /// Run pruning to maintain minimal state
     async fn run_pruning(state: &Arc<RwLock<NodeState>>, config: &PruningConfig) {
-        let state_guard = state.write().unwrap();
+        let state_guard = match state.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("Failed to acquire write lock for pruning");
+                return;
+            }
+        };
 
         // Check if we need to prune
         if state_guard.last_pruned.elapsed().as_secs() < config.pruning_interval_secs {
@@ -1093,7 +1128,13 @@ impl TachyonNode {
             }
         }
 
-        let mut s2 = state.write().unwrap();
+        let mut s2 = match state.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("Failed to acquire write lock after pruning");
+                return;
+            }
+        };
         s2.last_pruned = Instant::now();
         s2.storage_size = new_storage_size;
 
@@ -1158,7 +1199,10 @@ impl TachyonNode {
     /// Get current node state
     pub fn get_state(&self) -> NodeState {
         // Clone the inner value instead of the guard
-        let guard = self.state.read().unwrap();
+        let guard = match self.state.read() {
+            Ok(g) => g,
+            Err(_) => return NodeState::new(), // Return default state on lock failure
+        };
         NodeState {
             current_height: guard.current_height,
             nullifier_set: guard.nullifier_set.clone(),

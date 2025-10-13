@@ -184,22 +184,28 @@ impl TachyonBlobStore {
                 ));
             }
         }
-        self.cache.write().unwrap().insert(hash, data);
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(hash, data);
+        }
         Ok(())
     }
 
     /// Retrieve a blob by its content identifier
     pub async fn get(&self, hash: &Hash) -> Result<Bytes> {
         // Check cache first
-        if let Some(data) = self.cache.read().unwrap().get(hash) {
-            return Ok(data.clone());
+        if let Ok(cache) = self.cache.read() {
+            if let Some(data) = cache.get(hash) {
+                return Ok(data.clone());
+            }
         }
 
         // Read from FsStore if available
         if let Some(fs) = &self.fs_store {
             let bytes = fs.get_bytes(*hash).await?;
             let data = bytes;
-            self.cache.write().unwrap().insert(*hash, data.clone());
+            if let Ok(mut cache) = self.cache.write() {
+                cache.insert(*hash, data.clone());
+            }
             return Ok(data);
         }
 
@@ -208,8 +214,10 @@ impl TachyonBlobStore {
 
     /// Check if a blob exists
     pub async fn contains(&self, hash: &Hash) -> bool {
-        if self.cache.read().unwrap().contains_key(hash) {
-            return true;
+        if let Ok(cache) = self.cache.read() {
+            if cache.contains_key(hash) {
+                return true;
+            }
         }
         if let Some(fs) = &self.fs_store {
             return fs.has(*hash).await.unwrap_or(false);
