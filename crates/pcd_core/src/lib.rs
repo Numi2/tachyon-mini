@@ -700,9 +700,8 @@ pub mod aggregation {
     /// Returns (recursion_proof_bytes, aggregated_commitment_bytes32).
     pub fn aggregate_action_proofs_recursive(action_proofs: &[Vec<u8>]) -> Result<(Vec<u8>, [u8; 32])> {
         let core = RecursionCore::new()?;
-        // Choose a small non-zero folding factor; can be protocol-parameterized later.
-        let folding_factor: u64 = 7;
-        core.aggregate_many_proofs(action_proofs, folding_factor)
+        // Use Fiat–Shamir safe recursion wiring so each step is bound to public inputs
+        core.aggregate_many_proofs_fs(action_proofs)
     }
 }
 
@@ -763,6 +762,10 @@ pub mod tachyon {
         pub aggregated_proof: Vec<u8>,
         /// Aggregated commitment (32 bytes) for quick verification/pipelining
         pub aggregated_commitment: [u8; 32],
+        /// FS recursion last-step previous aggregated commitment (public input)
+        pub fs_prev_commitment: [u8; 32],
+        /// FS recursion last-step current commitment (public input)
+        pub fs_current_commitment: [u8; 32],
     }
 
     impl Tachystamp {
@@ -774,10 +777,10 @@ pub mod tachyon {
             proofs: &[Vec<u8>],
         ) -> Result<Self> {
             let core = RecursionCore::new()?;
-            let (agg_proof, agg_commit) = if proofs.is_empty() {
-                (Vec::new(), [0u8; 32])
+            let (agg_proof, agg_commit, fs_prev, fs_cur) = if proofs.is_empty() {
+                (Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32])
             } else {
-                core.aggregate_many_proofs(proofs, TACHY_FOLDING_FACTOR)?
+                core.aggregate_many_proofs_fs_with_witness(proofs)?
             };
             Ok(Self {
                 anchor,
@@ -785,6 +788,8 @@ pub mod tachyon {
                 actions,
                 aggregated_proof: agg_proof,
                 aggregated_commitment: agg_commit,
+                fs_prev_commitment: fs_prev,
+                fs_current_commitment: fs_cur,
             })
         }
     }
@@ -1186,7 +1191,6 @@ pub fn pcd_keys_config() -> (PathBuf, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tachyon::*;
 
     #[test]
     fn test_pcd_state_creation() {

@@ -1,8 +1,11 @@
 //! PCD scaffolding for non-uniform circuits with folding accumulation.
 //! This defines a minimal step interface so Orchard/Tachyon circuits can
 //! emit/consume fold digests and accumulator digests.
+//!
+//! - Split accumulation gadget over Pasta scalars.
+//! - PCD container with Fiat–Shamir transcript (placeholder backend).
 
-use ff::Field;
+use ff::{Field, FromUniformBytes, PrimeField};
 
 use crate::accum::{AccumDigest, FoldDigest};
 use crate::folding::{PoseidonFoldCombiner, fold_many};
@@ -110,5 +113,47 @@ pub fn verify_chain_tip(
 }
 */
 
+
+/// Fiat–Shamir transcript for PCD (placeholder): absorb bytes and derive Pasta Fp challenges.
+#[derive(Clone, Debug, Default)]
+pub struct FsTranscript {
+    state: blake3::Hasher,
+}
+
+impl FsTranscript {
+    /// Initialize a new transcript with a domain separator.
+    pub fn new(domain: &[u8]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"pcd:fs:transcript:v1");
+        h.update(domain);
+        Self { state: h }
+    }
+
+    /// Absorb arbitrary bytes into the transcript state.
+    pub fn absorb(&mut self, data: &[u8]) {
+        self.state.update(data);
+    }
+
+    /// Derive a Pasta Fp challenge uniformly from the current transcript state and the given label.
+    pub fn challenge_fp(&self, label: &[u8]) -> pasta_curves::Fp {
+        use std::io::Read as _;
+        let mut xof = {
+            let mut h = self.state.clone();
+            h.update(label);
+            h.finalize_xof()
+        };
+        let mut wide = [0u8; 64];
+        xof.read_exact(&mut wide).unwrap();
+        pasta_curves::Fp::from_uniform_bytes(&wide)
+    }
+}
+
+/// Convenience: derive a Fiat–Shamir challenge from two Pasta Fp elements.
+pub fn fs_challenge_from_pair(prev: pasta_curves::Fp, cur: pasta_curves::Fp) -> pasta_curves::Fp {
+    let mut t = FsTranscript::new(b"pcd:fs:recursion:v1");
+    t.absorb(prev.to_repr().as_ref());
+    t.absorb(cur.to_repr().as_ref());
+    t.challenge_fp(b"ch")
+}
 
 

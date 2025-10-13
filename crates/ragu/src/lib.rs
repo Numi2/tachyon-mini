@@ -426,8 +426,8 @@ pub mod accum_unified;
 mod tests {
     use super::maybe::*;
     use super::accum::*;
-    use super::folding::*;
     use super::tachygram::Tachygram;
+    use ff::Field; // Bring trait providing Fr::ZERO/ONE into scope
 
     #[test]
     fn maybe_always_executes_closures() {

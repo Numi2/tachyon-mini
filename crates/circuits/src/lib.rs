@@ -60,6 +60,14 @@ fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr,
         .hash([tag_d3, d1, d2])
 }
 
+/// Poseidon-based Fiat–Shamir challenge (native) for recursion chaining.
+/// Uses width-3, rate-2 Poseidon (same spec as transition) with a domain tag.
+fn compute_fs_challenge_poseidon(prev: Fr, cur: Fr) -> Fr {
+    let tag_fs = Fr::from(11u64);
+    poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([tag_fs, prev, cur])
+}
+
 // -----------------------------
 // ragu integration
 // -----------------------------
@@ -571,6 +579,163 @@ pub struct PcdRecursionConfig {
     pub selector: Selector,
 }
 
+/// Fiat–Shamir recursion circuit for safe aggregation
+#[derive(Clone, Debug)]
+pub struct FsRecursionCircuit {
+    /// Previous aggregated commitment (public input)
+    pub prev_agg: Value<Fr>,
+    /// Current step commitment (public input)
+    pub current_commit: Value<Fr>,
+    /// Aggregated commitment output (public input)
+    pub aggregated_out: Value<Fr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FsRecursionConfig {
+    pub advice: [Column<Advice>; 6],
+    pub instance: [Column<Instance>; 3],
+    pub selector: Selector,
+    pub poseidon: Pow5Config<Fr, 3, 2>,
+}
+
+impl Circuit<Fr> for FsRecursionCircuit {
+    type Config = FsRecursionConfig;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            prev_agg: Value::unknown(),
+            current_commit: Value::unknown(),
+            aggregated_out: Value::unknown(),
+        }
+    }
+
+    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+        let advice = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(), // partial s-box for poseidon
+            meta.advice_column(), // challenge copy cell
+            meta.advice_column(), // extra/tag
+        ];
+        let instance = [
+            meta.instance_column(),
+            meta.instance_column(),
+            meta.instance_column(),
+        ];
+        let selector = meta.selector();
+
+        for a in &advice { meta.enable_equality(*a); }
+        for i in &instance { meta.enable_equality(*i); }
+
+        // Configure Poseidon (t=3, rate=2) for in-circuit FS challenge
+        let rc_a = [meta.fixed_column(), meta.fixed_column(), meta.fixed_column()];
+        let rc_b = [meta.fixed_column(), meta.fixed_column(), meta.fixed_column()];
+        meta.enable_constant(rc_b[0]);
+        let poseidon = Pow5Chip::<Fr, 3, 2>::configure::<P128Pow5T3>(
+            meta,
+            [advice[0], advice[1], advice[2]],
+            advice[3],
+            rc_a,
+            rc_b,
+        );
+
+        // Enforce: aggregated_out = prev_agg * challenge + current_commit
+        meta.create_gate("fs_recursion", |meta| {
+            let s = meta.query_selector(selector);
+            let prev = meta.query_advice(advice[0], Rotation::cur());
+            let cur = meta.query_advice(advice[1], Rotation::cur());
+            let ch = meta.query_advice(advice[4], Rotation::cur());
+            let out = meta.query_advice(advice[2], Rotation::cur());
+            vec![s * (out - (prev * ch + cur))]
+        });
+
+        FsRecursionConfig { advice, instance, selector, poseidon }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<Fr>,
+    ) -> Result<(), Error> {
+        // Assign prev, current, aggregated, and a local challenge copy placeholder
+        let (prev_cell, cur_cell, ch_local_cell, out_cell) = layouter.assign_region(
+            || "assign fs recursion row",
+            |mut region| {
+                config.selector.enable(&mut region, 0)?;
+
+                let prev = region.assign_advice(
+                    || "prev agg",
+                    config.advice[0],
+                    0,
+                    || self.prev_agg,
+                )?;
+
+                let cur = region.assign_advice(
+                    || "current commit",
+                    config.advice[1],
+                    0,
+                    || self.current_commit,
+                )?;
+
+                let ch_witness = self.prev_agg.zip(self.current_commit).map(|(p, c)| compute_fs_challenge_poseidon(p, c));
+                let ch_local = region.assign_advice(
+                    || "challenge (local copy)",
+                    config.advice[4],
+                    0,
+                    || ch_witness,
+                )?;
+
+                let out = region.assign_advice(
+                    || "aggregated out",
+                    config.advice[2],
+                    0,
+                    || self.aggregated_out,
+                )?;
+
+                Ok((prev, cur, ch_local, out))
+            },
+        )?;
+
+        // Compute Poseidon-based FS challenge in-circuit: H(TAG_FS, prev, cur)
+        let chip = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
+        let h = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+            chip,
+            layouter.namespace(|| "poseidon fs challenge init"),
+        )?;
+        // Assign tag as a constant
+        let tag_cell = layouter.assign_region(
+            || "assign fs tag",
+            |mut region| {
+                let c = region.assign_advice(|| "tag_fs", config.advice[5], 0, || Value::known(Fr::from(11u64)))?;
+                region.constrain_constant(c.cell(), Fr::from(11u64))?;
+                Ok(c)
+            },
+        )?;
+        let ch_cell = h.hash(
+            layouter.namespace(|| "poseidon h(tag,prev,cur)"),
+            [tag_cell, prev_cell.clone(), cur_cell.clone()],
+        )?;
+
+        // Bind local challenge copy to the computed Poseidon output
+        layouter.assign_region(
+            || "bind local challenge == poseidon output",
+            |mut region| {
+                region.constrain_equal(ch_local_cell.cell(), ch_cell.cell())?;
+                Ok(())
+            },
+        )?;
+
+        // Expose public inputs (prev, current, aggregated)
+        layouter.constrain_instance(prev_cell.cell(), config.instance[0], 0)?;
+        layouter.constrain_instance(cur_cell.cell(), config.instance[1], 0)?;
+        layouter.constrain_instance(out_cell.cell(), config.instance[2], 0)?;
+
+        Ok(())
+    }
+}
+
 /// PCD core functionality
 pub struct PcdCore {
     /// Basic state for now
@@ -780,6 +945,9 @@ pub struct RecursionCore {
     pub pk: ProvingKey<G1Affine>,
 }
 
+// Public alias for FS recursion witness tuple used across crates
+pub type FsAggregateWitness = (Vec<u8>, [u8; 32], [u8; 32], [u8; 32]);
+
 impl RecursionCore {
     /// Create a new recursion core with default k=12
     pub fn new() -> Result<Self> { Self::with_k(12) }
@@ -941,6 +1109,152 @@ impl RecursionCore {
     pub fn aggregate_tachy_digests(&self, digests: &[Fr]) -> Result<(Vec<u8>, [u8; 32])> {
         // Choose a small fixed folding factor (e.g., 2) for simplicity
         self.aggregate_many_digests_fr(digests, 2)
+    }
+}
+
+impl RecursionCore {
+    /// Prove one FS recursion step with public (prev, current, challenge, aggregated)
+    pub fn prove_aggregate_pair_fs(
+        &self,
+        prev_commitment: &[u8; 32],
+        current_commitment: &[u8; 32],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let prev_fr = Fr::from_repr(*prev_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(prev_commitment));
+        let cur_fr = Fr::from_repr(*current_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(current_commitment));
+        let ch = compute_fs_challenge_poseidon(prev_fr, cur_fr);
+        let out_fr = prev_fr * ch + cur_fr;
+
+        let circuit = FsRecursionCircuit {
+            prev_agg: Value::known(prev_fr),
+            current_commit: Value::known(cur_fr),
+            aggregated_out: Value::known(out_fr),
+        };
+
+        // Derive keys for FS circuit shape on demand
+        let empty = FsRecursionCircuit {
+            prev_agg: Value::unknown(),
+            current_commit: Value::unknown(),
+            aggregated_out: Value::unknown(),
+        };
+        let vk = keygen_vk(&self.params, &empty)?;
+        let pk = keygen_pk(&self.params, vk, &empty)?;
+
+        let inst_prev = [prev_fr];
+        let inst_cur = [cur_fr];
+        let inst_out = [out_fr];
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<G1Affine>>::init(vec![]);
+        halo2_proofs::plonk::create_proof(
+            &self.params,
+            &pk,
+            &[circuit],
+            &[&[&inst_prev[..], &inst_cur[..], &inst_out[..]]],
+            OsRng,
+            &mut transcript,
+        )?;
+        let proof_bytes = transcript.finalize();
+
+        let mut out_bytes = [0u8; 32];
+        out_bytes.copy_from_slice(out_fr.to_repr().as_ref());
+        Ok((proof_bytes, out_bytes))
+    }
+
+    /// Verify one FS recursion step given public (prev, current, aggregated)
+    pub fn verify_aggregate_pair_fs(
+        &self,
+        proof: &[u8],
+        prev_commitment: &[u8; 32],
+        current_commitment: &[u8; 32],
+        aggregated_commitment: &[u8; 32],
+    ) -> Result<bool> {
+        let prev_fr = Fr::from_repr(*prev_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(prev_commitment));
+        let cur_fr = Fr::from_repr(*current_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(current_commitment));
+        let out_fr = Fr::from_repr(*aggregated_commitment)
+            .unwrap_or_else(|| Self::to_fr_from_bytes(aggregated_commitment));
+
+        let inst_prev = [prev_fr];
+        let inst_cur = [cur_fr];
+        let inst_out = [out_fr];
+
+        // Recreate verifying key for the FS circuit
+        let empty = FsRecursionCircuit {
+            prev_agg: Value::unknown(),
+            current_commit: Value::unknown(),
+            aggregated_out: Value::unknown(),
+        };
+        let vk = keygen_vk(&self.params, &empty)?;
+
+        let mut transcript = Blake2bRead::<Cursor<&[u8]>, G1Affine, Challenge255<G1Affine>>::init(Cursor::new(proof));
+        let strategy = SingleVerifier::new(&self.params);
+        let ok = verify_proof(
+            &self.params,
+            &vk,
+            strategy,
+            &[&[&inst_prev[..], &inst_cur[..], &inst_out[..]]],
+            &mut transcript,
+        )
+        .is_ok();
+        Ok(ok)
+    }
+
+    /// Aggregate many commitments via Fiat–Shamir recursion
+    pub fn aggregate_many_commitments_fs(
+        &self,
+        commitments: &[[u8; 32]],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let mut prev = [0u8; 32]; // start from zero accumulator
+        let mut last_proof: Vec<u8> = Vec::new();
+        for cur in commitments {
+            let (proof, out) = self.prove_aggregate_pair_fs(&prev, cur)?;
+            last_proof = proof;
+            prev = out;
+        }
+        Ok((last_proof, prev))
+    }
+
+    /// Aggregate many commitments via Fiat–Shamir recursion and return last-step public inputs
+    pub fn aggregate_many_commitments_fs_with_witness(
+        &self,
+        commitments: &[[u8; 32]],
+    ) -> Result<FsAggregateWitness> {
+        if commitments.is_empty() { return Ok((Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32])); }
+        let mut prev = [0u8; 32];
+        let mut last_proof: Vec<u8> = Vec::new();
+        let mut prev_of_last = [0u8; 32];
+        let mut last_commit = [0u8; 32];
+        for (idx, cur) in commitments.iter().enumerate() {
+            let (proof, out) = self.prove_aggregate_pair_fs(&prev, cur)?;
+            last_proof = proof;
+            prev_of_last = prev;
+            last_commit = *cur;
+            prev = out;
+            // Continue until last element; prev_of_last/last_commit hold last-step inputs
+            let _ = idx;
+        }
+        Ok((last_proof, prev, prev_of_last, last_commit))
+    }
+
+    /// Aggregate many raw proofs via commit-then-FS recursion
+    pub fn aggregate_many_proofs_fs(
+        &self,
+        proofs: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let mut commitments: Vec<[u8; 32]> = Vec::with_capacity(proofs.len());
+        for p in proofs { commitments.push(self.commit_proof_bytes(p)); }
+        self.aggregate_many_commitments_fs(&commitments)
+    }
+
+    /// Aggregate many raw proofs via FS recursion and return last-step public inputs
+    pub fn aggregate_many_proofs_fs_with_witness(
+        &self,
+        proofs: &[Vec<u8>],
+    ) -> Result<FsAggregateWitness> {
+        let mut commitments: Vec<[u8; 32]> = Vec::with_capacity(proofs.len());
+        for p in proofs { commitments.push(self.commit_proof_bytes(p)); }
+        self.aggregate_many_commitments_fs_with_witness(&commitments)
     }
 }
 
@@ -1377,55 +1691,82 @@ pub mod performance {
     }
 }
 
-/// Recursive proof aggregation for PCD
+/// Recursive proof aggregation for PCD (Poseidon-based chaining)
 #[derive(Clone, Debug)]
 pub struct PcdAggregator {
-    /// Current aggregated proof state
-    pub state: Vec<u8>,
-    /// Aggregation circuit
-    pub circuit: Option<PcdTransitionCircuit>,
+    /// Current aggregated commitment (Fr encoded as 32 bytes)
+    pub state: [u8; 32],
 }
 
 impl PcdAggregator {
-    /// Create a new aggregator
-    pub fn new() -> Self {
-        Self {
-            state: vec![],
-            circuit: None,
-        }
-    }
+    /// Create a new aggregator with zero accumulator
+    pub fn new() -> Self { Self { state: [0u8; 32] } }
 
-    /// Aggregate a new proof into the current state using hash chaining
-    pub fn aggregate(&mut self, new_proof: &[u8]) -> Result<()> {
-        let mut hasher = Blake3Hasher::new();
-        hasher.update(b"pcd:agg:v1");
-        hasher.update(&self.state);
-        hasher.update(new_proof);
-        self.state = hasher.finalize().as_bytes().to_vec();
+    /// Aggregate a new commitment (32-byte canonical field encoding) using Poseidon chain:
+    ///   acc' = H(TAG_ACC, acc, new)
+    pub fn aggregate(&mut self, new_commitment: &[u8; 32]) -> Result<()> {
+        let tag = Fr::from(5u64);
+        let acc_fr = Fr::from_repr(self.state)
+            .unwrap_or_else(|| {
+                // If state is not canonical (e.g., zero at start), treat as zero
+                Fr::from(0u64)
+            });
+        let new_fr = Option::<Fr>::from(Fr::from_repr(*new_commitment))
+            .ok_or_else(|| anyhow::anyhow!("non-canonical new commitment encoding"))?;
+        let next = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+            .hash([tag, acc_fr, new_fr]);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(next.to_repr().as_ref());
+        self.state = out;
         Ok(())
     }
 
-    /// Generate a final aggregated proof (32-byte field representation)
-    pub fn finalize(&self) -> Result<Vec<u8>> {
-        Ok(self.state.clone())
-    }
+    /// Final aggregated commitment bytes
+    pub fn finalize(&self) -> Result<[u8; 32]> { Ok(self.state) }
 }
 
 impl Default for PcdAggregator {
     fn default() -> Self { Self::new() }
 }
 
-/// Aggregate Orchard-like action proofs into a single 32-byte commitment using hash chaining
-pub fn aggregate_orchard_actions(proofs: &[Vec<u8>]) -> Result<Vec<u8>> {
-    let mut acc: Vec<u8> = Vec::new();
-    for proof in proofs {
-        let mut hasher = Blake3Hasher::new();
-        hasher.update(b"pcd:orchard:agg:v1");
-        hasher.update(&acc);
-        hasher.update(proof);
-        acc = hasher.finalize().as_bytes().to_vec();
+/// Aggregate Orchard-like action commitments (32-byte canonical field encodings)
+/// into a single 32-byte Poseidon commitment using chaining:
+///   acc' = H(TAG_ORCH, acc, item)
+pub fn aggregate_orchard_actions_poseidon(items: &[[u8; 32]]) -> Result<[u8; 32]> {
+    let tag = Fr::from(6u64);
+    let mut acc = Fr::from(0u64);
+    for it in items {
+        let it_fr = Option::<Fr>::from(Fr::from_repr(*it))
+            .ok_or_else(|| anyhow::anyhow!("non-canonical orchard item encoding"))?;
+        acc = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+            .hash([tag, acc, it_fr]);
     }
-    Ok(acc)
+    let mut out = [0u8; 32];
+    out.copy_from_slice(acc.to_repr().as_ref());
+    Ok(out)
+}
+
+/// Backward-compatible Orchard-like aggregation over arbitrary proof bytes.
+/// Maps each proof to a field element via uniform bytes and chains with Poseidon:
+///   acc' = H(TAG_ORCH, acc, map_uniform(proof_bytes))
+pub fn aggregate_orchard_actions(proofs: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let tag = Fr::from(6u64);
+    let mut acc = Fr::from(0u64);
+    for p in proofs {
+        use std::io::Read as _;
+        let mut h = blake3::Hasher::new();
+        h.update(b"pcd:orchard:fr:uniform:v1");
+        h.update(p);
+        let mut xof = h.finalize_xof();
+        let mut wide = [0u8; 64];
+        xof.read_exact(&mut wide).unwrap();
+        let it_fr = Fr::from_uniform_bytes(&wide);
+        acc = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+            .hash([tag, acc, it_fr]);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(acc.to_repr().as_ref());
+    Ok(out.to_vec())
 }
 
 /// Tests for PCD circuits
@@ -1553,23 +1894,37 @@ mod tests {
     #[test]
     fn test_aggregator() {
         let mut aggregator = PcdAggregator::new();
-        let p1 = vec![1, 2, 3];
-        let p2 = vec![4, 5, 6];
-        aggregator.aggregate(&p1).unwrap();
+        let c1 = {
+            let mut b = [0u8; 32];
+            b[0] = 1;
+            b
+        };
+        let c2 = {
+            let mut b = [0u8; 32];
+            b[0] = 2;
+            b
+        };
+        aggregator.aggregate(&c1).unwrap();
         let mid = aggregator.finalize().unwrap();
-        assert_eq!(mid.len(), 32);
-        aggregator.aggregate(&p2).unwrap();
-        let final_proof = aggregator.finalize().unwrap();
-        assert_eq!(final_proof.len(), 32);
-        assert_ne!(final_proof, mid);
+        aggregator.aggregate(&c2).unwrap();
+        let final_commit = aggregator.finalize().unwrap();
+        assert_ne!(final_commit, mid);
     }
 
     #[test]
     fn test_orchard_aggregation_function() {
-        let agg1 = aggregate_orchard_actions(&vec![vec![1, 2, 3]]).unwrap();
-        let agg2 = aggregate_orchard_actions(&vec![vec![1, 2, 3], vec![4, 5]]).unwrap();
-        assert_eq!(agg1.len(), 32);
-        assert_eq!(agg2.len(), 32);
+        let i1 = {
+            let mut b = [0u8; 32];
+            b[0] = 9;
+            b
+        };
+        let i2 = {
+            let mut b = [0u8; 32];
+            b[0] = 10;
+            b
+        };
+        let agg1 = aggregate_orchard_actions_poseidon(&[i1]).unwrap();
+        let agg2 = aggregate_orchard_actions_poseidon(&[i1, i2]).unwrap();
         assert_ne!(agg1, agg2);
     }
 

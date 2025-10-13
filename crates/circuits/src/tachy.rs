@@ -357,7 +357,7 @@ mod tests {
             nonce: Value::known(nonce),
             sig_r: {
                 // choose r and derive s according to s = r + chal*pk
-                let chal = compute_sig_challenge(leaf_new, pk);
+                let _chal = compute_sig_challenge(leaf_new, pk);
                 let r = Fr::from(9u64);
                 let _s = r + chal * pk;
                 // store s in circuit field below; return r here

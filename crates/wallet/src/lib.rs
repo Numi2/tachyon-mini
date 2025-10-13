@@ -687,13 +687,12 @@ impl TachyonWallet {
         // Anchor is the current state roots/height
         let anchor = TachyAnchor { height: state.anchor_height, mmr_root: state.mmr_root, nullifier_root: state.nullifier_root };
 
-        // Aggregate provided proofs into a Tachystamp using RecursionCore
+        // Aggregate provided proofs into a Tachystamp using safe Fiat–Shamir recursion
         let core = ProofRecursionCore::new()?;
-        // If proofs are empty, allow zero; else fold deterministically
-        let (agg_proof, agg_commit) = if proofs.is_empty() {
-            (Vec::new(), [0u8; 32])
+        let (agg_proof, agg_commit, fs_prev, fs_cur) = if proofs.is_empty() {
+            (Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32])
         } else {
-            core.aggregate_many_proofs(&proofs, pcd_core::tachyon::TACHY_FOLDING_FACTOR)?
+            core.aggregate_many_proofs_fs_with_witness(&proofs)?
         };
         let stamp = Tachystamp {
             anchor,
@@ -701,6 +700,8 @@ impl TachyonWallet {
             actions,
             aggregated_proof: agg_proof,
             aggregated_commitment: agg_commit,
+            fs_prev_commitment: fs_prev,
+            fs_current_commitment: fs_cur,
         };
         Ok(stamp)
     }

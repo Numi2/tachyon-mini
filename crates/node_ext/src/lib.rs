@@ -13,7 +13,7 @@ use net_iroh::{TachyonNetwork, BlobKind};
 use bytes::Bytes;
 use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
 use pcd_core::tachyon::{Tachystamp, Tachygram, TachyAnchor, Tachyaction};
-use pcd_core::aggregation::{aggregate_action_proofs, aggregate_action_proofs_recursive};
+use pcd_core::aggregation::aggregate_action_proofs;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -549,9 +549,14 @@ impl TachyonNode {
             || stamp.anchor.nullifier_root != state.nullifier_root
         { return Ok(false); }
 
-        // Recursion verification for aggregated commitment
+        // Recursion verification (Fiat–Shamir): verify the last step with public inputs
         let core = circuits::RecursionCore::new()?;
-        let ok = core.verify_aggregate_pair(&stamp.aggregated_proof, &stamp.aggregated_commitment)?;
+        let ok = core.verify_aggregate_pair_fs(
+            &stamp.aggregated_proof,
+            &stamp.fs_prev_commitment,
+            &stamp.fs_current_commitment,
+            &stamp.aggregated_commitment,
+        )?;
         if !ok { return Ok(false); }
 
         // Basic tachygram sanity
@@ -616,17 +621,36 @@ impl TachyonNode {
     }
 
     /// Aggregate PCD proofs from a block using Halo2 recursion.
-    /// Returns aggregated recursion proof bytes and the aggregated commitment (32 bytes).
-    pub fn aggregate_block_proofs(&self, block: &Block) -> Result<(Vec<u8>, [u8; 32])> {
-        let proofs: Vec<Vec<u8>> = block.transactions.iter().map(|t| t.pcd_proof.clone()).collect();
-        // Fallback to hash-chain aggregation if recursion fails
-        match aggregate_action_proofs_recursive(&proofs) {
-            Ok(res) => Ok(res),
+    /// Returns (recursion_proof_bytes, aggregated_commitment, fs_prev_commitment, fs_current_commitment).
+    pub fn aggregate_block_proofs(
+        &self,
+        block: &Block,
+    ) -> Result<circuits::FsAggregateWitness> {
+        let proofs: Vec<Vec<u8>> = block
+            .transactions
+            .iter()
+            .map(|t| t.pcd_proof.clone())
+            .collect();
+
+        if proofs.is_empty() {
+            return Ok((Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32]));
+        }
+
+        // Try FS recursion with last-step public inputs so validators can check the final step
+        let fs_result = (|| -> Result<circuits::FsAggregateWitness> {
+            let core = circuits::RecursionCore::new()?;
+            core.aggregate_many_proofs_fs_with_witness(&proofs)
+        })();
+
+        match fs_result {
+            Ok(tuple) => Ok(tuple),
             Err(_) => {
+                // Fallback to hash-chain aggregation if recursion fails (not FS-verifiable)
                 let agg = aggregate_action_proofs(&proofs)?;
                 let mut commitment = [0u8; 32];
                 commitment.copy_from_slice(blake3::hash(&agg).as_bytes());
-                Ok((agg, commitment))
+                // No FS last-step inputs available; set to zero so consumers can detect non-FS path
+                Ok((agg, commitment, [0u8; 32], [0u8; 32]))
             }
         }
     }
@@ -635,7 +659,12 @@ impl TachyonNode {
     /// Tachygrams are the union of commitments and nullifiers; order: commitments then nullifiers per tx order.
     pub fn build_block_tachystamp(&self, block: &Block) -> Result<Tachystamp> {
         // Aggregate proofs (reuse existing method)
-        let (aggregated_proof, aggregated_commitment) = self.aggregate_block_proofs(block)?;
+        let (
+            aggregated_proof,
+            aggregated_commitment,
+            fs_prev_commitment,
+            fs_current_commitment,
+        ) = self.aggregate_block_proofs(block)?;
 
         // Collect tachygrams from transactions in order: outputs then nullifiers
         let mut grams: Vec<Tachygram> = Vec::new();
@@ -657,6 +686,8 @@ impl TachyonNode {
             actions,
             aggregated_proof,
             aggregated_commitment,
+            fs_prev_commitment,
+            fs_current_commitment,
         })
     }
 
