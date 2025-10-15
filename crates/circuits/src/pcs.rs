@@ -14,10 +14,22 @@ use pasta_curves::{
 pub mod domains {
     /// FS challenge domain for publisher
     pub const TAG_FS_PUBLISHER: u64 = 0x50554246; // 'PUBF'
+    /// FS binding tag for coeff-commit digest included into r
+    pub const TAG_FS_COEF: u64 = 0x46534346; // 'FSCF'
     /// Accumulator hash domain H_A(A_i, P_i)
     pub const TAG_ACC_A: u64 = 0x41434341; // 'ACCA'
     /// Wallet accumulator hash domain H_S(S_i, P_i')
     pub const TAG_ACC_S: u64 = 0x41434353; // 'ACCS'
+    /// Aggregator binding domain for next state
+    pub const TAG_ACC_AGG: u64 = 0x41474741; // 'AGGA'
+    /// P_i' derivation domain (simulate P_i - [alpha]G0)
+    pub const TAG_PI_PRIME: u64 = 0x50495052; // 'PIPR'
+    /// Coefficient commitment domain tag
+    pub const TAG_COEF_COMMIT: u64 = 0x434F4546; // 'COEF'
+    /// Unified block gram hash tag
+    pub const TAG_UGRAM: u64 = 0x4752414D; // 'GRAM'
+    /// Unified block fold/update tag
+    pub const TAG_UFOLD: u64 = 0x46554C44; // 'FULD'
 }
 
 /// Deterministically derive a vector of Pallas generators G_k using BLAKE3-to-scalar
@@ -99,7 +111,7 @@ pub fn hash_accumulator_s(s_x: Fr, s_y: Fr, p_x: Fr, p_y: Fr) -> Fr {
 /// Returns C = H(H(TAG, c0, c1), c2, c3) ...; if fewer than 2 remain pad with zero.
 pub fn commit_coeffs_poseidon(coeffs: &[Fr]) -> Fr {
     // Domain tag for coeff commitment
-    let tag = Fr::from(0x434F4546u64); // 'COEF'
+    let tag = Fr::from(domains::TAG_COEF_COMMIT as u64);
     let mut acc = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
         .hash([tag, coeffs.get(0).copied().unwrap_or(Fr::ZERO), coeffs.get(1).copied().unwrap_or(Fr::ZERO)]);
     let mut idx = 2;
@@ -111,6 +123,29 @@ pub fn commit_coeffs_poseidon(coeffs: &[Fr]) -> Fr {
         idx += 2;
     }
     acc
+}
+
+/// Compute aggregator next digest: H(TAG_ACC_AGG, A_i_x, A_i_y) then H(d1, P_i_x, P_i_y) then
+/// mix in h_i as a final round: H(out, h_i, 0)
+pub fn hash_accumulator_next(a_x: Fr, a_y: Fr, p_x: Fr, p_y: Fr, h_i: Fr) -> Fr {
+    let tag = Fr::from(domains::TAG_ACC_AGG as u64);
+    let d1 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, a_x, a_y]);
+    let d2 = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([d1, p_x, p_y]);
+    poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([d2, h_i, Fr::ZERO])
+}
+
+/// Derive P_i' digest from P_i and alpha: H(TAG_PI_PRIME, P_i, alpha)
+pub fn hash_pi_prime(p_i: Fr, alpha: Fr) -> Fr {
+    let tag = Fr::from(domains::TAG_PI_PRIME as u64);
+    poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag, p_i, alpha])
+}
+
+/// Derive a domain-separated digest from a coefficient commitment to bind into r.
+/// d_coeff = H(TAG_FS_COEF, coef_commit, 0)
+pub fn fs_digest_of_coeff_commit(coef_commit: Fr) -> Fr {
+    let tag = Fr::from(domains::TAG_FS_COEF as u64);
+    poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([tag, coef_commit, Fr::ZERO])
 }
 
 

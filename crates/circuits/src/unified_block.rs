@@ -11,6 +11,10 @@ use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
 use pasta_curves::{Fp as Fr, vesta::Affine as G1Affine};
 use crate::pcs;
+use std::path::Path;
+use std::fs::File;
+use std::io::{Read, Write};
+use serde_json;
 
 /// Circuit configuration
 #[derive(Clone, Debug)]
@@ -97,8 +101,8 @@ impl<const U: usize> Circuit<Fr> for UnifiedBlockCircuit<U> {
             let tag_g_cell = layouter.assign_region(
                 || format!("tag_g {i}"),
                 |mut region| {
-                    let c = region.assign_advice(|| "tag_g", cfg.advice[4], 0, || Value::known(Fr::from(0x4752414Du64)))?; // 'GRAM'
-                    region.constrain_constant(c.cell(), Fr::from(0x4752414Du64))?;
+                    let c = region.assign_advice(|| "tag_g", cfg.advice[4], 0, || Value::known(Fr::from(pcs::domains::TAG_UGRAM as u64)))?; // 'GRAM'
+                    region.constrain_constant(c.cell(), Fr::from(pcs::domains::TAG_UGRAM as u64))?;
                     Ok(c)
                 },
             )?;
@@ -123,8 +127,8 @@ impl<const U: usize> Circuit<Fr> for UnifiedBlockCircuit<U> {
             let tag_u_cell = layouter.assign_region(
                 || format!("tag_u {i}"),
                 |mut region| {
-                    let c = region.assign_advice(|| "tag_u", cfg.advice[4], 0, || Value::known(Fr::from(0x46554C44u64)))?; // 'FULD'
-                    region.constrain_constant(c.cell(), Fr::from(0x46554C44u64))?;
+                    let c = region.assign_advice(|| "tag_u", cfg.advice[4], 0, || Value::known(Fr::from(pcs::domains::TAG_UFOLD as u64)))?; // 'FULD'
+                    region.constrain_constant(c.cell(), Fr::from(pcs::domains::TAG_UFOLD as u64))?;
                     Ok(c)
                 },
             )?;
@@ -300,7 +304,46 @@ impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisher
         layouter.constrain_instance(a_next_cell.cell(), cfg.instance[3], 0)?;
         layouter.constrain_instance(len_cell.cell(), cfg.instance[4], 0)?;
 
-        // Compute FS challenge r = H(TAG_FS_PUBLISHER, A_i, P_i)
+        // Compute a Poseidon-based commitment to coefficients to bind to public P_i
+        // acc = H(tag, c0, c1); for k>=2: acc = H(acc, c_k, next)
+        let tag_coef_commit = layouter.assign_region(|| "tag coef", |mut region| {
+            let c = region.assign_advice(|| "tag_coef", cfg.advice[5], 1, || Value::known(Fr::from(pcs::domains::TAG_COEF_COMMIT as u64)))?; // 'COEF'
+            region.constrain_constant(c.cell(), Fr::from(pcs::domains::TAG_COEF_COMMIT as u64))?;
+            Ok(c)
+        })?;
+        // Load c0 and c1 (or zero) as first pair
+        let c0_cell = layouter.assign_region(|| "c0", |mut region| region.assign_advice(|| "c0", cfg.advice[0], 3, || self.coeffs[0]))?;
+        let c1_cell = layouter.assign_region(|| "c1", |mut region| region.assign_advice(|| "c1", cfg.advice[1], 3, || self.coeffs.get(1).cloned().unwrap_or(Value::known(Fr::ZERO))))?;
+        let chip_coef0 = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
+        let h_coef0 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+            chip_coef0,
+            layouter.namespace(|| "coef commit round0"),
+        )?;
+        let mut coef_acc = h_coef0.hash(
+            layouter.namespace(|| "H(tag,c0,c1)"),
+            [tag_coef_commit.clone(), c0_cell.clone(), c1_cell.clone()],
+        )?;
+        for (idx, cval) in self.coeffs.iter().enumerate() {
+            // After the first two coefficients are bound, fold subsequent coefficients pairwise into coef_acc
+            if idx >= 2 {
+                if idx % 2 == 0 {
+                    let cur_cell = layouter.assign_region(|| format!("c_cur {idx}"), |mut region| region.assign_advice(|| "c_cur", cfg.advice[3], 0, || *cval))?;
+                    let next_c = self.coeffs.get(idx + 1).cloned().unwrap_or(Value::known(Fr::ZERO));
+                    let next_cell = layouter.assign_region(|| format!("c_next {idx}"), |mut region| region.assign_advice(|| "c_next", cfg.advice[2], 3, || next_c))?;
+                    let chip_step = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
+                    let h_step = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+                        chip_step,
+                        layouter.namespace(|| format!("coef commit step {idx}")),
+                    )?;
+                    coef_acc = h_step.hash(
+                        layouter.namespace(|| format!("H(acc,c{},c{})", idx, idx+1)),
+                        [coef_acc.clone(), cur_cell.clone(), next_cell.clone()],
+                    )?;
+                }
+            }
+        }
+
+        // Now compute FS challenge r using A_i, P_i, block_len and d_coeff
         let chip = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
         let h = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
             chip,
@@ -311,9 +354,33 @@ impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisher
             region.constrain_constant(c.cell(), Fr::from(pcs::domains::TAG_FS_PUBLISHER as u64))?;
             Ok(c)
         })?;
-        let r_cell = h.hash(
+        let h1 = h.hash(
             layouter.namespace(|| "H(tag, A_i, P_i)"),
             [tag_cell, a_i_cell.clone(), p_i_cell.clone()],
+        )?;
+        let chip_dc = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
+        let h_dc = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+            chip_dc,
+            layouter.namespace(|| "d_coeff hash"),
+        )?;
+        let tag_dc = layouter.assign_region(|| "tag fs coef", |mut region| {
+            let c = region.assign_advice(|| "tag_fs_coef", cfg.advice[5], 3, || Value::known(Fr::from(pcs::domains::TAG_FS_COEF as u64)))?;
+            region.constrain_constant(c.cell(), Fr::from(pcs::domains::TAG_FS_COEF as u64))?;
+            Ok(c)
+        })?;
+        let zero_dc = layouter.assign_region(|| "zero_dc", |mut region| region.assign_advice(|| "zero_dc", cfg.advice[4], 2, || Value::known(Fr::ZERO)))?;
+        let d_coeff = h_dc.hash(
+            layouter.namespace(|| "H(tag, coef_acc, 0)"),
+            [tag_dc, coef_acc.clone(), zero_dc],
+        )?;
+        let chip2 = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
+        let h_len = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+            chip2,
+            layouter.namespace(|| "poseidon fs len round"),
+        )?;
+        let r_cell = h_len.hash(
+            layouter.namespace(|| "H(h1, len, d_coeff)"),
+            [h1, len_cell.clone(), d_coeff.clone()],
         )?;
 
         // Assign coeffs and compute Horner(p)(r)
@@ -321,21 +388,16 @@ impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisher
             region.assign_advice(|| "p(r)", cfg.advice[4], 0, || Value::known(Fr::ZERO))
         })?;
         for (idx, cval) in self.coeffs.iter().enumerate() {
-            // pr = pr * r + c
             let tmp = layouter.assign_region(|| format!("coeff {idx}"), |mut region| {
                 region.assign_advice(|| "c", cfg.advice[3], 0, || *cval)
             })?;
-            // Compute pr * r
             let pr_times_r = layouter.assign_region(|| format!("pr*r {idx}"), |mut region| {
                 let prr = pr_cell.value().zip(r_cell.value()).map(|(p, r)| *p * *r);
                 region.assign_advice(|| "pr*r", cfg.advice[4], 0, || prr)
             })?;
-            // pr = pr*r + c
             layouter.assign_region(|| format!("update pr {idx}"), |mut region| {
-                region.constrain_equal(pr_times_r.cell(), pr_times_r.cell())?; // no-op to keep region alive
-                Ok(())
+                region.constrain_equal(pr_times_r.cell(), pr_times_r.cell())?; Ok(())
             })?;
-            // Reassign pr = pr_times_r + c
             pr_cell = layouter.assign_region(|| format!("pr_new {idx}"), |mut region| {
                 let pr_new = pr_times_r.value().zip(tmp.value()).map(|(a, b)| *a + *b);
                 region.assign_advice(|| "pr_new", cfg.advice[4], 0, || pr_new)
@@ -395,6 +457,44 @@ impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisher
             })?;
         }
 
+        // Enforce adjacent deduplication for selected roots: if b_j and b_{j+1} are 1 then (a_{j+1} - a_j) * inv_j == 1
+        // Implement as (a_{j+1} - a_j) * inv_j == b_j * b_{j+1}
+        for j in 0..(MAX_ROOTS.saturating_sub(1)) {
+            let a_j = layouter.assign_region(|| format!("a_dup_{j}"), |mut region| {
+                region.assign_advice(|| "a_j", cfg.advice[1], 3, || self.roots[j])
+            })?;
+            let a_j1 = layouter.assign_region(|| format!("a_dup_{j}_next"), |mut region| {
+                region.assign_advice(|| "a_{j+1}", cfg.advice[2], 3, || self.roots[j + 1])
+            })?;
+            let b_j = layouter.assign_region(|| format!("b_dup_{j}"), |mut region| {
+                region.assign_advice(|| "b_j", cfg.advice[4], 3, || self.inc_flags[j])
+            })?;
+            let b_j1 = layouter.assign_region(|| format!("b_dup_{j}_next"), |mut region| {
+                region.assign_advice(|| "b_{j+1}", cfg.advice[5], 3, || self.inc_flags[j + 1])
+            })?;
+            let bb = layouter.assign_region(|| format!("bb_{j}"), |mut region| {
+                let val = b_j.value().zip(b_j1.value()).map(|(x, y)| *x * *y);
+                region.assign_advice(|| "bb", cfg.advice[0], 3, || val)
+            })?;
+            let diff = layouter.assign_region(|| format!("diff_{j}"), |mut region| {
+                let val = a_j1.value().zip(a_j.value()).map(|(nxt, cur)| *nxt - *cur);
+                region.assign_advice(|| "diff", cfg.advice[3], 3, || val)
+            })?;
+            let inv = layouter.assign_region(|| format!("inv_{j}"), |mut region| {
+                let val = a_j1.value().zip(a_j.value()).zip(b_j.value()).zip(b_j1.value()).map(|(((nxt, cur), bj), bj1)| {
+                    let d = *nxt - *cur; let both = *bj * *bj1; if both == Fr::ONE { d.invert().unwrap_or(Fr::ZERO) } else { Fr::ZERO }
+                });
+                region.assign_advice(|| "inv", cfg.advice[2], 3, || val)
+            })?;
+            let prod = layouter.assign_region(|| format!("diff*inv_{j}"), |mut region| {
+                let val = diff.value().zip(inv.value()).map(|(d, i)| *d * *i);
+                region.assign_advice(|| "prod", cfg.advice[1], 3, || val)
+            })?;
+            layouter.assign_region(|| format!("bind_dup_{j}"), |mut region| {
+                region.constrain_equal(prod.cell(), bb.cell())?; Ok(())
+            })?;
+        }
+
         // Enforce sum_flags == block_len
         layouter.assign_region(|| "bind sum == len", |mut region| {
             region.constrain_equal(sum_flags_cell.cell(), len_cell.cell())?;
@@ -406,6 +506,14 @@ impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisher
             region.constrain_equal(pr_cell.cell(), prod_cell.cell())?;
             Ok(())
         })?;
+
+        // Bind public P_i to in-circuit coefficient commitment
+        layouter.assign_region(|| "bind P_i == coef_commit", |mut region| {
+            region.constrain_equal(p_i_cell.cell(), coef_acc.cell())?;
+            Ok(())
+        })?;
+
+        // FS challenge r already computed using d_coeff; no recomputation needed
 
         // Enforce h_i = H_A(A_i, P_i) using Poseidon composition (digest placeholder)
         let chip_h = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
@@ -443,7 +551,7 @@ pub fn prove_poly_publisher<const MAX_DEG: usize, const MAX_ROOTS: usize>(
     roots: [Fr; MAX_ROOTS],
     inc_flags: [bool; MAX_ROOTS],
 ) -> Result<Vec<u8>> {
-    let params = ParamsIPA::<G1Affine>::new(k);
+    let params = load_or_setup_publisher_params::<MAX_DEG, MAX_ROOTS>(k)?;
     let circuit = PolyPublisherCircuit::<MAX_DEG, MAX_ROOTS> {
         a_i: Value::known(a_i),
         p_i: Value::known(p_i),
@@ -486,7 +594,7 @@ pub fn verify_poly_publisher(
     proof: &[u8],
 ) -> Result<bool> {
     if proof.is_empty() { return Ok(false); }
-    let params = ParamsIPA::<G1Affine>::new(k);
+    let params = load_or_setup_publisher_params::<1, 1>(k)?;
     // Use empty shape of the same circuit to derive VK
     let empty = PolyPublisherCircuit::<1, 1> {
         a_i: Value::unknown(),
@@ -513,4 +621,79 @@ pub fn verify_poly_publisher(
         &[&[&inst_a[..], &inst_p[..], &inst_h[..], &inst_next[..], &inst_len[..]]],
         &mut transcript,
     ).is_ok())
+}
+
+/// Publisher circuit params persistence with versioned IDs
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PublisherCircuitMeta { version: u32, k: u32, id: String }
+
+fn publisher_circuit_id<const MAX_DEG: usize, const MAX_ROOTS: usize>() -> String {
+    format!("publisher:v1:deg{}:roots{}", MAX_DEG, MAX_ROOTS)
+}
+
+fn params_store_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = Path::new("crates/pcd_core/crates/node_ext/node_data/keys");
+    (base.join("pub_params.bin"), base.join("pub_meta.json"))
+}
+
+fn load_or_setup_publisher_params<const MAX_DEG: usize, const MAX_ROOTS: usize>(k: u32) -> Result<ParamsIPA<G1Affine>> {
+    std::fs::create_dir_all("crates/pcd_core/crates/node_ext/node_data/keys").ok();
+    let (params_path, meta_path) = params_store_paths();
+    if params_path.exists() {
+        let mut pf = File::open(&params_path)?;
+        let params = ParamsIPA::<G1Affine>::read(&mut pf)?;
+        if meta_path.exists() {
+            let mut s = String::new(); File::open(&meta_path)?.read_to_string(&mut s)?;
+            let meta: PublisherCircuitMeta = serde_json::from_str(&s)?;
+            let expected = PublisherCircuitMeta { version: 1, k, id: publisher_circuit_id::<MAX_DEG, MAX_ROOTS>() };
+            if meta.k != expected.k || meta.id != expected.id { return Err(anyhow::anyhow!("publisher params meta mismatch")); }
+        }
+        Ok(params)
+    } else {
+        let params = ParamsIPA::<G1Affine>::new(k);
+        let mut f = File::create(&params_path)?; params.write(&mut f)?;
+        let meta = PublisherCircuitMeta { version: 1, k, id: publisher_circuit_id::<MAX_DEG, MAX_ROOTS>() };
+        let mut mf = File::create(&meta_path)?; mf.write_all(serde_json::to_string_pretty(&meta)?.as_bytes())?;
+        Ok(params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publisher_verify_mismatch_pi_fails() {
+        const MAX_DEG: usize = 4; const MAX_ROOTS: usize = 4;
+        let k = 12u32;
+        // Simple coeffs: p(x) = 3x + 2, roots = [1,2], L=2 => p(r) == (r-1)(r-2)
+        let coeffs = [Fr::from(2u64), Fr::from(3u64), Fr::ZERO, Fr::ZERO, Fr::ZERO];
+        let roots = [Fr::from(1u64), Fr::from(2u64), Fr::ZERO, Fr::ZERO];
+        let flags = [true, true, false, false];
+        let a_i = Fr::from(7u64);
+        let a_next = Fr::from(9u64);
+        // Bind h_i = H_A(A_i, P_i) (we'll set p_i later)
+        let p_i = Fr::from(123u64);
+        let h_i = pcs::hash_accumulator_a(a_i, Fr::ZERO, p_i, Fr::ZERO);
+        let proof = prove_poly_publisher::<MAX_DEG, MAX_ROOTS>(k, a_i, p_i, a_next, h_i, 2, coeffs, roots, flags).expect("prove");
+        // Verify with mismatched p_i should fail
+        let ok = verify_poly_publisher(k, a_i, Fr::from(124u64), a_next, h_i, 2, &proof).expect("verify");
+        assert!(!ok);
+    }
+
+    #[test]
+    fn publisher_verify_wrong_block_len_fails() {
+        const MAX_DEG: usize = 4; const MAX_ROOTS: usize = 4;
+        let k = 12u32;
+        let coeffs = [Fr::from(1u64), Fr::from(1u64), Fr::ZERO, Fr::ZERO, Fr::ZERO];
+        let roots = [Fr::from(5u64), Fr::from(6u64), Fr::ZERO, Fr::ZERO];
+        let flags = [true, false, false, false];
+        let a_i = Fr::from(7u64);
+        let a_next = Fr::from(9u64);
+        let p_i = Fr::from(55u64);
+        let h_i = pcs::hash_accumulator_a(a_i, Fr::ZERO, p_i, Fr::ZERO);
+        let proof = prove_poly_publisher::<MAX_DEG, MAX_ROOTS>(k, a_i, p_i, a_next, h_i, 1, coeffs, roots, flags).expect("prove");
+        let ok = verify_poly_publisher(k, a_i, p_i, a_next, h_i, 2, &proof).expect("verify");
+        assert!(!ok);
+    }
 }

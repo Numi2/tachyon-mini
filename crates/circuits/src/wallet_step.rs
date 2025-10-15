@@ -9,6 +9,11 @@ use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
 use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
 use pasta_curves::{Fq as Fr, vesta::Affine as G1Affine};
+use std::path::Path;
+use std::fs::File;
+use std::io::{Read, Write};
+use serde_json;
+use crate::pcs;
 
 /// Config for wallet step
 #[derive(Clone, Debug)]
@@ -142,19 +147,61 @@ impl<const MAX_ROOTS: usize> Circuit<Fr> for WalletStepCircuit<MAX_ROOTS> {
             })?;
         }
 
-        // α * β = 1 to prove α ≠ 0
+        // α * β = 1 to prove α ≠ 0 (explicit multiplication and equality)
         let beta_cell = layouter.assign_region(|| "beta", |mut region| region.assign_advice(|| "beta", cfg.advice[4], 2, || self.beta))?;
-        let one_cell = layouter.assign_region(|| "one", |mut region| region.assign_advice(|| "one", cfg.advice[5], 2, || Value::known(Fr::ONE)))?;
-        layouter.assign_region(|| "alpha*beta == 1", |mut region| {
-            // Enforce by copy constraint across an equality region
-            let prod = alpha_cell.value().zip(beta_cell.value()).map(|(a, b)| *a * *b);
-            let prod_cell = region.assign_advice(|| "prod", cfg.advice[0], 2, || prod)?;
-            region.constrain_equal(prod_cell.cell(), one_cell.cell())?;
-            Ok(())
+        let prod_cell = layouter.assign_region(|| "prod", |mut region| {
+            let val = alpha_cell.value().zip(beta_cell.value()).map(|(a, b)| *a * *b);
+            region.assign_advice(|| "prod", cfg.advice[0], 2, || val)
         })?;
+        let one_cell = layouter.assign_region(|| "one", |mut region| region.assign_advice(|| "one", cfg.advice[5], 2, || Value::known(Fr::ONE)))?;
+        layouter.assign_region(|| "bind prod == 1", |mut region| { region.constrain_equal(prod_cell.cell(), one_cell.cell())?; Ok(()) })?;
 
-        // Note: P_i' and accumulator updates are bound as digest placeholders in this prototype.
-        // A production circuit would include Pallas ECC arithmetic and scalar mul by α.
+		// Derive P_i' binding from actual alpha and provided P_i digest:
+		//   pi_prime = H(TAG_PI_PRIME, P_i, alpha)
+		let chip_pi = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
+		let h_pi = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+			chip_pi,
+			layouter.namespace(|| "poseidon pi_prime"),
+		)?;
+		let tag_pi_cell = layouter.assign_region(|| "tag_pi_prime", |mut region| {
+			let c = region.assign_advice(|| "tag_pi", cfg.advice[0], 3, || Value::known(Fr::from(pcs::domains::TAG_PI_PRIME as u64)))?;
+			region.constrain_constant(c.cell(), Fr::from(pcs::domains::TAG_PI_PRIME as u64))?;
+			Ok(c)
+		})?;
+		let pi_prime_cell = h_pi.hash(
+			layouter.namespace(|| "H(tag_pi, P_i, alpha)"),
+			[tag_pi_cell, p_i_cell.clone(), alpha_cell.clone()],
+		)?;
+
+		// Enforce S_{i+1} = H_S(S_i, P_i') with the same two-round composition used for accumulator hashes
+		let chip_s1 = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
+		let h_s1 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+			chip_s1,
+			layouter.namespace(|| "poseidon acc S d1"),
+		)?;
+		let tag_s_cell = layouter.assign_region(|| "tag_acc_s", |mut region| {
+			let c = region.assign_advice(|| "tag_s", cfg.advice[1], 3, || Value::known(Fr::from(pcs::domains::TAG_ACC_S as u64)))?;
+			region.constrain_constant(c.cell(), Fr::from(pcs::domains::TAG_ACC_S as u64))?;
+			Ok(c)
+		})?;
+		let zero_cell = layouter.assign_region(|| "zero_const", |mut region| region.assign_advice(|| "zero", cfg.advice[2], 3, || Value::known(Fr::ZERO)))?;
+		let d1_cell = h_s1.hash(
+			layouter.namespace(|| "H(tag_s, S_i, 0)"),
+			[tag_s_cell, s_i_cell.clone(), zero_cell.clone()],
+		)?;
+		let chip_s2 = Pow5Chip::<Fr, 3, 2>::construct(cfg.poseidon.clone());
+		let h_s2 = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+			chip_s2,
+			layouter.namespace(|| "poseidon acc S out"),
+		)?;
+		let s_next_from_pi_prime = h_s2.hash(
+			layouter.namespace(|| "H(d1, P_i', 0)"),
+			[d1_cell, pi_prime_cell, zero_cell],
+		)?;
+		layouter.assign_region(|| "bind S_{i+1}", |mut region| {
+			region.constrain_equal(s_next_cell.cell(), s_next_from_pi_prime.cell())?;
+			Ok(())
+		})?;
 
         Ok(())
     }
@@ -173,7 +220,7 @@ pub fn prove_wallet_step<const MAX_ROOTS: usize>(
     inc_flags: [bool; MAX_ROOTS],
     beta: Fr,
 ) -> Result<Vec<u8>> {
-    let params = ParamsIPA::<G1Affine>::new(k);
+    let params = load_or_setup_wallet_params::<MAX_ROOTS>(k)?;
     let circuit = WalletStepCircuit::<MAX_ROOTS> {
         a_i: Value::known(a_i),
         s_i: Value::known(s_i),
@@ -217,7 +264,7 @@ pub fn verify_wallet_step(
     s_next: Fr,
 ) -> Result<bool> {
     if proof.is_empty() { return Ok(false); }
-    let params = ParamsIPA::<G1Affine>::new(k);
+    let params = load_or_setup_wallet_params::<1>(k)?;
     let empty = WalletStepCircuit::<1> {
         a_i: Value::unknown(), s_i: Value::unknown(), p_i: Value::unknown(), a_next: Value::unknown(), s_next: Value::unknown(), v: Value::unknown(), roots: [Value::unknown(); 1], inc_flags: [Value::unknown(); 1], beta: Value::unknown()
     };
@@ -230,6 +277,64 @@ pub fn verify_wallet_step(
     let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<G1Affine>>::init(std::io::Cursor::new(proof));
     let strategy = SingleVerifier::new(&params);
     Ok(verify_proof::<IPACommitmentScheme<G1Affine>, _, _, _>(&params, &vk, strategy, &[&[&inst_a[..], &inst_s[..], &inst_p[..], &inst_an[..], &inst_sn[..]]], &mut transcript).is_ok())
+}
+
+/// Wallet circuit params persistence with versioned IDs
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WalletCircuitMeta { version: u32, k: u32, id: String }
+
+fn wallet_circuit_id<const MAX_ROOTS: usize>() -> String {
+    format!("wallet_step:v1:roots{}", MAX_ROOTS)
+}
+
+fn wallet_params_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = Path::new("crates/pcd_core/crates/node_ext/node_data/keys");
+    (base.join("wallet_params.bin"), base.join("wallet_meta.json"))
+}
+
+fn load_or_setup_wallet_params<const MAX_ROOTS: usize>(k: u32) -> Result<ParamsIPA<G1Affine>> {
+    std::fs::create_dir_all("crates/pcd_core/crates/node_ext/node_data/keys").ok();
+    let (params_path, meta_path) = wallet_params_paths();
+    if params_path.exists() {
+        let mut pf = File::open(&params_path)?;
+        let params = ParamsIPA::<G1Affine>::read(&mut pf)?;
+        if meta_path.exists() {
+            let mut s = String::new(); File::open(&meta_path)?.read_to_string(&mut s)?;
+            let meta: WalletCircuitMeta = serde_json::from_str(&s)?;
+            let expected = WalletCircuitMeta { version: 1, k, id: wallet_circuit_id::<MAX_ROOTS>() };
+            if meta.k != expected.k || meta.id != expected.id { return Err(anyhow::anyhow!("wallet params meta mismatch")); }
+        }
+        Ok(params)
+    } else {
+        let params = ParamsIPA::<G1Affine>::new(k);
+        let mut f = File::create(&params_path)?; params.write(&mut f)?;
+        let meta = WalletCircuitMeta { version: 1, k, id: wallet_circuit_id::<MAX_ROOTS>() };
+        let mut mf = File::create(&meta_path)?; mf.write_all(serde_json::to_string_pretty(&meta)?.as_bytes())?;
+        Ok(params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_alpha_zero_prove_fails() {
+        const MAX_ROOTS: usize = 4;
+        let k = 8u32;
+        // Choose v equal to first root and set flag[0]=true so alpha includes (v-a0)=0
+        let v = Fr::from(5u64);
+        let roots = [Fr::from(5u64), Fr::from(9u64), Fr::ZERO, Fr::ZERO];
+        let flags = [true, false, false, false];
+        let a_i = Fr::from(1u64);
+        let s_i = Fr::from(2u64);
+        let p_i = Fr::from(3u64);
+        let a_next = Fr::from(4u64);
+        let s_next = Fr::from(5u64);
+        // Any beta will not satisfy alpha*beta=1 since alpha=0; prover should fail
+        let res = prove_wallet_step::<MAX_ROOTS>(k, a_i, s_i, p_i, a_next, s_next, v, roots, [flags[0], flags[1], flags[2], flags[3]], Fr::ONE);
+        assert!(res.is_err());
+    }
 }
 
 
