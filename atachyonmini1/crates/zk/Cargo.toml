@@ -1,0 +1,31 @@
+[package]
+name = "tachyon_zk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+bincode.workspace = true
+ff.workspace = true
+pasta_curves.workspace = true
+halo2_gadgets.workspace = true
+halo2_proofs.workspace = true
+
+# Re-export internal ZK stack
+circuits = { path = "../circuits" }
+pcd_core = { path = "../pcd_core" }
+ragu = { path = "../ragu", optional = true }
+accum_mmr = { path = "../accum_mmr" }
+accum_set = { path = "../accum_set" }
+
+[features]
+default = []
+ragu = ["dep:ragu"]
+
+

@@ -1,0 +1,14 @@
+[package]
+name = "accum_mmr"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tachyon Team"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+hex = "0.4"
+thiserror.workspace = true

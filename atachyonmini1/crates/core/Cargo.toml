@@ -1,0 +1,19 @@
+[package]
+name = "tachyon_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+# Re-exported internal crates
+node_ext = { path = "../node_ext" }
+net_iroh = { path = "../net_iroh" }
+header_sync = { path = "../header_sync" }
+tachyon_common = { path = "../tachyon_common" }
+
+

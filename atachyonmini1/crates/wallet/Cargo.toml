@@ -1,0 +1,49 @@
+[package]
+name = "wallet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+storage = { path = "../storage" }
+tachyon_core = { path = "../core", optional = true }
+tachyon_zk = { path = "../zk", optional = true }
+pq_crypto = { path = "../pq_crypto", optional = true }
+# node_ext removed (use tachyon_core facade)
+blake3.workspace = true
+tracing.workspace = true
+bincode.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+hex = "0.4"
+ff.workspace = true
+pasta_curves.workspace = true
+halo2_gadgets.workspace = true
+# accumulators consumed via tachyon_zk facade
+dex = { path = "../dex", optional = true }
+rand = { version = "0.8", optional = true }
+# circuits and tachyon_common removed (use tachyon_zk and tachyon_core facades)
+## Zcash dependencies temporarily removed to resolve dependency conflicts
+## bip0039 removed to avoid pbkdf2/subtle conflicts
+
+# Optional mnemonic support (disabled by default; add dependency if enabling)
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[features]
+default = ["pcd"]
+# Zcash temporarily disabled: feature kept for compatibility but does nothing
+zcash = []
+zcash_mnemonic = []
+pcd = [
+    "tachyon_core",
+    "tachyon_zk",
+    "pq_crypto",
+    "reqwest",
+    "dex",
+]

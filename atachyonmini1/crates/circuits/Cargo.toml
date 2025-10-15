@@ -1,0 +1,28 @@
+[package]
+name = "circuits"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tachyon Team"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+halo2_proofs.workspace = true
+halo2_gadgets.workspace = true
+blake3.workspace = true
+ff = "0.13"
+rand.workspace = true
+halo2curves = "0.6"
+pasta_curves.workspace = true
+serde_json = "1"
+tracing.workspace = true
+ragu = { path = "../ragu" }
+
+[features]
+dev-graph = ["halo2_proofs/dev-graph", "dep:plotters"]
+
+[dependencies.plotters]
+version = "0.3"
+optional = true

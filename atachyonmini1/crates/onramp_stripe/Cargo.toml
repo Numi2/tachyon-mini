@@ -1,0 +1,32 @@
+[package]
+name = "onramp_stripe"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tachyon Team"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hex = "0.4"
+wallet = { path = "../wallet" }
+tachyon_common = { path = "../tachyon_common" }
+
+# lightweight http server for webhook (axum)
+axum = { version = "0.7", features = ["macros"] }
+hyper = { version = "1", features = ["http1", "server"] }
+tower = "0.4"
+
+# For signature verification (placeholder; real Stripe SDK can be added externally)
+# Webhook verification deps
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+time = "0.3"
+constant_time_eq = "0.3"
+
+

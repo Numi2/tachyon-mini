@@ -1,0 +1,15 @@
+[package]
+name = "accum_set"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tachyon Team"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+blake3.workspace = true
+serde-big-array = "0.5"
+thiserror.workspace = true
+
+

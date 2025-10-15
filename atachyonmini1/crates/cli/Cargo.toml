@@ -1,0 +1,40 @@
+[[bin]]
+name = "tachyon"
+path = "src/main.rs"
+
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json = "1.0"
+anyhow.workspace = true
+clap = { version = "4.0", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber = "0.3"
+wallet = { path = "../wallet" }
+pq_crypto = { path = "../pq_crypto" }
+hex = "0.4"
+tachyon_core = { path = "../core" }
+tachyon_zk = { path = "../zk" }
+bytes = "1.6"
+blake3 = "1.5"
+rpassword = "7"
+dirs-next = "2"
+onramp_stripe = { path = "../onramp_stripe", optional = true }
+rand.workspace = true
+pasta_curves.workspace = true
+halo2_proofs.workspace = true
+
+[features]
+default = []
+onramp = ["dep:onramp_stripe"]
+# Enable Zcash-related CLI commands and forward feature to wallet crate
+zcash = ["wallet/zcash"]
+# Enable mnemonic support (for seed import) and forward to wallet crate
+zcash_mnemonic = ["zcash", "wallet/zcash_mnemonic"]

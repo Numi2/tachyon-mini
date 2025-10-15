@@ -1,0 +1,6 @@
+data/**
+**/target/**
+**/.DS_Store
+target/
+
+
