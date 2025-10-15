@@ -18,6 +18,7 @@ halo2curves = "0.6"
 pasta_curves.workspace = true
 ragu.path = "../ragu"
 serde_json = "1"
+tracing.workspace = true
 
 [features]
 dev-graph = ["halo2_proofs/dev-graph", "dep:plotters"]

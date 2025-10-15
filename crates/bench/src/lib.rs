@@ -291,7 +291,7 @@ impl TachyonBenchmark {
         let proofs: Vec<_> = test_hashes
             .iter()
             .enumerate()
-            .map(|(i, _)| mmr.prove(i as u64).unwrap())
+            .filter_map(|(i, _)| mmr.prove(i as u64).ok())
             .collect();
 
         let start_time = Instant::now();
@@ -303,7 +303,8 @@ impl TachyonBenchmark {
             let verify_start = Instant::now();
 
             if timeout(Duration::from_secs(self.config.timeout_secs), async {
-                let mmr_root = mmr.root().unwrap_or(blake3::Hash::from([0u8; 32]));
+                let mmr_root = mmr.root()
+                    .ok_or_else(|| anyhow!("MMR root is None - cannot verify proof against empty accumulator"))?;
                 let _is_valid = proof.verify(&mmr_root);
                 Ok::<_, anyhow::Error>(())
             })
@@ -924,7 +925,7 @@ impl TachyonBenchmark {
 
         // Pre-create encrypted notes
         let notes: Vec<_> = (0..self.config.iterations)
-            .map(|i| EncryptedNote::new(i as u64, i as u64, &note_data, &master_key).unwrap())
+            .filter_map(|i| EncryptedNote::new(i as u64, i as u64, &note_data, &master_key).ok())
             .collect();
 
         let start_time = Instant::now();

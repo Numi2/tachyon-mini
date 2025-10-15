@@ -15,6 +15,8 @@ use onramp_stripe as onramp;
 use circuits::{RecursionCore, compute_tachy_digest};
 use pasta_curves::Fp as Fr;
 use pcd_core::tachyon as tachyon_api;
+use circuits::unified_block::{prove_poly_publisher, verify_poly_publisher};
+use circuits::wallet_step::{prove_wallet_step, verify_wallet_step};
 
 /// Tachyon CLI application
 #[derive(Parser)]
@@ -244,6 +246,91 @@ pub enum Commands {
     Params {
         #[command(subcommand)]
         params_command: ParamsCommands,
+    },
+    /// Prove a small polynomial publisher instance (demo bounds MAX_DEG=8, MAX_ROOTS=8)
+    PolyPublisherProve {
+        /// Security parameter k (2^k)
+        #[arg(long, default_value_t = 12)]
+        k: u32,
+        /// A_i (as u64)
+        #[arg(long)]
+        a_i: u64,
+        /// P_i (as u64)
+        #[arg(long)]
+        p_i: u64,
+        /// A_{i+1} (as u64)
+        #[arg(long)]
+        a_next: u64,
+        /// h_i (as u64)
+        #[arg(long)]
+        h_i: u64,
+        /// Coefficients c0,c1,... (comma-separated u64)
+        #[arg(long)]
+        coeffs: String,
+        /// Roots list r0,r1,... (comma-separated u64)
+        #[arg(long)]
+        roots: String,
+        /// Block length (<= roots.len())
+        #[arg(long)]
+        block_len: u64,
+    },
+    /// Verify a small polynomial publisher proof (demo bounds MAX_DEG=8, MAX_ROOTS=8)
+    PolyPublisherVerify {
+        /// Security parameter k (2^k)
+        #[arg(long, default_value_t = 12)]
+        k: u32,
+        /// A_i (as u64)
+        #[arg(long)]
+        a_i: u64,
+        /// P_i (as u64)
+        #[arg(long)]
+        p_i: u64,
+        /// A_{i+1} (as u64)
+        #[arg(long)]
+        a_next: u64,
+        /// h_i (as u64)
+        #[arg(long)]
+        h_i: u64,
+        /// Block length
+        #[arg(long)]
+        block_len: u64,
+        /// Proof hex string
+        #[arg(long)]
+        proof_hex: String,
+    },
+    /// Prove a wallet IVC step (demo bounds MAX_ROOTS=8)
+    WalletStepProve {
+        /// Security parameter k (2^k)
+        #[arg(long, default_value_t = 12)]
+        k: u32,
+        /// A_i, S_i, P_i, A_{i+1}, S_{i+1} as u64 values (digest placeholders)
+        #[arg(long)] a_i: u64,
+        #[arg(long)] s_i: u64,
+        #[arg(long)] p_i: u64,
+        #[arg(long)] a_next: u64,
+        #[arg(long)] s_next: u64,
+        /// secret tag v
+        #[arg(long)] v: u64,
+        /// Roots list r0,r1,... (comma-separated u64)
+        #[arg(long)] roots: String,
+        /// Flags list b0,b1,... (comma-separated 0/1)
+        #[arg(long)] flags: String,
+        /// beta inverse witness (u64)
+        #[arg(long)] beta: u64,
+    },
+    /// Verify a wallet IVC step (demo bounds MAX_ROOTS=8)
+    WalletStepVerify {
+        /// Security parameter k (2^k)
+        #[arg(long, default_value_t = 12)]
+        k: u32,
+        /// A_i, S_i, P_i, A_{i+1}, S_{i+1} as u64 values
+        #[arg(long)] a_i: u64,
+        #[arg(long)] s_i: u64,
+        #[arg(long)] p_i: u64,
+        #[arg(long)] a_next: u64,
+        #[arg(long)] s_next: u64,
+        /// Proof hex
+        #[arg(long)] proof_hex: String,
     },
 }
 #[derive(Subcommand)]
@@ -895,6 +982,48 @@ pub async fn run() -> Result<()> {
                 }
             }
 
+            Ok(())
+        }
+        Commands::PolyPublisherProve { k, a_i, p_i, a_next, h_i, coeffs, roots, block_len } => {
+            const MAX_DEG: usize = 8; const MAX_ROOTS: usize = 8;
+            let parse_u64s = |s: &str| -> Vec<u64> { s.split(',').filter(|x| !x.trim().is_empty()).filter_map(|x| x.trim().parse::<u64>().ok()).collect() };
+            let coeff_vals = parse_u64s(&coeffs);
+            let root_vals = parse_u64s(&roots);
+            if coeff_vals.len() > MAX_DEG + 1 || root_vals.len() > MAX_ROOTS { return Err(anyhow!("exceeds demo bounds")); }
+            let mut coeffs_fr = [Fr::ZERO; MAX_DEG + 1];
+            for (i, v) in coeff_vals.iter().enumerate() { coeffs_fr[i] = Fr::from(*v); }
+            let mut roots_fr = [Fr::ZERO; MAX_ROOTS];
+            for (i, v) in root_vals.iter().enumerate() { roots_fr[i] = Fr::from(*v); }
+            let mut flags = [false; MAX_ROOTS];
+            for i in 0..(block_len as usize).min(root_vals.len()).min(MAX_ROOTS) { flags[i] = true; }
+            let proof = prove_poly_publisher::<MAX_DEG, MAX_ROOTS>(k, Fr::from(a_i), Fr::from(p_i), Fr::from(a_next), Fr::from(h_i), block_len, coeffs_fr, roots_fr, flags)?;
+            println!("0x{}", hex::encode(proof));
+            Ok(())
+        }
+        Commands::PolyPublisherVerify { k, a_i, p_i, a_next, h_i, block_len, proof_hex } => {
+            let proof = hex::decode(proof_hex.trim_start_matches("0x"))?;
+            let ok = verify_poly_publisher(k, Fr::from(a_i), Fr::from(p_i), Fr::from(a_next), Fr::from(h_i), block_len, &proof)?;
+            println!("{}", if ok { "ok" } else { "fail" });
+            Ok(())
+        }
+        Commands::WalletStepProve { k, a_i, s_i, p_i, a_next, s_next, v, roots, flags, beta } => {
+            const MAX_ROOTS: usize = 8;
+            let parse_u64s = |s: &str| -> Vec<u64> { s.split(',').filter(|x| !x.trim().is_empty()).filter_map(|x| x.trim().parse::<u64>().ok()).collect() };
+            let root_vals = parse_u64s(&roots);
+            let flag_vals: Vec<u64> = parse_u64s(&flags);
+            if root_vals.len() > MAX_ROOTS || flag_vals.len() > MAX_ROOTS { return Err(anyhow!("exceeds demo bounds")); }
+            let mut roots_fr = [Fr::ZERO; MAX_ROOTS];
+            for (i, val) in root_vals.iter().enumerate() { roots_fr[i] = Fr::from(*val); }
+            let mut inc_flags = [false; MAX_ROOTS];
+            for (i, val) in flag_vals.iter().enumerate() { inc_flags[i] = (*val != 0); }
+            let proof = prove_wallet_step::<MAX_ROOTS>(k, Fr::from(a_i), Fr::from(s_i), Fr::from(p_i), Fr::from(a_next), Fr::from(s_next), Fr::from(v), roots_fr, inc_flags, Fr::from(beta))?;
+            println!("0x{}", hex::encode(proof));
+            Ok(())
+        }
+        Commands::WalletStepVerify { k, a_i, s_i, p_i, a_next, s_next, proof_hex } => {
+            let proof = hex::decode(proof_hex.trim_start_matches("0x"))?;
+            let ok = verify_wallet_step(k, Fr::from(a_i), Fr::from(s_i), Fr::from(p_i), Fr::from(a_next), Fr::from(s_next), &proof)?;
+            println!("{}", if ok { "ok" } else { "fail" });
             Ok(())
         }
     }

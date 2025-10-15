@@ -90,9 +90,17 @@ impl Default for SetAccumulator {
 impl SetAccumulator {
     /// Create a new empty accumulator
     pub fn new() -> Self {
+        // Compute empty root using domain-separated hash rather than zero
+        let empty_root = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"accum_set:empty:v1");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(h.finalize().as_bytes());
+            out
+        };
         Self {
             elements: BTreeSet::new(),
-            root: [0u8; 32],
+            root: empty_root,
         }
     }
 
@@ -219,7 +227,12 @@ fn hash_nodes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 /// Compute a Merkle root over the provided leaves. If odd, duplicate last.
 fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
-        return [0u8; 32];
+        // Return domain-separated empty root instead of zero
+        let mut h = blake3::Hasher::new();
+        h.update(b"accum_set:empty:v1");
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        return out;
     }
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
     while level.len() > 1 {
@@ -276,12 +289,14 @@ mod tests {
     #[test]
     fn test_set_accumulator() {
         let mut acc = SetAccumulator::new();
-        assert_eq!(acc.root(), [0u8; 32]);
+        // Empty accumulator should have a domain-separated empty root, not zero
+        let empty_root = acc.root();
+        assert_ne!(empty_root, [0u8; 32]);
         let e1 = [1u8; 32];
         let e2 = [2u8; 32];
         acc.insert(e1);
         let r1 = acc.root();
-        assert_ne!(r1, [0u8; 32]);
+        assert_ne!(r1, empty_root);
         acc.insert(e2);
         let r2 = acc.root();
         assert_ne!(r2, r1);

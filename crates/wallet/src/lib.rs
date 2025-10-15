@@ -40,6 +40,8 @@ use tachyon_common::HTTP_CLIENT;
 use accum_mmr::{MmrAccumulator, MmrWitness};
 use pcd_core::tachyon::{Tachystamp, Tachygram, Tachyaction, TachyAnchor, TachyOpKind};
 use circuits::RecursionCore as ProofRecursionCore;
+use circuits::wallet_step::{prove_wallet_step, verify_wallet_step};
+use pasta_curves::Fp as Fr;
 #[cfg(feature = "pcd")]
 use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, OwnerId as DexOwnerId, OrderId as DexOrderId, OrderBookSnapshot as DexSnapshot, Trade as DexTrade};
 use halo2_gadgets::poseidon::primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3};
@@ -52,7 +54,7 @@ use circuits::orchard::prove_spend_link;
 mod zcash;
 
 /// Wallet configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WalletConfig {
     /// Database path for encrypted storage
     pub db_path: String,
@@ -62,6 +64,17 @@ pub struct WalletConfig {
     pub network_config: NetworkConfig,
     /// Sync configuration
     pub sync_config: SyncConfig,
+}
+
+impl std::fmt::Debug for WalletConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletConfig")
+            .field("db_path", &self.db_path)
+            .field("master_password", &"<redacted>")
+            .field("network_config", &self.network_config)
+            .field("sync_config", &self.sync_config)
+            .finish()
+    }
 }
 
 impl Default for WalletConfig {
@@ -325,20 +338,6 @@ impl OutOfBandHandler {
             secret_key,
             pending_payments: HashMap::new(),
         })
-    }
-
-    /// Get our public key for OOB payments
-    pub fn public_key(&self, _database: &WalletDatabase) -> KyberPublicKey {
-        // Deprecated; kept for compatibility. Return a placeholder is unsafe.
-        // Use wallet.get_oob_public_key() instead. We still return a deterministic
-        // public key derived from the secret to avoid empty key usage paths.
-        // WARNING: For compatibility only; do not rely on this method in new code.
-        let sk_bytes = self.secret_key.as_bytes();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"oob_pk_compat");
-        hasher.update(sk_bytes);
-        let digest = hasher.finalize();
-        KyberPublicKey::new(digest.as_bytes().to_vec())
     }
 
     /// Add a pending OOB payment
@@ -1329,12 +1328,10 @@ impl TachyonWallet {
             pk
         } else {
             // Should not happen; fallback to ephemeral for continuity
-            let (pk, _sk) = SimpleKem::generate_keypair().unwrap_or_else(|_| {
-                // If key generation fails, return a zero key (should never happen)
-                (KyberPublicKey::new(vec![0u8; pq_crypto::KYBER_PUBLIC_KEY_SIZE]),
-                 KyberSecretKey::new(vec![0u8; pq_crypto::KYBER_SECRET_KEY_SIZE]))
-            });
-            pk
+            // Return a zero key if generation fails (caller should check)
+            SimpleKem::generate_keypair()
+                .map(|(pk, _)| pk)
+                .unwrap_or_else(|_| KyberPublicKey::new(vec![0u8; 32]))
         }
     }
 
@@ -1417,7 +1414,7 @@ impl TachyonWallet {
                 // Fallback: uniform map from bytes if not canonical
                 use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:map:v1"); h.update(&cm); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64];
                 // XOF read from BLAKE3 should never fail with a fixed-size buffer
-                xof.read_exact(&mut wide).expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+                let _ = xof.read_exact(&mut wide);
                 Fr::from_uniform_bytes(&wide)
             })
         };
@@ -1427,7 +1424,7 @@ impl TachyonWallet {
             Fr::from_repr(repr).unwrap_or_else(|| {
                 use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:nf:rho:v1"); h.update(&rho32); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64];
                 // XOF read from BLAKE3 should never fail with a fixed-size buffer
-                xof.read_exact(&mut wide).expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+                let _ = xof.read_exact(&mut wide);
                 Fr::from_uniform_bytes(&wide)
             })
         };
@@ -1476,7 +1473,7 @@ impl TachyonWallet {
                 let pk_f = {
                     use std::io::Read as _; let mut h = blake3::Hasher::new(); h.update(b"orch:pk:map:v1"); h.update(&n.recipient); let mut xof = h.finalize_xof(); let mut wide = [0u8; 64];
                     // XOF read from BLAKE3 should never fail with a fixed-size buffer
-                    xof.read_exact(&mut wide).expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+                    let _ = xof.read_exact(&mut wide);
                     Fr::from_uniform_bytes(&wide)
                 };
                 let val_f = Fr::from(n.value);
@@ -1642,7 +1639,7 @@ impl TachyonWallet {
             hasher.update(b"wallet:uniform_fr:v1");
             hasher.update(src);
             let mut wide = [0u8; 64];
-            hasher.finalize_xof().read_exact(&mut wide).expect("xof read");
+            let _ = hasher.finalize_xof().read_exact(&mut wide);
             let fr = Fr::from_uniform_bytes(&wide);
             let mut out = [0u8; 32];
             out.copy_from_slice(fr.to_repr().as_ref());

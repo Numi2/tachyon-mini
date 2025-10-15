@@ -197,6 +197,7 @@ impl MmrProof {
             });
         }
 
+        // MMR proofs must have at least one peak
         acc.unwrap_or_else(|| Hash::from([0u8; 32]))
     }
 }
@@ -557,7 +558,7 @@ impl MmrWitness {
 
         match acc {
             Some(root) => root == *mmr_root,
-            None => Hash::from([0u8; 32]) == *mmr_root,
+            None => return false, // Empty witness cannot be valid
         }
     }
 

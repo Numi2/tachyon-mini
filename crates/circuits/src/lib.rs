@@ -30,12 +30,13 @@ use ragu::circuit as ragu_circuit;
 use ragu::circuit::Sink;
 use ragu::drivers::compute_public_inputs;
 use ragu::maybe as ragu_maybe;
-// use ragu::maybe::Maybe as _; // unused import
 mod sparse_merkle;
 pub mod tachy;
 pub mod orchard;
 pub mod recursion;
 pub mod unified_block;
+pub mod pcs;
+pub mod wallet_step;
 
 // Re-export selected helpers for external consumers (e.g., CLI)
 pub use crate::tachy::compute_tachy_digest;
@@ -166,9 +167,8 @@ pub fn compute_transition_digest_bytes(
         hasher.update(bytes);
         let mut xof = hasher.finalize_xof();
         let mut wide = [0u8; 64];
-        // XOF read from BLAKE3 should never fail with a fixed-size buffer
-        xof.read_exact(&mut wide)
-            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+        // XOF read from BLAKE3 with a fixed-size buffer is infallible
+        let _ = xof.read_exact(&mut wide);
         Fr::from_uniform_bytes(&wide)
     }
     let prev_fr = to_fr(prev_state);
@@ -326,8 +326,7 @@ pub fn compute_state_commitment(components: &[Fr]) -> Fr {
         let mut xof = h.finalize_xof();
         let mut wide = [0u8; 64];
         // XOF read from BLAKE3 should never fail with a fixed-size buffer
-        xof.read_exact(&mut wide)
-            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+        let _ = xof.read_exact(&mut wide);
         Fr::from_uniform_bytes(&wide)
     }
 }
@@ -916,13 +915,13 @@ impl PcdCore {
 
     /// Validate PCD circuit security
     pub fn validate_circuit_security(&self) -> Result<()> {
-        println!("PCD circuit security validation passed (demo mode)");
+        tracing::info!("PCD circuit security validation passed (demo mode)");
         Ok(())
     }
 
     /// Optimize circuit for production performance
     pub fn optimize_for_production(&self) -> Result<()> {
-        println!("Circuit optimization completed for production (demo mode)");
+        tracing::info!("Circuit optimization completed for production (demo mode)");
         Ok(())
     }
 
@@ -945,10 +944,8 @@ impl PcdCore {
             hasher.update(bytes);
             let mut xof = hasher.finalize_xof();
             let mut wide = [0u8; 64];
-            // XOF read from BLAKE3 should never fail with a fixed-size buffer
-            if xof.read_exact(&mut wide).is_err() {
-                wide = [0u8; 64];
-            }
+            // XOF read from BLAKE3 with a fixed-size buffer is infallible
+            let _ = xof.read_exact(&mut wide);
             Fr::from_uniform_bytes(&wide)
         }
 
@@ -1111,8 +1108,7 @@ impl RecursionCore {
         let mut xof = hasher.finalize_xof();
         let mut wide = [0u8; 64];
         // XOF read from BLAKE3 should never fail with a fixed-size buffer
-        xof.read_exact(&mut wide)
-            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+        let _ = xof.read_exact(&mut wide);
         Fr::from_uniform_bytes(&wide)
     }
 
@@ -1233,8 +1229,7 @@ impl RecursionCore {
         let mut xof = hasher.finalize_xof();
         let mut wide = [0u8; 64];
         // XOF read from BLAKE3 should never fail with a fixed-size buffer
-        xof.read_exact(&mut wide)
-            .expect("BLAKE3 XOF read_exact should never fail with fixed-size buffer");
+        let _ = xof.read_exact(&mut wide);
         Fr::from_uniform_bytes(&wide)
             });
         }
@@ -1790,9 +1785,9 @@ pub mod performance {
             let verification_time = start.elapsed();
             self.verification_times.push(verification_time);
 
-            println!("Performance benchmarks completed:");
-            println!("  Proving time: {:?}", proving_time);
-            println!("  Verification time: {:?}", verification_time);
+            tracing::info!("Performance benchmarks completed:");
+            tracing::info!("  Proving time: {:?}", proving_time);
+            tracing::info!("  Verification time: {:?}", verification_time);
 
             Ok(())
         }
@@ -1904,10 +1899,8 @@ pub fn aggregate_orchard_actions(proofs: &[Vec<u8>]) -> Result<Vec<u8>> {
         h.update(p);
         let mut xof = h.finalize_xof();
         let mut wide = [0u8; 64];
-        // XOF read from BLAKE3 should never fail with a fixed-size buffer
-        if xof.read_exact(&mut wide).is_err() {
-            wide = [0u8; 64];
-        }
+        // XOF read from BLAKE3 with a fixed-size buffer is infallible
+        let _ = xof.read_exact(&mut wide);
         let it_fr = Fr::from_uniform_bytes(&wide);
         acc = poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
             .hash([tag, acc, it_fr]);

@@ -12,6 +12,8 @@ use blake3::Hash;
 use net_iroh::{TachyonNetwork, BlobKind};
 use bytes::Bytes;
 use circuits::{PcdCore as Halo2PcdCore, compute_transition_digest_bytes};
+use circuits::unified_block::{prove_poly_publisher, verify_poly_publisher};
+use pasta_curves::Fp as Fr;
 use circuits::orchard::SpendLinkCore;
 use pcd_core::tachyon::{Tachystamp, Tachygram, TachyAnchor, Tachyaction};
 use pq_crypto::SuiteB;
@@ -642,10 +644,50 @@ impl TachyonNode {
         for d in &smt_ops { smt.apply_delta(d.clone())?; }
         let new_smt_root = smt.root();
 
-        // Compute commit and Halo2 proof
+        // Compute commit and Halo2 proof (transition)
         let commit = compute_transition_digest_bytes(&prev_digest, &new_mmr_root, &new_smt_root, block.height);
         let halo2 = Halo2PcdCore::load_or_setup(std::path::Path::new("crates/node_ext/node_data/keys"), 12)?;
         let block_proof = halo2.prove_transition(&prev_digest, &commit, &new_mmr_root, &new_smt_root, block.height)?;
+
+        // Polynomial publisher: derive roots from union of grams (commitments then nullifiers), sorted/dedup for nullifiers only
+        let mut roots_fr: Vec<Fr> = Vec::new();
+        for cm in &ordered_outputs {
+            if let Some(f) = Option::<Fr>::from(Fr::from_repr(*cm)) { roots_fr.push(f); }
+        }
+        for nf in &ordered_nullifiers {
+            if let Some(f) = Option::<Fr>::from(Fr::from_repr(*nf)) { roots_fr.push(f); }
+        }
+        // Degree bound: choose small demo bound
+        const MAX_DEG: usize = 8; // demo
+        const MAX_ROOTS: usize = 8;
+        roots_fr.truncate(MAX_ROOTS);
+        let mut roots_arr = [Fr::ZERO; MAX_ROOTS];
+        for (i, v) in roots_fr.iter().enumerate() { roots_arr[i] = *v; }
+        let inc_flags = {
+            let mut f = [false; MAX_ROOTS];
+            for i in 0..roots_fr.len().min(MAX_ROOTS) { f[i] = true; }
+            f
+        };
+        // Build naive coefficients c_0..c_d for p(X)=∏(X-a_j) with d = L
+        let l = roots_fr.len();
+        let mut coeffs = vec![Fr::ZERO; l + 1];
+        coeffs[l] = Fr::ONE; // monic
+        for a in roots_fr.iter() {
+            // multiply by (X - a)
+            for k in (1..=l).rev() { coeffs[k - 1] = coeffs[k - 1] - coeffs[k] * *a; }
+        }
+        // Pad/resize to MAX_DEG+1
+        let mut coeffs_arr = [Fr::ZERO; MAX_DEG + 1];
+        let copy_len = (l + 1).min(MAX_DEG + 1);
+        for i in 0..copy_len { coeffs_arr[i] = coeffs[i]; }
+
+        // Placeholder digests for A_i, P_i, A_{i+1}: reuse transition digest mapping for simplicity
+        let a_i_fr = Option::<Fr>::from(Fr::from_repr(prev_digest)).unwrap_or(Fr::ZERO);
+        let p_i_fr = Option::<Fr>::from(Fr::from_repr(commit)).unwrap_or(Fr::ZERO);
+        let a_next_fr = Option::<Fr>::from(Fr::from_repr(commit)).unwrap_or(Fr::ZERO);
+        let h_i_fr = Fr::from(0xABu64);
+        let block_len = roots_fr.len() as u64;
+        let _pub_proof = prove_poly_publisher::<MAX_DEG, MAX_ROOTS>(12, a_i_fr, p_i_fr, a_next_fr, h_i_fr, block_len, coeffs_arr, roots_arr, inc_flags)?;
 
         let header = BlockHeader {
             prev_hash: block.previous_hash,
@@ -1118,11 +1160,15 @@ impl TachyonNode {
         let journals_dir = std::path::Path::new(&self.config.network_config.data_dir).join("journals");
         let _ = async_fs::create_dir_all(&journals_dir).await;
         let journal_path = journals_dir.join(format!("journal_{}.bin", block.height));
-        let journal_blob = bincode::serialize(&(mmr_bytes.as_slice(), smt_bytes.as_slice())).unwrap_or_default();
-        let _ = async_fs::write(&journal_path, &journal_blob).await;
-        {
-            let mut s = self.state.write().unwrap();
+        let journal_blob = bincode::serialize(&(mmr_bytes.as_slice(), smt_bytes.as_slice()))
+            .map_err(|e| anyhow!("failed to serialize journal: {}", e))?;
+        async_fs::write(&journal_path, &journal_blob)
+            .await
+            .map_err(|e| anyhow!("failed to write journal {:?}: {}", journal_path, e))?;
+        if let Ok(mut s) = self.state.write() {
             s.storage_size = s.storage_size.saturating_add(journal_blob.len() as u64);
+        } else {
+            tracing::error!("Failed to acquire write lock to update storage_size after journaling");
         }
 
         // Publish deltas so OSS and wallets can consume block updates
@@ -1580,8 +1626,11 @@ impl Block {
             transactions,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+                .map(|d| d.as_secs())
+                .unwrap_or_else(|_| {
+                    tracing::warn!("SystemTime before UNIX_EPOCH; using 0");
+                    0
+                }),
         }
     }
 }
