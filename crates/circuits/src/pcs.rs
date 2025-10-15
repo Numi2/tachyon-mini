@@ -3,11 +3,12 @@
 //! This module provides host-side generator derivation and in-circuit
 //! scalar-field utilities needed by the polynomial publisher circuit.
 
-use ff::Field;
+use ff::{Field, FromUniformBytes};
 use halo2_gadgets::poseidon::primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3};
 use pasta_curves::{
     pallas::{Affine as PallasAffine, Scalar as PallasScalar},
     Fq as Fr, // Circuit scalar field (Vesta field)
+    group::Curve,
 };
 
 /// Domain tags (v1)
@@ -36,7 +37,6 @@ pub mod domains {
 /// and multiplying the canonical Pallas generator.
 pub fn derive_pedersen_generators(count: usize, domain_sep: &[u8]) -> Vec<PallasAffine> {
     use blake3::Hasher;
-    use group::Curve;
     let base = PallasAffine::generator();
     let mut out = Vec::with_capacity(count);
     for idx in 0..count {
@@ -48,9 +48,8 @@ pub fn derive_pedersen_generators(count: usize, domain_sep: &[u8]) -> Vec<Pallas
         // Map 32 bytes uniformly to a scalar
         let mut wide = [0u8; 64];
         {
-            let mut xof = Hasher::new_derive_key("tachyon-mini:pcs:wide").finalize_xof();
-            // Use the digest as seed material; we simply copy it into the first 32 bytes
-            // and leave the rest zero for deterministic but non-cryptographic expansion.
+            let _xof = Hasher::new_derive_key("tachyon-mini:pcs:wide").finalize_xof();
+            // Use the digest as seed material; copy into the first 32 bytes; ignore XOF output.
             wide[..32].copy_from_slice(digest.as_bytes());
         }
         let s = PallasScalar::from_uniform_bytes(&wide);

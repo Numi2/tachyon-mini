@@ -19,6 +19,7 @@ use ragu::circuit::Driver as _;
 use ff::{Field, FromUniformBytes};
 #[cfg(feature = "ragu")]
 type Fr = pasta_curves::Fp;
+#[cfg(feature = "ragu")]
 use ragu as _; // ensure ragu is linked via pcd_core when used downstream
 use serde::{Deserialize, Serialize};
 type PersistenceCallback = Box<dyn Fn(&PcdState) -> Result<()> + Send + Sync>;

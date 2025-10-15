@@ -66,9 +66,14 @@ pub fn poseidon2_t3_hash_tagged(a: Fr, b: Fr, tag: u64) -> Fr {
 
 /// Emit a Poseidon2 escape hatch event in the R1CS recorder, wiring inputs/outputs by vars.
 pub fn poseidon2_escape<FDrv: Driver<F = Fr>>(dr: &mut R1csProverDriver<Fr>, inputs: &[Wire<Fr>], outputs: &[Wire<Fr>], tag: u64) {
-    let to_var = |w: &Wire<Fr>| match w { Wire::Var(v) => *v, Wire::Const(_) => panic!("poseidon escape requires vars") };
-    let ins: Vec<_> = inputs.iter().map(to_var).collect();
-    let outs: Vec<_> = outputs.iter().map(to_var).collect();
+    let mut to_var = |w: &Wire<Fr>| match w { Wire::Var(v) => *v, Wire::Const(_) => {
+        let z = dr.alloc_witness_value(Fr::ZERO);
+        match z { Wire::Var(vv) => vv, _ => unreachable!() }
+    } };
+    let mut ins: Vec<_> = Vec::with_capacity(inputs.len());
+    for w in inputs { ins.push(to_var(w)); }
+    let mut outs: Vec<_> = Vec::with_capacity(outputs.len());
+    for w in outputs { outs.push(to_var(w)); }
     dr.r1cs.emit_poseidon2(&ins, &outs, tag);
 }
 

@@ -16,7 +16,6 @@ ff = "0.13"
 rand.workspace = true
 halo2curves = "0.6"
 pasta_curves.workspace = true
-ragu.path = "../ragu"
 serde_json = "1"
 tracing.workspace = true
 

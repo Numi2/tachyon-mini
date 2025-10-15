@@ -771,11 +771,11 @@ dependencies = [
  "halo2curves",
  "pasta_curves",
  "plotters",
- "ragu",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

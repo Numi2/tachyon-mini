@@ -46,7 +46,7 @@ iroh-blobs = "0.92.0"
 ## Note: crate-specific optional deps (e.g., zebra-chain, equihash) are declared in their crates
 
 # Zero-knowledge proofs
-halo2_proofs = "0.3"
+halo2_proofs = { version = "0.3", features = ["beta"] }
 halo2_gadgets = "0.3"
 
 # Cryptography

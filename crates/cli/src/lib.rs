@@ -1661,14 +1661,14 @@ async fn execute_params_command(command: ParamsCommands) -> Result<()> {
     match command {
         ParamsCommands::Gen { out, k } => {
             // Generate IPA params for Pasta and write to file
-            let params = halo2_proofs::poly::ipa::commitment::ParamsIPA::<pasta_curves::vesta::Affine>::new(k);
+            let params = halo2_proofs::ParamsIPA::<pasta_curves::vesta::Affine>::new(k);
             let mut f = std::fs::File::create(&out)?;
             params.write(&mut f)?;
             println!("ok: wrote SRS params (k={}) to {}", k, out);
         }
         ParamsCommands::Info { file } => {
             let mut f = std::fs::File::open(&file)?;
-            let _params = halo2_proofs::poly::ipa::commitment::ParamsIPA::<pasta_curves::vesta::Affine>::read(&mut f)?;
+            let _params = halo2_proofs::ParamsIPA::<pasta_curves::vesta::Affine>::read(&mut f)?;
             println!("SRS: loaded from {} (size: {} bytes)", file, f.metadata()?.len());
         }
     }

@@ -1374,13 +1374,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_database_creation() {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn test_database_creation() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
         let db_path = temp_dir.path().join("wallet_db");
 
         let db = WalletDatabase::new(&db_path, "test_password")
-            .await
-            .unwrap();
+            .await?;
         let stats = db.get_stats().await;
 
         assert_eq!(stats.total_notes, 0);
@@ -1388,25 +1387,25 @@ mod tests {
         assert_eq!(stats.spent_notes, 0);
         assert!(!stats.has_pcd_state);
         assert_eq!(stats.witness_count, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_note_operations() {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn test_note_operations() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
         let db_path = temp_dir.path().join("wallet_db");
         let db = WalletDatabase::new(&db_path, "test_password")
-            .await
-            .unwrap();
+            .await?;
 
         let commitment = [1u8; NOTE_COMMITMENT_SIZE];
         let note_data = b"test note data";
-        let note = EncryptedNote::new(0, 100, note_data, &db.master_key).unwrap();
+        let note = EncryptedNote::new(0, 100, note_data, &db.master_key)?;
 
         // Add note
-        db.add_note(commitment, note.clone()).await.unwrap();
+        db.add_note(commitment, note.clone()).await?;
 
         // Retrieve note
-        let retrieved_note = db.get_note(&commitment).await.unwrap();
+        let retrieved_note = db.get_note(&commitment).await.ok_or_else(|| anyhow::anyhow!("note not found"))?;
         assert_eq!(retrieved_note.position, note.position);
         assert_eq!(retrieved_note.block_height, note.block_height);
 
@@ -1420,77 +1419,77 @@ mod tests {
 
         // Mark as spent
         db.update_note_spent_status(&commitment, true)
-            .await
-            .unwrap();
+            .await?;
         let unspent_notes = db.list_unspent_notes().await;
         assert_eq!(unspent_notes.len(), 0);
 
         // Delete note
-        db.delete_note(&commitment).await.unwrap();
+        db.delete_note(&commitment).await?;
         let notes = db.list_notes().await;
         assert_eq!(notes.len(), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pcd_state() {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn test_pcd_state() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
         let db_path = temp_dir.path().join("wallet_db");
         let db = WalletDatabase::new(&db_path, "test_password")
-            .await
-            .unwrap();
+            .await?;
 
         let state_commitment = [2u8; 32];
         let state_data = b"test pcd state";
         let proof = b"test proof".to_vec();
 
         let pcd_state =
-            PcdStateRecord::new(200, state_commitment, state_data, proof, &db.master_key).unwrap();
+            PcdStateRecord::new(200, state_commitment, state_data, proof, &db.master_key)?;
 
         // Set PCD state
-        db.set_pcd_state(pcd_state.clone()).await.unwrap();
+        db.set_pcd_state(pcd_state.clone()).await?;
 
         // Retrieve PCD state
-        let retrieved_state = db.get_pcd_state().await.unwrap();
+        let retrieved_state = db.get_pcd_state().await.ok_or_else(|| anyhow::anyhow!("pcd state not found"))?;
         assert_eq!(retrieved_state.anchor_height, pcd_state.anchor_height);
         assert_eq!(retrieved_state.state_commitment, pcd_state.state_commitment);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_witness_operations() {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn test_witness_operations() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
         let db_path = temp_dir.path().join("wallet_db");
         let db = WalletDatabase::new(&db_path, "test_password")
-            .await
-            .unwrap();
+            .await?;
 
         let witness_data = b"test witness data";
-        let witness = WitnessRecord::new(42, witness_data, &db.master_key).unwrap();
+        let witness = WitnessRecord::new(42, witness_data, &db.master_key)?;
 
         // Add witness
-        db.upsert_witness(42, witness.clone()).await.unwrap();
+        db.upsert_witness(42, witness.clone()).await?;
 
         // Retrieve witness
-        let retrieved_witness = db.get_witness(42).await.unwrap();
+        let retrieved_witness = db.get_witness(42).await.ok_or_else(|| anyhow::anyhow!("witness not found"))?;
         assert_eq!(retrieved_witness.position, witness.position);
 
         // List witnesses
         let witnesses = db.list_witnesses().await;
         assert_eq!(witnesses.len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_encryption_decryption() {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn test_encryption_decryption() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
         let db_path = temp_dir.path().join("wallet_db");
         let db = WalletDatabase::new(&db_path, "test_password")
-            .await
-            .unwrap();
+            .await?;
 
         let note_data = b"sensitive note data";
-        let note = EncryptedNote::new(0, 100, note_data, &db.master_key).unwrap();
+        let note = EncryptedNote::new(0, 100, note_data, &db.master_key)?;
 
         // Decrypt the note
-        let decrypted_data = note.decrypt(&db.master_key).unwrap();
+        let decrypted_data = note.decrypt(&db.master_key)?;
         assert_eq!(note_data.to_vec(), decrypted_data);
+        Ok(())
     }
 }

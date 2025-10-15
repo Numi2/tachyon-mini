@@ -558,7 +558,7 @@ impl MmrWitness {
 
         match acc {
             Some(root) => root == *mmr_root,
-            None => return false, // Empty witness cannot be valid
+            None => false, // Empty witness cannot be valid
         }
     }
 
@@ -804,34 +804,35 @@ mod tests {
     }
 
     #[test]
-    fn test_mmr_proof_verify_and_root() {
+    fn test_mmr_proof_verify_and_root() -> anyhow::Result<()> {
         let mut mmr = MmrAccumulator::new();
         let h1 = Hash::from([1u8; 32]);
         let h2 = Hash::from([2u8; 32]);
         let h3 = Hash::from([3u8; 32]);
-        let p1 = mmr.append(h1).unwrap();
-        let _p2 = mmr.append(h2).unwrap();
-        let _p3 = mmr.append(h3).unwrap();
-        let root = mmr.root().unwrap();
+        let p1 = mmr.append(h1)?;
+        let _p2 = mmr.append(h2)?;
+        let _p3 = mmr.append(h3)?;
+        let root = mmr.root().ok_or_else(|| anyhow!("no root"))?;
 
-        let proof1 = mmr.prove(p1).unwrap();
+        let proof1 = mmr.prove(p1)?;
         assert!(proof1.verify(&root));
         assert_eq!(proof1.calculate_root(), root);
+        Ok(())
     }
 
     #[test]
-    fn test_mmr_witness_verify_matches_proof() {
+    fn test_mmr_witness_verify_matches_proof() -> anyhow::Result<()> {
         // Build a small MMR and produce a proof for a leaf
         let mut mmr = MmrAccumulator::new();
         let h1 = Hash::from([1u8; 32]);
         let h2 = Hash::from([2u8; 32]);
         let h3 = Hash::from([3u8; 32]);
-        let p1 = mmr.append(h1).unwrap();
-        let _p2 = mmr.append(h2).unwrap();
-        let _p3 = mmr.append(h3).unwrap();
-        let root = mmr.root().unwrap();
+        let p1 = mmr.append(h1)?;
+        let _p2 = mmr.append(h2)?;
+        let _p3 = mmr.append(h3)?;
+        let root = mmr.root().ok_or_else(|| anyhow!("no root"))?;
 
-        let proof = mmr.prove(p1).unwrap();
+        let proof = mmr.prove(p1)?;
 
         // Convert MmrProof into a MmrWitness view
         let mut witness = MmrWitness {
@@ -857,33 +858,36 @@ mod tests {
         witness.update(&new_peaks);
 
         assert!(witness.verify(&h1, &root));
+        Ok(())
     }
 
     #[test]
-    fn test_mmr_persistence_roundtrip() {
+    fn test_mmr_persistence_roundtrip() -> anyhow::Result<()> {
         let mut mmr = MmrAccumulator::new();
         let h1 = Hash::from([10u8; 32]);
         let h2 = Hash::from([11u8; 32]);
-        let _ = mmr.append(h1).unwrap();
-        let _ = mmr.append(h2).unwrap();
-        let root_before = mmr.root().unwrap();
+        let _ = mmr.append(h1)?;
+        let _ = mmr.append(h2)?;
+        let root_before = mmr.root().ok_or_else(|| anyhow!("no root"))?;
 
         let mut storage = InMemoryMmrStorage::default();
         mmr.persist_to(&mut storage);
-        let loaded = MmrAccumulator::load_from(&storage).unwrap();
+        let loaded = MmrAccumulator::load_from(&storage)?;
         assert_eq!(loaded.size(), mmr.size());
         assert_eq!(loaded.peaks(), mmr.peaks());
-        assert_eq!(loaded.root().unwrap(), root_before);
+        assert_eq!(loaded.root().ok_or_else(|| anyhow!("no root"))?, root_before);
+        Ok(())
     }
 
     #[test]
-    fn test_tachygram_insert_and_prove() {
+    fn test_tachygram_insert_and_prove() -> anyhow::Result<()> {
         let mut tg = TachygramAccumulator::new();
         let e1 = [1u8; 32];
         let e2 = [2u8; 32];
-        tg.batch_insert(&[e1, e2]).unwrap();
-        let root = tg.root().unwrap();
-        let proof = tg.prove(&e1).unwrap();
+        tg.batch_insert(&[e1, e2])?;
+        let root = tg.root().ok_or_else(|| anyhow!("no root"))?;
+        let proof = tg.prove(&e1)?;
         assert!(proof.verify(&root));
+        Ok(())
     }
 }

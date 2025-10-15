@@ -5,7 +5,8 @@ use anyhow::Result;
 use ff::Field;
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, keygen_pk, keygen_vk, create_proof, verify_proof, SingleVerifier};
-use halo2_proofs::poly::ipa::commitment::{ParamsIPA, IPACommitmentScheme};
+use halo2_proofs::poly::Rotation;
+use halo2_proofs::{ParamsIPA, IPACommitmentScheme};
 use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
 use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
@@ -200,19 +201,19 @@ pub struct PolyPublisherConfig {
 /// Circuit that checks p_i(r) (from coeffs) equals ∏(r − a_{ij}) over the first L roots,
 /// where L = block_len, with prefix-of-ones selector flags. It also binds h_i = H_A(A_i, P_i).
 #[derive(Clone, Debug)]
-pub struct PolyPublisherCircuit<const MAX_DEG: usize, const MAX_ROOTS: usize> {
+pub struct PolyPublisherCircuit<const MAX_COEFFS: usize, const MAX_ROOTS: usize> {
     pub a_i: Value<Fr>,        // public
     pub p_i: Value<Fr>,        // public (digest placeholder)
     pub a_next: Value<Fr>,     // public (digest placeholder)
     pub h_i: Value<Fr>,        // public
     pub block_len: Value<Fr>,  // public
 
-    pub coeffs: [Value<Fr>; MAX_DEG + 1],
+    pub coeffs: [Value<Fr>; MAX_COEFFS],
     pub roots: [Value<Fr>; MAX_ROOTS],
     pub inc_flags: [Value<Fr>; MAX_ROOTS], // 0/1 flags, prefix-of-ones shape
 }
 
-impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisherCircuit<MAX_DEG, MAX_ROOTS> {
+impl<const MAX_COEFFS: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisherCircuit<MAX_COEFFS, MAX_ROOTS> {
     type Config = PolyPublisherConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -223,7 +224,7 @@ impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisher
             a_next: Value::unknown(),
             h_i: Value::unknown(),
             block_len: Value::unknown(),
-            coeffs: [Value::unknown(); MAX_DEG + 1],
+            coeffs: [Value::unknown(); MAX_COEFFS],
             roots: [Value::unknown(); MAX_ROOTS],
             inc_flags: [Value::unknown(); MAX_ROOTS],
         }
@@ -540,19 +541,19 @@ impl<const MAX_DEG: usize, const MAX_ROOTS: usize> Circuit<Fr> for PolyPublisher
 }
 
 /// Prove a polynomial publisher instance. Returns proof bytes.
-pub fn prove_poly_publisher<const MAX_DEG: usize, const MAX_ROOTS: usize>(
+pub fn prove_poly_publisher<const MAX_COEFFS: usize, const MAX_ROOTS: usize>(
     k: u32,
     a_i: Fr,
     p_i: Fr,
     a_next: Fr,
     h_i: Fr,
     block_len: u64,
-    coeffs: [Fr; MAX_DEG + 1],
+    coeffs: [Fr; MAX_COEFFS],
     roots: [Fr; MAX_ROOTS],
     inc_flags: [bool; MAX_ROOTS],
 ) -> Result<Vec<u8>> {
-    let params = load_or_setup_publisher_params::<MAX_DEG, MAX_ROOTS>(k)?;
-    let circuit = PolyPublisherCircuit::<MAX_DEG, MAX_ROOTS> {
+    let params = load_or_setup_publisher_params::<MAX_COEFFS, MAX_ROOTS>(k)?;
+    let circuit = PolyPublisherCircuit::<MAX_COEFFS, MAX_ROOTS> {
         a_i: Value::known(a_i),
         p_i: Value::known(p_i),
         a_next: Value::known(a_next),
@@ -594,9 +595,9 @@ pub fn verify_poly_publisher(
     proof: &[u8],
 ) -> Result<bool> {
     if proof.is_empty() { return Ok(false); }
-    let params = load_or_setup_publisher_params::<1, 1>(k)?;
+    let params = load_or_setup_publisher_params::<2, 1>(k)?;
     // Use empty shape of the same circuit to derive VK
-    let empty = PolyPublisherCircuit::<1, 1> {
+    let empty = PolyPublisherCircuit::<2, 1> {
         a_i: Value::unknown(),
         p_i: Value::unknown(),
         a_next: Value::unknown(),

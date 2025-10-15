@@ -15,9 +15,10 @@ use ff::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value, AssignedCell},
     plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, keygen_pk, keygen_vk, create_proof, VerifyingKey, ProvingKey},
-    poly::{ipa::commitment::{ParamsIPA, IPACommitmentScheme}, Rotation},
+    poly::Rotation,
     transcript::{Blake2bRead, Blake2bWrite, Challenge255},
 };
+use halo2_proofs::poly::ipa::commitment::{ParamsIPA, IPACommitmentScheme};
 use pasta_curves::{Fp as Fr, vesta::Affine as G1Affine};
 
 use crate::r1cs::{R1csRecorder, Var, LinearCombination};

@@ -415,6 +415,8 @@ pub mod poly;
 pub mod r1cs;
 pub mod gadgets;
 pub mod backend;
+#[cfg(feature = "halo2-backend")]
+#[cfg(feature = "halo2-backend")]
 pub mod backend_halo2;
 pub mod pcd;
 pub mod accum;

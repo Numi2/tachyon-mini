@@ -431,53 +431,7 @@ impl ObliviousSyncService {
         Ok(())
     }
 
-    /// Generate a delta bundle for the current state
-    #[allow(dead_code)]
-    fn generate_delta_bundle(current_state: &PcdState) -> Result<PcdDeltaBundle> {
-        // Use a real snapshot by deriving content from the state data and anchor height.
-        // 1) Commitments: append two deterministic leaves to the MMR using anchor-bound seeds.
-        let mut mmr_hashes = Vec::new();
-        for i in 0..2u32 {
-            let mut h = blake3::Hasher::new();
-            h.update(b"snapshot:mmr_leaf:v1");
-            h.update(&current_state.anchor_height.to_le_bytes());
-            h.update(&i.to_le_bytes());
-            h.update(&current_state.state_data);
-            mmr_hashes.push(SerializableHash(h.finalize()));
-        }
-        let mmr_deltas = vec![MmrDelta::BatchAppend { hashes: mmr_hashes }];
-        let mmr_delta = bincode::serialize(&mmr_deltas)?;
-
-        // 2) Nullifiers: derive blinded nullifiers from synthetic commitments+rseeds tied to state
-        let mut blinded_nullifiers: Vec<[u8; 32]> = Vec::new();
-        for i in 0..4u32 {
-            let mut hasher_c = blake3::Hasher::new();
-            hasher_c.update(b"snapshot:commitment:v1");
-            hasher_c.update(&current_state.anchor_height.to_le_bytes());
-            hasher_c.update(&i.to_le_bytes());
-            hasher_c.update(&current_state.state_data);
-            let mut commitment = [0u8; 32];
-            commitment.copy_from_slice(hasher_c.finalize().as_bytes());
-
-            let mut hasher_r = blake3::Hasher::new();
-            hasher_r.update(b"snapshot:rseed:v1");
-            hasher_r.update(&current_state.anchor_height.to_le_bytes());
-            hasher_r.update(&i.to_le_bytes());
-            hasher_r.update(&current_state.state_data);
-            let mut rseed = [0u8; 32];
-            rseed.copy_from_slice(hasher_r.finalize().as_bytes());
-
-            let nf = derive_nullifier(&commitment, &rseed, NullifierDerivationMode::Blinded);
-            blinded_nullifiers.push(nf);
-        }
-        let nf_delta = bincode::serialize(&SetDelta::BatchInsert { elements: blinded_nullifiers })?;
-
-        Ok(PcdDeltaBundle::new(
-            vec![mmr_delta],
-            vec![nf_delta],
-            (current_state.anchor_height, current_state.anchor_height + 1),
-        ))
-    }
+    // Removed unused `generate_delta_bundle` dead code.
 
     /// Generate PCD transition proof
     fn generate_pcd_transition(

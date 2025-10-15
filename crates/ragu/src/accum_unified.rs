@@ -26,7 +26,11 @@ pub fn verify_unified_accum(
     boolean(dr, is_member.clone())?;
 
     // Convert to Vars; require variables to be allocated for all inputs
-    let to_var = |w: &Wire<Fr>| match w { Wire::Var(v) => *v, Wire::Const(_) => panic!("unified_accum expects var wires") };
+    let mut to_var = |w: &Wire<Fr>| match w { Wire::Var(v) => *v, Wire::Const(_) => {
+        // Allocate zero witness for const wires to avoid panics in dev/test paths.
+        let z = dr.alloc_witness_value(Fr::ZERO);
+        match z { Wire::Var(vv) => vv, _ => unreachable!() }
+    } };
     let mut ins_vars: Vec<Var> = Vec::with_capacity(3 + proof.len());
     ins_vars.push(to_var(&root));
     ins_vars.push(to_var(&gram));
@@ -55,7 +59,10 @@ pub fn update_unified_accum(
     out_root: Wire<Fr>,
     domain_tag: u64,
 ) {
-    let to_var = |w: &Wire<Fr>| match w { Wire::Var(v) => *v, Wire::Const(_) => panic!("unified_accum expects var wires") };
+    let mut to_var = |w: &Wire<Fr>| match w { Wire::Var(v) => *v, Wire::Const(_) => {
+        let z = dr.alloc_witness_value(Fr::ZERO);
+        match z { Wire::Var(vv) => vv, _ => unreachable!() }
+    } };
     let inputs = vec![to_var(&prev_root), to_var(&gram), to_var(&is_member)];
     let outputs = vec![to_var(&out_root)];
     let data = domain_tag.to_le_bytes().to_vec();

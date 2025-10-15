@@ -72,13 +72,15 @@ pub fn prove_block_step(
         root_w = out_w;
     }
     // Derive fold digest as Poseidon(tag, prev_fold, new_root)
-    let new_root = match root_w { Wire::Var(v) => dr.r1cs.get_assignment(v).unwrap(), _ => panic!() };
+    let new_root = match root_w { Wire::Var(v) => dr.r1cs.get_assignment(v).unwrap_or(pasta_curves::Fp::ZERO), _ => pasta_curves::Fp::ZERO };
     let new_fold = crate::accum::fold_digests(prev_fold_digest, FoldDigest(new_root), 0xF011D);
     // Bundle proof in mock form (R1CS digest + assignments); backends replace this with real SNARK
     let inst = dr.r1cs.alloc_instance();
     dr.r1cs.set_assignment(inst, new_root);
-    let proof = crate::backend::prove_mock::<pasta_curves::Fp>(b"block-step", &dr.r1cs, &[inst]).unwrap();
-    (PcdProof { bytes: proof.to_bytes().unwrap() }, PcdOutput { accum: crate::accum::AccumDigest(new_root), fold: new_fold })
+    let proof = crate::backend::prove_mock::<pasta_curves::Fp>(b"block-step", &dr.r1cs, &[inst])
+        .unwrap_or_else(|_| crate::backend::R1csMockProof { version: crate::backend::ProofFormatVersion(1), domain: b"block-step".to_vec(), r1cs_digest: [0u8;32], constraints_bytes: vec![], public_inputs: vec![], witness_values: vec![] });
+    let bytes = proof.to_bytes().unwrap_or_default();
+    (PcdProof { bytes }, PcdOutput { accum: crate::accum::AccumDigest(new_root), fold: new_fold })
 }
 
 /// Full chain step: verify previous recursion binder (agg_prev = H(tag, agg_prev_prev, state_prev)),

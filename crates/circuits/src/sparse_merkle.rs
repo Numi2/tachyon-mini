@@ -17,17 +17,7 @@ pub struct SparseMerkleConfig {
     pub poseidon: Pow5Config<Fr, 3, 2>,
 }
 
-/// A single update/membership verification row.
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct SparseMerkleRow {
-    pub key: Value<Fr>,
-    pub leaf: Value<Fr>,
-    pub root_old: Value<Fr>,
-    pub root_new: Value<Fr>,
-    pub sibling: Value<Fr>,
-    pub direction: Value<Fr>, // 0 for left, 1 for right
-}
+// A single update/membership verification row.
 
 impl SparseMerkleConfig {
     pub fn configure(meta: &mut ConstraintSystem<Fr>) -> Self {
@@ -99,14 +89,12 @@ impl SparseMerkleConfig {
 
 /// A circuit that verifies a Merkle path of fixed DEPTH and exposes the resulting root.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct SmtPathConfig {
     pub smt: SparseMerkleConfig,
     pub instance_root: Column<Instance>,
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct SmtPathCircuit<const DEPTH: usize> {
     pub leaf: Value<Fr>,
     pub siblings: [Value<Fr>; DEPTH],

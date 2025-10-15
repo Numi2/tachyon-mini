@@ -45,7 +45,7 @@ use pasta_curves::Fp as Fr;
 #[cfg(feature = "pcd")]
 use dex::{DexService, Side as DexSide, Price as DexPrice, Quantity as DexQty, OwnerId as DexOwnerId, OrderId as DexOrderId, OrderBookSnapshot as DexSnapshot, Trade as DexTrade};
 use halo2_gadgets::poseidon::primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3};
-use pasta_curves::Fp as Fr;
+// duplicate import removed
 use ff::{PrimeField, FromUniformBytes};
 #[cfg(feature = "pcd")]
 use circuits::orchard::prove_spend_link;
@@ -1952,55 +1952,55 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_wallet_creation() {
+    async fn test_wallet_creation() -> anyhow::Result<()> {
         let config = WalletConfig::default();
-        let wallet = TachyonWallet::new(config).await.unwrap();
+        let wallet = TachyonWallet::new(config).await?;
 
-        let stats = wallet.get_stats().await.unwrap();
+        let stats = wallet.get_stats().await?;
         assert_eq!(stats.db_stats.total_notes, 0);
         assert_eq!(stats.pending_payments, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_wallet_initialization() {
+    async fn test_wallet_initialization() -> anyhow::Result<()> {
         #[cfg(not(feature = "pcd"))]
         {
             // If PCD is disabled, initialize() is a no-op and should not fail.
             let mut config = WalletConfig::default();
-            config.db_path = tempfile::tempdir()
-                .unwrap()
+            config.db_path = tempfile::tempdir()?
                 .path()
                 .join("test_wallet")
                 .to_string_lossy()
                 .to_string();
-            let mut wallet = TachyonWallet::new(config).await.unwrap();
-            wallet.initialize().await.unwrap();
-            return;
+            let mut wallet = TachyonWallet::new(config).await?;
+            wallet.initialize().await?;
+            return Ok(());
         }
         let mut config = WalletConfig::default();
-        config.db_path = tempfile::tempdir()
-            .unwrap()
+        config.db_path = tempfile::tempdir()?
             .path()
             .join("test_wallet")
             .to_string_lossy()
             .to_string();
 
-        let mut wallet = TachyonWallet::new(config).await.unwrap();
-        wallet.initialize().await.unwrap();
+        let mut wallet = TachyonWallet::new(config).await?;
+        wallet.initialize().await?;
 
         #[cfg(feature = "pcd")]
         {
             let pcd_state = wallet.get_pcd_state().await;
             assert!(pcd_state.is_some());
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_oob_payment() {
+    async fn test_oob_payment() -> anyhow::Result<()> {
         #[cfg(not(feature = "pcd"))]
-        return;
+        return Ok(());
         let config = WalletConfig::default();
-        let wallet = TachyonWallet::new(config).await.unwrap();
+        let wallet = TachyonWallet::new(config).await?;
 
         let recipient_pk = wallet.get_oob_public_key().await;
         let note_data = b"test note for payment".to_vec();
@@ -2009,20 +2009,21 @@ mod tests {
         let payment = wallet
             .create_oob_payment(recipient_pk, note_data.clone(), associated_data)
             .await
-            .unwrap();
-        payment.verify().unwrap();
+            ?;
+        payment.verify()?;
 
-        let payment_hash = wallet.receive_oob_payment(payment).await.unwrap();
+        let payment_hash = wallet.receive_oob_payment(payment).await?;
         assert_eq!(payment_hash.len(), 32);
 
-        let processed_note = wallet.process_oob_payment(&payment_hash).await.unwrap();
+        let processed_note = wallet.process_oob_payment(&payment_hash).await?;
         assert!(processed_note.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_transaction_building() {
+    async fn test_transaction_building() -> anyhow::Result<()> {
         let config = WalletConfig::default();
-        let wallet = TachyonWallet::new(config).await.unwrap();
+        let wallet = TachyonWallet::new(config).await?;
 
         let output_note = WalletNote {
             commitment: [1u8; NOTE_COMMITMENT_SIZE],
@@ -2039,8 +2040,9 @@ mod tests {
         let transaction = wallet
             .build_transaction(vec![], vec![output_note])
             .await
-            .unwrap();
+            ?;
         assert_eq!(transaction.outputs.len(), 1);
         assert_eq!(transaction.inputs.len(), 0);
+        Ok(())
     }
 }

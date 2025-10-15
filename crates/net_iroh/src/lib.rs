@@ -226,11 +226,11 @@ impl TachyonBlobStore {
     }
 }
 
-fn default_relay_url() -> iroh::RelayUrl {
+fn default_relay_url() -> Option<iroh::RelayUrl> {
     std::env::var("TACHYON_RELAY_URL")
         .ok()
         .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
-        .unwrap_or_else(|| DEFAULT_RELAY_URL.parse::<iroh::RelayUrl>().expect("invalid DEFAULT_RELAY_URL"))
+        .or_else(|| DEFAULT_RELAY_URL.parse::<iroh::RelayUrl>().ok())
 }
 
 /// High-level network interface
@@ -373,11 +373,12 @@ impl TachyonNetwork {
             while let Some((node_id, message)) = control_rx.recv().await {
                 // Record announce messages for later consumers
                 if let ControlMessage::Announce { kind, cid, height, size, ticket } = &message {
-                    let mut guard = recent_announcements_clone.write().unwrap();
-                    guard.push((kind.clone(), *cid, *height, *size, ticket.clone()));
-                    if guard.len() > 1000 {
-                        let drain_len = guard.len() - 1000;
-                        guard.drain(0..drain_len);
+                    if let Ok(mut guard) = recent_announcements_clone.write() {
+                        guard.push((kind.clone(), *cid, *height, *size, ticket.clone()));
+                        if guard.len() > 1000 {
+                            let drain_len = guard.len() - 1000;
+                            guard.drain(0..drain_len);
+                        }
                     }
                 }
                 Self::handle_control_message(
@@ -414,7 +415,9 @@ impl TachyonNetwork {
 
     /// Register a header provider to serve headers by height to peers
     pub fn set_header_provider(&self, provider: Arc<dyn HeaderProvider>) {
-        *self.header_provider.write().unwrap() = Some(provider);
+        if let Ok(mut w) = self.header_provider.write() {
+            *w = Some(provider);
+        }
     }
 
     /// Publish a blob to the network
@@ -438,7 +441,7 @@ impl TachyonNetwork {
         // Fall back to local ticket format if node address is not initialized
         let ticket = {
             let mut node_addr = self.endpoint.node_addr().initialized().await;
-            node_addr = node_addr.with_relay_url(default_relay_url());
+            if let Some(relay) = default_relay_url() { node_addr = node_addr.with_relay_url(relay); }
             let blob_ticket = BlobTicket::new(node_addr, cid, BlobFormat::Raw);
             blob_ticket.to_string()
         };
@@ -459,18 +462,18 @@ impl TachyonNetwork {
             .send((kind.clone(), cid, height, data.len(), ticket.clone()));
 
         // Record locally for components that prefer direct access
-        self.published
-            .write()
-            .unwrap()
-            .push((kind.clone(), data.to_vec(), height));
+        if let Ok(mut w) = self.published.write() {
+            w.push((kind.clone(), data.to_vec(), height));
+        }
 
         // Record in recent announcements as well
         {
-            let mut guard = self.recent_announcements.write().unwrap();
-            guard.push((kind.clone(), cid, height, data.len(), ticket.clone()));
-            if guard.len() > 1000 {
-                let drain_len = guard.len() - 1000;
-                guard.drain(0..drain_len);
+            if let Ok(mut guard) = self.recent_announcements.write() {
+                guard.push((kind.clone(), cid, height, data.len(), ticket.clone()));
+                if guard.len() > 1000 {
+                    let drain_len = guard.len() - 1000;
+                    guard.drain(0..drain_len);
+                }
             }
         }
 
@@ -480,7 +483,7 @@ impl TachyonNetwork {
 
     /// Return the currently connected peer IDs
     pub fn peers_connected(&self) -> Vec<NodeId> {
-        self.peers.read().unwrap().keys().cloned().collect()
+        self.peers.read().map(|g| g.keys().cloned().collect()).unwrap_or_default()
     }
 
     /// Request headers by height range from a specific peer and wait for the response
@@ -492,7 +495,7 @@ impl TachyonNetwork {
     ) -> Result<Vec<(u64, Vec<u8>)>> {
         let conn = {
             // Drop the lock before awaiting to satisfy clippy's await_holding_lock
-            let conn_opt = { self.peers.read().unwrap().get(&peer_id).cloned() };
+            let conn_opt = { self.peers.read().ok().and_then(|g| g.get(&peer_id).cloned()) };
             conn_opt.ok_or_else(|| anyhow!("not connected to requested peer"))?
         };
 
@@ -546,8 +549,7 @@ impl TachyonNetwork {
     pub async fn send_oob_to_peer(&self, peer_id: NodeId, hash: [u8; 32], payment: Vec<u8>) -> Result<()> {
         // First attempt to clone an existing connection without holding a lock across await
         let existing_conn = {
-            let guard = self.peers.read().unwrap();
-            guard.get(&peer_id).cloned()
+            self.peers.read().ok().and_then(|g| g.get(&peer_id).cloned())
         };
         if let Some(existing) = existing_conn {
             let (mut send, recv) = existing.open_bi().await?;
@@ -563,11 +565,13 @@ impl TachyonNetwork {
         }
 
         // Not connected: connect without holding the lock, then store
-        let node_addr = iroh::NodeAddr::new(peer_id).with_relay_url(default_relay_url());
+        let mut node_addr = iroh::NodeAddr::new(peer_id);
+        if let Some(relay) = default_relay_url() { node_addr = node_addr.with_relay_url(relay); }
         let conn = self.endpoint.connect(node_addr, CONTROL_ALPN).await?;
         {
-            let mut guard = self.peers.write().unwrap();
-            guard.insert(peer_id, conn.clone());
+            if let Ok(mut guard) = self.peers.write() {
+                guard.insert(peer_id, conn.clone());
+            }
         }
         let (mut send, recv) = conn.open_bi().await?;
         let req = ControlMessage::OobPayment { hash, payment };
@@ -583,12 +587,12 @@ impl TachyonNetwork {
 
     /// Return a snapshot of recently published blobs (kind, bytes, height)
     pub async fn get_published(&self) -> Vec<(BlobKind, Vec<u8>, u64)> {
-        self.published.read().unwrap().clone()
+        self.published.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Get a snapshot of recent announcements (kind, cid, height, size, ticket)
     pub fn get_recent_announcements(&self) -> Vec<(BlobKind, Cid, u64, usize, String)> {
-        self.recent_announcements.read().unwrap().clone()
+        self.recent_announcements.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Fetch a blob by CID
@@ -808,18 +812,20 @@ impl TachyonNetwork {
         let node_addr = if let Some(addr) = peer_addr {
             iroh::NodeAddr::new(peer_id).with_relay_url(addr.clone())
         } else {
-            iroh::NodeAddr::new(peer_id).with_relay_url(default_relay_url())
+            let mut na = iroh::NodeAddr::new(peer_id);
+            if let Some(relay) = default_relay_url() { na = na.with_relay_url(relay); }
+            na
         };
 
         let conn = self.endpoint.connect(node_addr, CONTROL_ALPN).await?;
-        self.peers.write().unwrap().insert(peer_id, conn);
+        self.peers.write().map_err(|_| anyhow!("peers lock poisoned"))?.insert(peer_id, conn);
         Ok(())
     }
 
     /// Broadcast a control message to all connected peers
     async fn broadcast_control_message(&self, message: ControlMessage) -> Result<()> {
         let encoded = bincode::serialize(&message).map_err(|e| anyhow!(e))?;
-        let peers = self.peers.read().unwrap().clone();
+        let peers = self.peers.read().map_err(|_| anyhow!("peers lock poisoned"))?.clone();
         for (peer_id, conn) in peers.into_iter() {
             match conn.open_bi().await {
                 Ok((mut send, _recv)) => {
@@ -939,11 +945,11 @@ impl ProtocolHandler for ControlProtocol {
                 Ok(id) => id,
                 Err(_) => return Ok(()),
             };
-            peers.write().unwrap().insert(node_id, conn.clone());
+            if let Ok(mut g) = peers.write() { g.insert(node_id, conn.clone()); }
             // If a control token is configured, require an Auth message before processing others
             let ctrl_token = std::env::var("TACHYON_CTRL_TOKEN").ok();
             if ctrl_token.is_some() {
-                auth_ok.write().unwrap().insert(node_id, false);
+                if let Ok(mut g) = auth_ok.write() { g.insert(node_id, false); }
             }
             // handle incoming streams
             while let Ok((mut send, recv)) = conn.accept_bi().await {
@@ -957,7 +963,7 @@ impl ProtocolHandler for ControlProtocol {
                             // Determine whether this is an auth message and update the map
                             let is_auth_msg = matches!(msg, ControlMessage::Auth { .. });
                             let authed_after_update: bool = {
-                                let mut authed_map = auth_ok.write().unwrap();
+                                let mut authed_map = match auth_ok.write() { Ok(g) => g, Err(_) => { continue; } };
                                 let entry = authed_map.entry(node_id).or_insert(false);
                                 if is_auth_msg {
                                     if let ControlMessage::Auth { token: provided } = &msg {
@@ -990,11 +996,15 @@ impl ProtocolHandler for ControlProtocol {
                         {
                             let rps: u32 = std::env::var("TACHYON_CTRL_RPS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
                             let burst: u32 = std::env::var("TACHYON_CTRL_BURST").ok().and_then(|s| s.parse().ok()).unwrap_or(rps.saturating_mul(2));
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            let now = match SystemTime::now().duration_since(UNIX_EPOCH) { Ok(d) => d.as_secs(), Err(_) => 0 };
                             let allow = {
-                                let mut map = buckets.write().unwrap();
-                                let entry = map.entry(node_id).or_insert(TokenBucket { tokens: burst, last_refill: now });
-                                TokenBucket::allow(now, entry, rps, burst)
+                                match buckets.write() {
+                                    Ok(mut map) => {
+                                        let entry = map.entry(node_id).or_insert(TokenBucket { tokens: burst, last_refill: now });
+                                        TokenBucket::allow(now, entry, rps, burst)
+                                    }
+                                    Err(_) => false,
+                                }
                             };
                             if !allow {
                                 // Drop silently when bucket empty
@@ -1004,19 +1014,18 @@ impl ProtocolHandler for ControlProtocol {
                                 match msg {
                                     ControlMessage::GetHeadersByHeight { start, count } => {
                                         // Prefer registered provider; fallback to published list
-                                        let provider_opt: Option<Arc<dyn HeaderProvider>> = {
-                                            header_provider.read().unwrap().clone()
-                                        };
+                                        let provider_opt: Option<Arc<dyn HeaderProvider>> = header_provider.read().ok().and_then(|hp| hp.clone());
                                         let headers_pairs: Vec<(u64, Vec<u8>)> = if let Some(provider) = provider_opt {
                                             provider.get_headers_by_height(start, count).await
                                         } else {
-                                            let mut headers: Vec<(u64, Vec<u8>)> = published
-                                                .read()
-                                                .unwrap()
-                                                .iter()
-                                                .filter(|(kind, _bytes, h)| *kind == BlobKind::Header && *h >= start)
-                                                .map(|(_k, bytes, h)| (*h, bytes.clone()))
-                                                .collect();
+                                            let mut headers: Vec<(u64, Vec<u8>)> = match published.read() {
+                                                Ok(p) => p
+                                                    .iter()
+                                                    .filter(|(kind, _bytes, h)| *kind == BlobKind::Header && *h >= start)
+                                                    .map(|(_k, bytes, h)| (*h, bytes.clone()))
+                                                    .collect(),
+                                                Err(_) => Vec::new(),
+                                            };
                                             headers.sort_by_key(|(h, _)| *h);
                                             headers.into_iter().take(count as usize).collect()
                                         };
@@ -1049,7 +1058,7 @@ impl ProtocolHandler for ControlProtocol {
                             }
                         }
             }
-            peers.write().unwrap().remove(&node_id);
+            if let Ok(mut g) = peers.write() { g.remove(&node_id); }
             Ok(())
         })
     }

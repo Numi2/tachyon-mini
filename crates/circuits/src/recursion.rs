@@ -8,7 +8,7 @@
 
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, keygen_pk, keygen_vk, create_proof, verify_proof, SingleVerifier};
-use halo2_proofs::poly::ipa::commitment::{ParamsIPA, IPACommitmentScheme};
+use halo2_proofs::{ParamsIPA, IPACommitmentScheme};
 use halo2_proofs::transcript::{Blake2bWrite, Blake2bRead, Challenge255};
 use pasta_curves::vesta::Affine as G1Affine;
 use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};

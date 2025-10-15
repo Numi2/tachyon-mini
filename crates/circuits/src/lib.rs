@@ -13,9 +13,10 @@ use halo2_proofs::{
         keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column, ConstraintSystem, Error,
         Fixed, Instance, ProvingKey, Selector, SingleVerifier, VerifyingKey,
     },
-    poly::{ipa::commitment::{ParamsIPA, IPACommitmentScheme}, Rotation},
     transcript::{Blake2bRead, Blake2bWrite, Challenge255},
+    ParamsIPA, IPACommitmentScheme,
 };
+use halo2_proofs::poly::Rotation;
 use pasta_curves::{Fp as Fr, vesta::Affine as G1Affine};
 use halo2_gadgets::poseidon::{
     primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3},
