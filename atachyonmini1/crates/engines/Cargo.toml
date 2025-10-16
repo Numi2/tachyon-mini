@@ -1,0 +1,20 @@
+[package]
+name = "engines"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+# External deps not yet in workspace deps
+bech32 = "0.9"
+url = "2.5"
+urlencoding = "2.1"
+ureq = { version = "2.9", features = ["json"] }
+base64 = "0.21"
+

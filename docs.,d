@@ -1,3 +1,0 @@
-	Recursive proof definition: each block or wallet state proof verifies the previous proof inside the circuit, so validation cost stays constant while proof depth grows.
-	
- both the global ledger and each wallet can be represented by a single, small, recursively updated proof that attests to complete history correctness and state validity while preserving full privacy.

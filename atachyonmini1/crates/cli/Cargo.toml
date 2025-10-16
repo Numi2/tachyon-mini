@@ -30,6 +30,7 @@ onramp_stripe = { path = "../onramp_stripe", optional = true }
 rand.workspace = true
 pasta_curves.workspace = true
 halo2_proofs.workspace = true
+engines = { path = "../engines" }
 
 [features]
 default = []

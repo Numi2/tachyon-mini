@@ -19,6 +19,9 @@ use pasta_curves::Fp as Fr;
 use tachyon_zk::tachyon as tachyon_api;
 use tachyon_zk::unified_block::{prove_poly_publisher, verify_poly_publisher};
 use tachyon_zk::wallet_step::{prove_wallet_step, verify_wallet_step};
+use engines::zebra_rpc::{ZebraRpcConfig, ZebraRpcEngine, sender_create_capability, recipient_finalize_capability};
+use engines::spend_builder::MySpendBuilder;
+use engines::status::InMemoryStatusDb;
 
 /// Tachyon CLI application
 #[derive(Parser)]
@@ -54,6 +57,11 @@ pub enum Commands {
     Wallet {
         #[command(subcommand)]
         wallet_command: WalletCommands,
+    },
+    /// Capability payments (Zebra RPC)
+    Cap {
+        #[command(subcommand)]
+        cap_command: CapCommands,
     },
     /// Zcash: Export backup to directory
     #[cfg(feature = "zcash")]
@@ -852,6 +860,7 @@ pub async fn run() -> Result<()> {
         Commands::Wallet { wallet_command } => {
             execute_wallet_command(wallet_command, &cli.data_dir).await
         }
+        Commands::Cap { cap_command } => execute_cap_command(cap_command).await,
         #[cfg(feature = "zcash")]
         Commands::ZcashUfvk { db_path, password, account } => {
             let mut cfg = WalletConfig::from_env();
@@ -1769,6 +1778,87 @@ async fn execute_network_command(command: NetworkCommands) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[derive(Subcommand)]
+pub enum CapCommands {
+    /// Create a capability URI by funding an ephemeral note
+    Create {
+        /// Zebra RPC URL (e.g. http://127.0.0.1:8232/)
+        #[arg(long, default_value = "http://127.0.0.1:8232/")]
+        url: String,
+        /// RPC user
+        #[arg(long)]
+        user: Option<String>,
+        /// RPC password
+        #[arg(long)]
+        pass: Option<String>,
+        /// Timeout (ms)
+        #[arg(long, default_value_t = 15000)]
+        timeout_ms: u64,
+        /// SLIP-44 coin type
+        #[arg(long, default_value_t = 133)]
+        coin: u32,
+        /// Default fee (zatoshis)
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+        /// Amount (zatoshis)
+        #[arg(long)]
+        amount: u64,
+        /// Optional description
+        #[arg(long)]
+        desc: Option<String>,
+        /// Bech32 HRP for capability key
+        #[arg(long, default_value = "zpay")]
+        hrp: String,
+    },
+    /// Finalize a capability by sweeping the note
+    Finalize {
+        /// Zebra RPC URL (e.g. http://127.0.0.1:8232/)
+        #[arg(long, default_value = "http://127.0.0.1:8232/")]
+        url: String,
+        /// RPC user
+        #[arg(long)]
+        user: Option<String>,
+        /// RPC password
+        #[arg(long)]
+        pass: Option<String>,
+        /// Timeout (ms)
+        #[arg(long, default_value_t = 15000)]
+        timeout_ms: u64,
+        /// SLIP-44 coin type
+        #[arg(long, default_value_t = 133)]
+        coin: u32,
+        /// Default fee (zatoshis)
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+        /// Capability URI
+        #[arg(long)]
+        uri: String,
+        /// Bech32 HRP for capability key
+        #[arg(long, default_value = "zpay")]
+        hrp: String,
+    },
+}
+
+async fn execute_cap_command(command: CapCommands) -> anyhow::Result<()> {
+    match command {
+        CapCommands::Create { url, user, pass, timeout_ms, coin, fee, amount, desc, hrp } => {
+            let cfg = ZebraRpcConfig { url, user, pass, timeout_ms };
+            let engine = ZebraRpcEngine::new(cfg, MySpendBuilder::new(), coin, fee);
+            let db = InMemoryStatusDb::default();
+            let cap = sender_create_capability(&engine, &db, amount, desc.as_deref(), &hrp)?;
+            println!("{}", cap);
+        }
+        CapCommands::Finalize { url, user, pass, timeout_ms, coin, fee, uri, hrp } => {
+            let cfg = ZebraRpcConfig { url, user, pass, timeout_ms };
+            let engine = ZebraRpcEngine::new(cfg, MySpendBuilder::new(), coin, fee);
+            let db = InMemoryStatusDb::default();
+            let txid = recipient_finalize_capability(&engine, &db, &uri, &hrp)?;
+            println!("{}", txid);
+        }
+    }
     Ok(())
 }
 

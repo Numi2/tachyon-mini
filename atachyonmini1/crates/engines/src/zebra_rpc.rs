@@ -1,0 +1,158 @@
+#![forbid(unsafe_code)]
+use serde::{Deserialize, Serialize};
+use tracing::instrument;
+
+use crate::engine::{FinalizeEngine, EngineError};
+use crate::spend_builder::{SpendBuilder, Zip324Key, AmountZat};
+use crate::status::{StatusDb, OutboundRecord, PaymentStatus};
+use crate::uri::CapabilityUri;
+
+#[derive(Clone)]
+pub struct ZebraRpcConfig {
+    pub url: String,             // e.g. http://127.0.0.1:8232/
+    pub user: Option<String>,    // basic auth credentials
+    pub pass: Option<String>,
+    pub timeout_ms: u64,         // timeout in milliseconds
+}
+
+#[derive(Clone)]
+pub struct ZebraRpcEngine<B: SpendBuilder> {
+    cfg: ZebraRpcConfig,
+    agent: ureq::Agent,
+    pub builder: B,
+    pub coin_type: u32,
+    pub default_fee_zat: AmountZat,
+}
+
+impl<B: SpendBuilder> ZebraRpcEngine<B> {
+    pub fn new(cfg: ZebraRpcConfig, builder: B, coin_type: u32, default_fee_zat: u64) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
+            .build();
+        Self {
+            cfg,
+            agent,
+            builder,
+            coin_type,
+            default_fee_zat: AmountZat(default_fee_zat),
+        }
+    }
+
+    fn rpc_call<T: for<'de> Deserialize<'de>, P: Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<T, EngineError> {
+        #[derive(Serialize)]
+        struct Req<'a, P> { jsonrpc: &'a str, id: u64, method: &'a str, params: P }
+        #[derive(Deserialize)]
+        struct Resp<T> { result: Option<T>, error: Option<RpcError> }
+        #[derive(Deserialize)]
+        struct RpcError { code: i64, message: String }
+
+        let req = Req { jsonrpc: "2.0", id: 1, method, params };
+        let mut r = self.agent.post(&self.cfg.url);
+        if let (Some(u), Some(p)) = (&self.cfg.user, &self.cfg.pass) {
+            let up = format!("{u}:{p}");
+            let b64 = base64::engine::general_purpose::STANDARD.encode(up);
+            r = r.set("Authorization", &format!("Basic {}", b64));
+        }
+        let res = r.send_json(serde_json::to_value(req).map_err(|e| EngineError::RpcTransport(e.to_string()))?)
+            .map_err(|e| EngineError::RpcTransport(e.to_string()))?;
+        let resp: Resp<T> = res.into_json().map_err(|_| EngineError::InvalidResponse)?;
+        match (resp.result, resp.error) {
+            (Some(v), None) => Ok(v),
+            (_, Some(err)) => Err(EngineError::RpcServer(format!("{} ({})", err.message, err.code))),
+            _ => Err(EngineError::InvalidResponse),
+        }
+    }
+}
+
+impl<B: SpendBuilder> FinalizeEngine for ZebraRpcEngine<B> {
+    #[instrument(skip(self, hex_tx))]
+    fn broadcast_raw_tx(&self, hex_tx: &str) -> Result<String, EngineError> {
+        // Zebra: sendrawtransaction <hexstring>
+        self.rpc_call::<String, _>("sendrawtransaction", vec![hex_tx])
+    }
+}
+
+/// Sender flow: fund ephemeral, broadcast, store, return URI.
+pub fn sender_create_capability<B: SpendBuilder, S: StatusDb>(
+    engine: &ZebraRpcEngine<B>,
+    db: &S,
+    amount_zat: u64,
+    desc: Option<&str>,
+    hrp: &str,
+) -> anyhow::Result<String> {
+    let idx = db.next_payment_index()?;
+    let key = engine.builder.zip324_key_for_index(engine.coin_type, idx)?;
+    let value = AmountZat(amount_zat + engine.default_fee_zat.0);
+    let raw = engine.builder.build_fund_ephemeral(&key, value, hrp)?;
+    let hex_tx = hex::encode(raw);
+    let txid = engine.broadcast_raw_tx(&hex_tx)?;
+    let cap = CapabilityUri { key, amount_zat: AmountZat(amount_zat), desc: desc.map(|s| s.to_owned()) }
+        .to_string_with_hrp(hrp)?;
+    db.put_outbound(OutboundRecord {
+        id: monotonic_now_ns(),
+        idx,
+        uri: cap.clone(),
+        amount_zat: AmountZat(amount_zat),
+        status: PaymentStatus::InProgress { funding_txid: txid },
+    })?;
+    Ok(cap)
+}
+
+/// Recipient flow: verify funded note, sweep, broadcast, update.
+pub fn recipient_finalize_capability<B: SpendBuilder, S: StatusDb>(
+    engine: &ZebraRpcEngine<B>,
+    db: &S,
+    uri: &str,
+    hrp: &str,
+) -> anyhow::Result<String> {
+    let parsed = crate::uri::CapabilityUri::parse(uri, hrp)?;
+    let min_value = AmountZat(parsed.amount_zat.0 + engine.default_fee_zat.0);
+    let note = engine.builder
+        .find_funded_note(&parsed.key, min_value)?
+        .ok_or_else(|| anyhow::anyhow!("funded note not found"))?;
+    let sweep_raw = engine.builder.build_sweep_to_wallet(&note, engine.default_fee_zat, hrp)?;
+    let sweep_hex = hex::encode(sweep_raw);
+    let sweep_txid = engine.broadcast_raw_tx(&sweep_hex)?;
+    // DB policy: locate record by exact URI if present
+    for rec in db.list_pending()? {
+        if rec.uri == uri {
+            db.update_status(rec.id, PaymentStatus::Finalizing { sweep_txid: sweep_txid.clone() })?;
+        }
+    }
+    Ok(sweep_txid)
+}
+
+/// Recovery flow: re‑derive keys and sweep any funded notes within a gap.
+pub fn recovery_scan_and_finalize<B: SpendBuilder, S: StatusDb>(
+    engine: &ZebraRpcEngine<B>,
+    db: &S,
+    start_index: u32,
+    gap_limit: u32,
+    hrp: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for i in start_index..start_index + gap_limit {
+        let key = match engine.builder.zip324_key_for_index(engine.coin_type, i) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        if let Some(note) = engine.builder.find_funded_note(&key, engine.default_fee_zat)? {
+            let raw = engine.builder.build_sweep_to_wallet(&note, engine.default_fee_zat, hrp)?;
+            let hex_tx = hex::encode(raw);
+            let txid = engine.broadcast_raw_tx(&hex_tx)?;
+            out.push(txid);
+        }
+    }
+    Ok(out)
+}
+
+fn monotonic_now_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+}
+
+

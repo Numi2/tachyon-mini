@@ -4,6 +4,7 @@ members = [
     "crates/zk",
     "crates/wallet",
     "crates/cli",
+    "crates/engines",
     "crates/node_ext",
     "crates/net_iroh",
     "crates/header_sync",
