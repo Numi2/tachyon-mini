@@ -4,7 +4,7 @@
 //! A tachygram is a sequence of tachyactions where each action's accumulator output
 //! feeds into the next action's accumulator input, creating a verifiable chain:
 //!
-//! acc₁ = H(acc₀, action₀), acc₂ = H(acc₁, action₁), ..., accₙ = H(accₙ₋₁, actionₙ₋₁)
+//! acc₁ = H(acc₀, action₀, 0), acc₂ = H(acc₁, action₁, 1), ..., accₙ = H(accₙ₋₁, actionₙ₋₁, n-1)
 //!
 //! This chaining structure enables:
 //! 1. Efficient batch verification (only check endpoints)
@@ -13,7 +13,7 @@
 //! 4. Incremental state updates
 
 use anyhow::{anyhow, Result};
-use ff::{Field, PrimeField};
+use ff::PrimeField;
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
@@ -39,6 +39,8 @@ pub struct Tachygram {
     pub acc_start: [u8; 32],
     pub acc_end: [u8; 32],
     pub actions: Vec<TachyAction>,
+    /// Counter tracking the number of actions accumulated so far
+    pub counter: u64,
     /// Optional: proof data for the entire chain
     pub proof: Option<Vec<u8>>,
 }
@@ -50,6 +52,7 @@ impl Tachygram {
             acc_start,
             acc_end: acc_start, // Initially empty
             actions: Vec::new(),
+            counter: 0,
             proof: None,
         }
     }
@@ -59,13 +62,14 @@ impl Tachygram {
         // Convert action to digest
         let action_digest = self.compute_action_digest(&action)?;
         
-        // Update accumulator: acc_end' = H(TAG_ACC, acc_end, action_digest)
+        // Update accumulator: acc_end' = H(acc_end, action_digest, counter)
         let acc_before_fr = bytes_to_fr(&self.acc_end)?;
         let action_digest_fr = bytes_to_fr(&action_digest)?;
-        let acc_after_fr = compute_acc_update(acc_before_fr, action_digest_fr);
+        let acc_after_fr = compute_acc_update(acc_before_fr, action_digest_fr, self.counter);
         
         self.acc_end = fr_to_bytes(&acc_after_fr);
         self.actions.push(action);
+        self.counter += 1;
         
         // Proof becomes stale when adding actions
         self.proof = None;
@@ -75,14 +79,22 @@ impl Tachygram {
 
     /// Chain this tachygram with another (sequentially compose them)
     pub fn chain(mut self, other: Tachygram) -> Result<Self> {
-        // Verify continuity: this.acc_end == other.acc_start
+        // Verify continuity: this.acc_end == other.acc_start AND this.counter == other's starting counter
         if self.acc_end != other.acc_start {
             return Err(anyhow!("Accumulator mismatch: cannot chain tachygrams"));
+        }
+        
+        // Counter must be continuous - other should start where self ends
+        let expected_start_counter = self.counter;
+        let other_start_counter = other.counter - other.actions.len() as u64;
+        if expected_start_counter != other_start_counter {
+            return Err(anyhow!("Counter mismatch: cannot chain tachygrams"));
         }
         
         // Append actions and update end state
         self.actions.extend(other.actions);
         self.acc_end = other.acc_end;
+        self.counter = other.counter;
         
         // Combined proof is invalid; must be regenerated
         self.proof = None;
@@ -103,11 +115,13 @@ impl Tachygram {
     /// Verify the accumulator chain without checking proofs
     pub fn verify_chain(&self) -> Result<bool> {
         let mut acc = bytes_to_fr(&self.acc_start)?;
+        let start_counter = self.counter - self.actions.len() as u64;
         
-        for action in &self.actions {
+        for (i, action) in self.actions.iter().enumerate() {
             let action_digest = self.compute_action_digest(action)?;
             let action_digest_fr = bytes_to_fr(&action_digest)?;
-            acc = compute_acc_update(acc, action_digest_fr);
+            let counter = start_counter + i as u64;
+            acc = compute_acc_update(acc, action_digest_fr, counter);
         }
         
         let expected_end = bytes_to_fr(&self.acc_end)?;
@@ -120,28 +134,36 @@ impl Tachygram {
             return Err(anyhow!("Split index out of bounds"));
         }
         
+        let start_counter = self.counter - self.actions.len() as u64;
+        
         if at == 0 {
+            let mut empty = Tachygram::new(self.acc_start);
+            empty.counter = start_counter;
             return Ok((
-                Tachygram::new(self.acc_start),
+                empty,
                 self,
             ));
         }
         
         if at == self.actions.len() {
+            let mut empty = Tachygram::new(self.acc_end);
+            empty.counter = self.counter;
             return Ok((
                 self.clone(),
-                Tachygram::new(self.acc_end),
+                empty,
             ));
         }
         
         // Compute intermediate accumulator state at split point
         let mut acc = bytes_to_fr(&self.acc_start)?;
-        for action in self.actions.iter().take(at) {
+        for (i, action) in self.actions.iter().take(at).enumerate() {
             let digest = self.compute_action_digest(action)?;
             let digest_fr = bytes_to_fr(&digest)?;
-            acc = compute_acc_update(acc, digest_fr);
+            let counter = start_counter + i as u64;
+            acc = compute_acc_update(acc, digest_fr, counter);
         }
         let mid_acc = fr_to_bytes(&acc);
+        let mid_counter = start_counter + at as u64;
         
         let (left_actions, right_actions) = self.actions.split_at(at);
         
@@ -149,6 +171,7 @@ impl Tachygram {
             acc_start: self.acc_start,
             acc_end: mid_acc,
             actions: left_actions.to_vec(),
+            counter: mid_counter,
             proof: None,
         };
         
@@ -156,6 +179,7 @@ impl Tachygram {
             acc_start: mid_acc,
             acc_end: self.acc_end,
             actions: right_actions.to_vec(),
+            counter: self.counter,
             proof: None,
         };
         
@@ -189,7 +213,7 @@ pub struct TachygramChainCircuit<const N: usize> {
     pub actions: [TachyActionWitness; N],
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct TachyActionWitness {
     pub payment_key: Value<Fr>,
     pub value: Value<Fr>,
@@ -335,30 +359,28 @@ impl<const N: usize> Circuit<Fr> for TachygramChainCircuit<N> {
                 [tag_out, inner, nonce],
             )?;
 
-            // Update accumulator
+            // Update accumulator: acc' = H(acc, action_digest, counter)
             let chip_acc = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
             let h_acc = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
                 chip_acc,
                 layouter.namespace(|| format!("poseidon acc {}", i)),
             )?;
             
-            let tag_acc = layouter.assign_region(
-                || format!("tag_acc {}", i),
+            let counter_cell = layouter.assign_region(
+                || format!("counter {}", i),
                 |mut region| {
-                    let c = region.assign_advice(
-                        || "tag_acc",
+                    region.assign_advice(
+                        || "counter",
                         config.advice[5],
                         0,
-                        || Value::known(Fr::from(50u64)),
-                    )?;
-                    region.constrain_constant(c.cell(), Fr::from(50u64))?;
-                    Ok(c)
+                        || Value::known(Fr::from(i as u64)),
+                    )
                 },
             )?;
             
             acc = h_acc.hash(
                 layouter.namespace(|| format!("hash acc {}", i)),
-                [tag_acc, acc, action_digest],
+                [acc, action_digest, counter_cell],
             )?;
         }
 
@@ -383,10 +405,10 @@ fn fr_to_bytes(fr: &Fr) -> [u8; 32] {
     bytes
 }
 
-fn compute_acc_update(acc_before: Fr, action_digest: Fr) -> Fr {
+fn compute_acc_update(acc_before: Fr, action_digest: Fr, counter: u64) -> Fr {
     use halo2_gadgets::poseidon::primitives as p;
-    let tag_acc = Fr::from(50u64);
-    p::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([tag_acc, acc_before, action_digest])
+    let counter_fr = Fr::from(counter);
+    p::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([acc_before, action_digest, counter_fr])
 }
 
 #[cfg(test)]
@@ -455,7 +477,9 @@ mod tests {
         };
         tg1.add_action(action1).unwrap();
         
+        // Create tg2 starting from where tg1 ended, with proper counter continuation
         let mut tg2 = Tachygram::new(tg1.acc_end);
+        tg2.counter = tg1.counter; // Start counter where tg1 left off
         let action2 = TachyAction {
             payment_key: [2u8; 32],
             value: 200,
@@ -467,6 +491,7 @@ mod tests {
         
         let chained = tg1.chain(tg2).unwrap();
         assert_eq!(chained.len(), 2);
+        assert_eq!(chained.counter, 2); // Final counter should be 2 after 2 actions
         assert!(chained.verify_chain().unwrap());
     }
 

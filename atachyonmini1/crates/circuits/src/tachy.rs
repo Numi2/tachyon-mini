@@ -8,7 +8,6 @@ use halo2_proofs::poly::Rotation;
 use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
 use pasta_curves::Fp as Fr;
-use ff::Field;
 
 #[derive(Clone, Debug)]
 pub struct TachyConfig {
@@ -20,7 +19,7 @@ pub struct TachyConfig {
 
 /// Tachyaction circuit: proves valid state transition via accumulator update
 /// - Computes action digest from payment_key, value, nonce
-/// - Updates accumulator state: acc' = H(TAG_ACC, acc, action_digest)
+/// - Updates accumulator state: acc' = H(acc, action_digest, counter)
 /// - Proves ownership via simplified Schnorr-like signature
 #[derive(Clone, Debug)]
 pub struct TachyActionCircuit {
@@ -28,6 +27,7 @@ pub struct TachyActionCircuit {
     pub payment_key: Value<Fr>,
     pub value: Value<Fr>,
     pub nonce: Value<Fr>,
+    pub counter: Value<Fr>,
     // Simplified Schnorr-like signature components over the base field
     pub sig_r: Value<Fr>,
     pub sig_s: Value<Fr>,
@@ -43,6 +43,7 @@ impl Circuit<Fr> for TachyActionCircuit {
             payment_key: Value::unknown(),
             value: Value::unknown(),
             nonce: Value::unknown(),
+            counter: Value::unknown(),
             sig_r: Value::unknown(),
             sig_s: Value::unknown(),
         }
@@ -142,27 +143,23 @@ impl Circuit<Fr> for TachyActionCircuit {
             [tag_out, inner, nonce],
         )?;
 
-        // 2) Update accumulator: acc_after = H(TAG_ACC, acc_before, action_digest)
+        // 2) Update accumulator: acc_after = H(acc_before, action_digest, counter)
         let chip_acc = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
         let h_acc = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
             chip_acc,
             layouter.namespace(|| "poseidon accumulator"),
         )?;
-        let tag_acc = layouter.assign_region(
-            || "tag_acc",
-            |mut region| {
-                let c = region.assign_advice(|| "tag_acc", config.advice[5], 0, || Value::known(Fr::from(50u64)))?;
-                region.constrain_constant(c.cell(), Fr::from(50u64))?;
-                Ok(c)
-            },
-        )?;
         let acc_before_cell = layouter.assign_region(
             || "acc_before",
             |mut region| region.assign_advice(|| "acc_before", config.advice[4], 0, || self.acc_before),
         )?;
+        let counter_cell = layouter.assign_region(
+            || "counter",
+            |mut region| region.assign_advice(|| "counter", config.advice[5], 0, || self.counter),
+        )?;
         let acc_after = h_acc.hash(
             layouter.namespace(|| "hash accumulator"),
-            [tag_acc, acc_before_cell.clone(), action_digest.clone()],
+            [acc_before_cell.clone(), action_digest.clone(), counter_cell],
         )?;
 
         // 3) Compute signature challenge and enforce simplified linear relation s = r + chal * pk
@@ -218,12 +215,12 @@ pub fn compute_tachy_digest(pk: Fr, value: Fr, nonce: Fr) -> Fr {
         .hash([tag_out, inner, nonce])
 }
 
-/// Native helper to compute accumulator update: acc' = H(TAG_ACC, acc, action_digest)
-pub fn compute_acc_update(acc_before: Fr, action_digest: Fr) -> Fr {
+/// Native helper to compute accumulator update: acc' = H(acc, action_digest, counter)
+pub fn compute_acc_update(acc_before: Fr, action_digest: Fr, counter: u64) -> Fr {
     use halo2_gadgets::poseidon::primitives as poseidon_primitives;
-    let tag_acc = Fr::from(50u64);
+    let counter_fr = Fr::from(counter);
     poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
-        .hash([tag_acc, acc_before, action_digest])
+        .hash([acc_before, action_digest, counter_fr])
 }
 
 /// Native helper to compute the signature challenge used in-circuit
@@ -245,8 +242,9 @@ mod tests {
         let pk = Fr::from(123u64);
         let val = Fr::from(5u64);
         let nonce = Fr::from(77u64);
+        let counter = 1u64;
         let action_digest = compute_tachy_digest(pk, val, nonce);
-        let acc_after = compute_acc_update(acc_before, action_digest);
+        let acc_after = compute_acc_update(acc_before, action_digest, counter);
 
         // Compute valid signature
         let chal = compute_sig_challenge(action_digest, pk);
@@ -258,6 +256,7 @@ mod tests {
             payment_key: Value::known(pk),
             value: Value::known(val),
             nonce: Value::known(nonce),
+            counter: Value::known(Fr::from(counter)),
             sig_r: Value::known(r),
             sig_s: Value::known(s),
         };
@@ -273,8 +272,9 @@ mod tests {
         let pk = Fr::from(123u64);
         let val = Fr::from(5u64);
         let nonce = Fr::from(77u64);
+        let counter = 1u64;
         let action_digest = compute_tachy_digest(pk, val, nonce);
-        let acc_after = compute_acc_update(acc_before, action_digest);
+        let acc_after = compute_acc_update(acc_before, action_digest, counter);
         let bad_s = Fr::from(999u64);
 
         let circuit = TachyActionCircuit {
@@ -282,6 +282,7 @@ mod tests {
             payment_key: Value::known(pk),
             value: Value::known(val),
             nonce: Value::known(nonce),
+            counter: Value::known(Fr::from(counter)),
             sig_r: Value::known(Fr::from(9u64)),
             sig_s: Value::known(bad_s),
         };
@@ -292,18 +293,18 @@ mod tests {
 
     #[test]
     fn test_tachy_action_chaining() {
-        // Test chaining multiple tachyactions: acc1 = update(acc0, d1), acc2 = update(acc1, d2)
+        // Test chaining multiple tachyactions: acc1 = update(acc0, d1, 0), acc2 = update(acc1, d2, 1)
         let acc0 = Fr::ZERO;
         
-        // First action
+        // First action (counter = 0)
         let pk1 = Fr::from(100u64);
         let d1 = compute_tachy_digest(pk1, Fr::from(10u64), Fr::from(1u64));
-        let acc1 = compute_acc_update(acc0, d1);
+        let acc1 = compute_acc_update(acc0, d1, 0);
         
-        // Second action
+        // Second action (counter = 1)
         let pk2 = Fr::from(200u64);
         let d2 = compute_tachy_digest(pk2, Fr::from(20u64), Fr::from(2u64));
-        let acc2 = compute_acc_update(acc1, d2);
+        let acc2 = compute_acc_update(acc1, d2, 1);
         
         // Verify chaining properties
         assert_ne!(acc0, acc1);
@@ -311,9 +312,13 @@ mod tests {
         assert_ne!(acc0, acc2);
         
         // Verify determinism: recomputing gives same result
-        let acc1_again = compute_acc_update(acc0, d1);
-        let acc2_again = compute_acc_update(acc1_again, d2);
+        let acc1_again = compute_acc_update(acc0, d1, 0);
+        let acc2_again = compute_acc_update(acc1_again, d2, 1);
         assert_eq!(acc1, acc1_again);
         assert_eq!(acc2, acc2_again);
+        
+        // Verify counter matters: same digest with different counter gives different result
+        let acc1_wrong_counter = compute_acc_update(acc0, d1, 1);
+        assert_ne!(acc1, acc1_wrong_counter);
     }
 }

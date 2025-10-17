@@ -68,10 +68,11 @@ proptest! {
     fn test_acc_update_deterministic(
         acc_before in fr_strategy(),
         action_digest in fr_strategy(),
+        counter in any::<u64>(),
     ) {
         // Property: Accumulator updates are deterministic
-        let acc1 = compute_acc_update(acc_before, action_digest);
-        let acc2 = compute_acc_update(acc_before, action_digest);
+        let acc1 = compute_acc_update(acc_before, action_digest, counter);
+        let acc2 = compute_acc_update(acc_before, action_digest, counter);
         prop_assert_eq!(acc1, acc2);
     }
 
@@ -79,10 +80,12 @@ proptest! {
     fn test_acc_update_changes_state(
         acc_before in fr_strategy(),
         action_digest in fr_strategy(),
+        counter in any::<u64>(),
     ) {
-        // Property: Accumulator update should change state (unless action_digest is zero)
-        let acc_after = compute_acc_update(acc_before, action_digest);
-        if action_digest != Fr::ZERO {
+        // Property: Accumulator update should change state (unless both inputs are zero)
+        let acc_after = compute_acc_update(acc_before, action_digest, counter);
+        // State changes unless all meaningful inputs are zero
+        if action_digest != Fr::ZERO || counter != 0 || acc_before != Fr::ZERO {
             prop_assert_ne!(acc_before, acc_after);
         }
     }
@@ -113,16 +116,18 @@ proptest! {
         // Property: Chaining is associative (when continuity is preserved)
         // (tg1 + tg2) + tg3 == tg1 + (tg2 + tg3)
         
-        // Make tg2 start where tg1 ends
+        // Make tg2 start where tg1 ends (with proper counter continuity)
         let mut tg2_adjusted = tg2.clone();
         tg2_adjusted.acc_start = tg1.acc_end;
+        tg2_adjusted.counter = tg1.counter; // Continue counter from tg1
+        // Recompute end state for tg2_adjusted
+        let _ = tg2_adjusted.verify_chain();
         
-        // Make tg3 start where tg2_adjusted ends
+        // Make tg3 start where tg2_adjusted ends (with proper counter continuity)
         let mut tg3_adjusted = tg3.clone();
         tg3_adjusted.acc_start = tg2_adjusted.acc_end;
-        
-        // Recompute chains
-        let _ = tg2_adjusted.verify_chain();
+        tg3_adjusted.counter = tg2_adjusted.counter; // Continue counter from tg2_adjusted
+        // Recompute end state for tg3_adjusted
         let _ = tg3_adjusted.verify_chain();
         
         // Chain left-to-right: (tg1 + tg2) + tg3
@@ -159,7 +164,8 @@ proptest! {
     #[test]
     fn test_tachygram_empty_is_identity(tg in tachygram_strategy()) {
         // Property: Chaining with an empty tachygram is identity
-        let empty = Tachygram::new(tg.acc_end);
+        let mut empty = Tachygram::new(tg.acc_end);
+        empty.counter = tg.counter; // Set counter to continue from tg
         let chained = tg.clone().chain(empty).unwrap();
         
         prop_assert_eq!(chained.acc_start, tg.acc_start);
@@ -174,13 +180,14 @@ mod invariants {
 
     proptest! {
         #[test]
-        fn test_accumulator_never_zero_unless_both_zero(
+        fn test_accumulator_never_zero_unless_all_zero(
             acc in fr_strategy(),
             digest in fr_strategy(),
+            counter in any::<u64>(),
         ) {
-            // Property: If either input is non-zero, output should be non-zero
-            let result = compute_acc_update(acc, digest);
-            if acc != Fr::ZERO || digest != Fr::ZERO {
+            // Property: If any input is non-zero, output should be non-zero
+            let result = compute_acc_update(acc, digest, counter);
+            if acc != Fr::ZERO || digest != Fr::ZERO || counter != 0 {
                 prop_assert_ne!(result, Fr::ZERO);
             }
         }
@@ -190,11 +197,26 @@ mod invariants {
             acc in fr_strategy(),
             d1 in fr_strategy(),
             d2 in fr_strategy(),
+            counter in any::<u64>(),
         ) {
             // Property: Different digests should produce different accumulator states (collision resistance)
             prop_assume!(d1 != d2);
-            let r1 = compute_acc_update(acc, d1);
-            let r2 = compute_acc_update(acc, d2);
+            let r1 = compute_acc_update(acc, d1, counter);
+            let r2 = compute_acc_update(acc, d2, counter);
+            prop_assert_ne!(r1, r2);
+        }
+        
+        #[test]
+        fn test_counter_matters(
+            acc in fr_strategy(),
+            digest in fr_strategy(),
+            c1 in any::<u64>(),
+            c2 in any::<u64>(),
+        ) {
+            // Property: Different counters should produce different accumulator states
+            prop_assume!(c1 != c2);
+            let r1 = compute_acc_update(acc, digest, c1);
+            let r2 = compute_acc_update(acc, digest, c2);
             prop_assert_ne!(r1, r2);
         }
     }

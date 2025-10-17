@@ -2,6 +2,45 @@
 //! Numan Thabit 2025
 //! Post-quantum cryptography utilities for Tachyon-mini.
 //! Provides KEM (Key Encapsulation Mechanism) and AEAD encryption for out-of-band payments.
+//!
+//! ## Features
+//!
+//! - **Hybrid KEM**: X25519/ML-KEM-768 hybrid key encapsulation providing both classical and post-quantum security
+//! - **Legacy KEM**: ML-KEM-768 (Kyber768) only for backwards compatibility
+//! - **AEAD Encryption**: AES-256-GCM for authenticated encryption
+//! - **Digital Signatures**: Dilithium3/ML-DSA-65 for post-quantum signatures
+//! - **Nullifier Privacy**: Epoch-tagged VRF-based nullifier blinding
+//!
+//! ## Hybrid KEM Example
+//!
+//! ```rust
+//! use pq_crypto::{HybridKem, HybridOutOfBandPayment};
+//!
+//! // Generate recipient's hybrid keypair (X25519 + ML-KEM-768)
+//! let (recipient_pk, recipient_sk) = HybridKem::generate_keypair().unwrap();
+//!
+//! // Sender creates encrypted payment metadata
+//! let payment_metadata = b"payment_address:1000 satoshis";
+//! let context = b"out_of_band_payment_v1";
+//! let payment = HybridOutOfBandPayment::new(
+//!     recipient_pk,
+//!     payment_metadata,
+//!     context.to_vec(),
+//! ).unwrap();
+//!
+//! // Recipient decrypts the payment
+//! let decrypted = payment.decrypt(&recipient_sk).unwrap();
+//! assert_eq!(decrypted, payment_metadata);
+//! ```
+//!
+//! ## Security Properties
+//!
+//! The hybrid KEM construction provides:
+//! - **Classical security**: 128-bit security via X25519 ECDH
+//! - **Post-quantum security**: NIST Level 3 security via ML-KEM-768
+//! - **Combined security**: Resistant to both classical and quantum attacks
+//! - **Key separation**: Independent key generation for X25519 and ML-KEM
+//! - **Secret combination**: BLAKE3-based KDF for combining shared secrets
 
 use anyhow::{anyhow, Result};
 use rand::RngCore;
