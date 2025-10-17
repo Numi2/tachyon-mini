@@ -15,7 +15,6 @@
 //!
 //! Base for S can be either Zero (recommended, gives S_m(v)=0) or One (as in the note).
 
-use core::ops::{Add, AddAssign, Mul, Sub};
 use curve25519_dalek::{
     ristretto::{RistrettoPoint, CompressedRistretto},
     scalar::Scalar,
@@ -38,6 +37,27 @@ pub enum TachyonError {
     /// Chain binding verification failed.
     ChainBindingFailed,
 }
+
+impl core::fmt::Display for TachyonError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TachyonError::DegreeExceeded { max, actual } => {
+                write!(f, "Degree exceeded: max {}, actual {}", max, actual)
+            }
+            TachyonError::InvalidStepCounter { expected, actual } => {
+                write!(f, "Invalid step counter: expected {}, actual {}", expected, actual)
+            }
+            TachyonError::CheckpointMismatch => {
+                write!(f, "Checkpoint verification failed: hash mismatch")
+            }
+            TachyonError::ChainBindingFailed => {
+                write!(f, "Chain binding verification failed")
+            }
+        }
+    }
+}
+
+impl core::error::Error for TachyonError {}
 
 /// Result type for Tachyon operations.
 pub type Result<T> = core::result::Result<T, TachyonError>;
@@ -320,6 +340,8 @@ fn mul_by_x_minus_r(mut poly: Vec<Scalar>, r: Scalar) -> Vec<Scalar> {
 }
 
 /// Build coefficients of ∏_j (X - a_j).
+/// Returns [1] for empty roots (the constant polynomial 1).
+/// Coefficients are in little-endian order: [constant, x, x², ...].
 pub fn coeffs_from_roots(roots: &[Scalar]) -> Vec<Scalar> {
     let mut poly = vec![Scalar::from(1u64)]; // 1
     for &r in roots {
@@ -329,7 +351,11 @@ pub fn coeffs_from_roots(roots: &[Scalar]) -> Vec<Scalar> {
 }
 
 /// Horner evaluation: ∑ b_k x^k with b[0] constant term.
+/// Returns 0 for empty coefficient vector.
 pub fn eval_poly_at(coeffs: &[Scalar], x: Scalar) -> Scalar {
+    if coeffs.is_empty() {
+        return Scalar::from(0u64);
+    }
     let mut acc = Scalar::from(0u64);
     for &c in coeffs.iter().rev() {
         acc = acc * x + c;

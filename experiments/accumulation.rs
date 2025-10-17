@@ -8,6 +8,12 @@ pub struct Accumulator<F: PrimeField> {
     pub v: F,
 }
 
+impl<F: PrimeField> Default for Accumulator<F> {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
 impl<F: PrimeField> Accumulator<F> {
     pub fn zero() -> Self { Self { v: F::ZERO } }
     pub fn unit(x: F) -> Self { Self { v: x } }
@@ -19,8 +25,14 @@ pub struct SplitAccumulator<F: PrimeField> {
     pub leaves: Vec<Accumulator<F>>,
 }
 
+impl<F: PrimeField> Default for SplitAccumulator<F> {
+    fn default() -> Self {
+        Self { leaves: Vec::new() }
+    }
+}
+
 impl<F: PrimeField> SplitAccumulator<F> {
-    pub fn new() -> Self { Self { leaves: Vec::new() } }
+    pub fn new() -> Self { Self::default() }
     pub fn push(&mut self, a: Accumulator<F>) { self.leaves.push(a); }
 
     pub fn split_fold(&self) -> Accumulator<F> {
@@ -34,6 +46,7 @@ impl<F: PrimeField> SplitAccumulator<F> {
             }
             layer = next;
         }
+        debug_assert_eq!(layer.len(), 1, "layer should have exactly one element");
         layer[0]
     }
 }

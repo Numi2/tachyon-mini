@@ -3,10 +3,12 @@
 //! This example demonstrates real-world usage of the hardened Tachyon accumulator
 //! with security features enabled.
 
-use curve25519_dalek::scalar::Scalar;
+// Import the tachygram module
+#[path = "tachygram.rs"]
+mod tachygram;
 
-// Note: In real usage, import from your library:
-// use tachyon::{Params, init_accumulator, init_fold, non_membership_step, ...};
+use tachygram as tachyon;
+use curve25519_dalek::scalar::Scalar;
 
 /// Example 1: Basic accumulator with non-membership proofs
 pub fn example_basic_accumulator() {

@@ -3,13 +3,6 @@
 //! Post-quantum cryptography utilities for Tachyon-mini.
 //! Provides KEM (Key Encapsulation Mechanism) and AEAD encryption for out-of-band payments.
 //!
-//! ## Features
-//!
-//! - **Hybrid KEM**: X25519/ML-KEM-768 hybrid key encapsulation providing both classical and post-quantum security
-//! - **Legacy KEM**: ML-KEM-768 (Kyber768) only for backwards compatibility
-//! - **AEAD Encryption**: AES-256-GCM for authenticated encryption
-//! - **Digital Signatures**: Dilithium3/ML-DSA-65 for post-quantum signatures
-//! - **Nullifier Privacy**: Epoch-tagged VRF-based nullifier blinding
 //!
 //! ## Hybrid KEM Example
 //!
