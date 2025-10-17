@@ -1,14 +1,20 @@
-//! ragu: PCD-oriented circuit API for Tachyon mini
+//! ragu: The circuit framework powering Tachyon's ZK proofs
 //! Numan Thabit 2025
-//! Minimal scaffolding: Maybe, Driver, Circuit traits.
+//!
+//! This is our low-level circuit API - think of it as the engine room!
+//! It provides the basic tools (Maybe types, Drivers, Circuit traits) that
+//! all our higher-level proof systems are built on top of.
 
 pub mod maybe {
-    /// Marker for the kind of Maybe storage (Always vs Empty)
+    /// Marks whether a Maybe is Always present or Empty.
+    /// This is the type-level magic that lets us skip work for Empty values!
     pub trait MaybeKind {
         type Rebind<T>: Maybe<T, Kind = Self>;
     }
 
-    /// Generalized Option-like interface where the variant is encoded in the type
+    /// Like Option, but the Some/None-ness is tracked in the TYPE, not at runtime.
+    /// This means the compiler can optimize away entire code paths when dealing with Empty!
+    /// Super useful for circuits where we want compile-time branching.
     pub trait Maybe<T> {
         type Kind: MaybeKind;
 

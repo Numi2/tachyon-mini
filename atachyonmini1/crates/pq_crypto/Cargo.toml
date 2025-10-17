@@ -18,6 +18,8 @@ pqcrypto-kyber = "0.8"
 pqcrypto-traits = "0.3"
 pqcrypto-dilithium = "0.5"
 pqcrypto-mldsa = { version = "0.1.2", optional = true }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+bincode = "1.3"
 
 [features]
 default = []

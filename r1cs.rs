@@ -1,16 +1,22 @@
 // src/cs.rs
-// lowrisk r1cs -  Numan
-//!  R1CS-like objects.
+// Numan's R1CS implementation
+//! 
+//! R1CS (Rank-1 Constraint System) - this is the language we use to express circuits!
+//! Think of it like writing equations that prove your computation is correct.
+//! Each constraint is like saying "A times B equals C" with our secret values.
 
 use ff::PrimeField;
 
+/// A variable in our constraint system - just a unique ID number
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Var(pub u32);
 
+/// A linear combination is like a weighted sum: c₀ + c₁·x₁ + c₂·x₂ + ...
+/// We use these to build up our constraints.
 #[derive(Clone, Debug)]
 pub struct LinComb<F: PrimeField> {
-    pub terms: Vec<(Var, F)>,
-    pub constant: F,
+    pub terms: Vec<(Var, F)>,  // Each variable and its coefficient
+    pub constant: F,            // The constant term
 }
 
 impl<F: PrimeField> LinComb<F> {
@@ -30,19 +36,25 @@ impl<F: PrimeField> LinComb<F> {
     }
 }
 
+/// A constraint is a rule that our values must satisfy.
+/// We have two types: multiplication constraints and equality-to-zero constraints.
 #[derive(Clone, Debug)]
 pub enum Constraint<F: PrimeField> {
-    /// <A, X> * <B, X> - <C, X> = 0
+    /// The classic R1CS constraint: A * B = C
+    /// This lets us encode multiplication relationships between variables
     R1CS { a: LinComb<F>, b: LinComb<F>, c: LinComb<F> },
-    /// <A, X> = 0
+    /// A simpler constraint: A = 0
+    /// Useful for enforcing that something equals a specific value
     EqZero { a: LinComb<F> },
 }
 
+/// The constraint system holds all our variables and rules.
+/// It's like a big list of equations that our proof must satisfy.
 #[derive(Default)]
 pub struct ConstraintSystem<F: PrimeField> {
-    pub num_vars: u32,
-    pub public_inputs: Vec<Var>,
-    pub constraints: Vec<Constraint<F>>,
+    pub num_vars: u32,                 // How many variables we have
+    pub public_inputs: Vec<Var>,       // Which ones are public (visible to everyone)
+    pub constraints: Vec<Constraint<F>>, // All the rules/equations
 }
 
 impl<F: PrimeField> ConstraintSystem<F> {

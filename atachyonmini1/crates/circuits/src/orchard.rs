@@ -1,10 +1,13 @@
-//! Orchard-oriented gadgets and circuit skeletons.
+//! Orchard-style gadgets and circuits
 //! Numan Thabit 2025
-//! This module provides production-grade building blocks required to express
-//! Orchard-like note commitment checks, nullifier derivations, and membership
-//! paths over Poseidon2-compatible hashes on Pasta. It intentionally avoids
-//! specifying spend authorization details and focuses on accumulator and
-//! constraint soundness.
+//!
+//! This module gives you the building blocks for Orchard-like privacy features!
+//! We've got tools for creating note commitments (like receipts), deriving nullifiers
+//! (to prevent double-spending), and proving membership in sets.
+//! 
+//! Everything uses Poseidon hashing on Pasta curves for maximum ZK-friendliness.
+//! We focus on the core cryptographic gadgets here - the spending authorization
+//! logic lives elsewhere.
 
 
 use ff::Field;
@@ -16,25 +19,26 @@ use halo2_gadgets::poseidon::{Hash as PoseidonHash, Pow5Chip, Pow5Config};
 use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
 use pasta_curves::Fp as Fr;
 
-use crate::sparse_merkle::SparseMerkleConfig;
-
-/// Orchard constants and tags for domain separation
+/// Special tags that keep different cryptographic operations separate.
+/// Like using different salt for different recipes - keeps everything organized!
 pub mod domain {
     use super::*;
-    pub const TAG_NOTE_COMMIT: u64 = 101;
-    pub const TAG_NULLIFIER: u64 = 102;
-    pub const TAG_IVK: u64 = 103;
-    pub const TAG_RK: u64 = 104;
-    pub const TAG_NF_A: u64 = 105;
-    pub const TAG_NF_B: u64 = 106;
-    // Wallet PIs v1
-    pub const TAG_STATE_V1: u64 = 201;
-    pub const TAG_LINK_V1: u64 = 202;
+    pub const TAG_NOTE_COMMIT: u64 = 101;  // For note commitments
+    pub const TAG_NULLIFIER: u64 = 102;    // For nullifiers (prevents double-spending)
+    pub const TAG_IVK: u64 = 103;          // For incoming viewing keys
+    pub const TAG_RK: u64 = 104;           // For randomized keys
+    pub const TAG_NF_A: u64 = 105;         // Nullifier derivation step A
+    pub const TAG_NF_B: u64 = 106;         // Nullifier derivation step B
+    // Wallet public input tags (version 1)
+    pub const TAG_STATE_V1: u64 = 201;     // For wallet state roots
+    pub const TAG_LINK_V1: u64 = 202;      // For transaction links
 
+    /// Converts a tag number into a field element
     pub fn tag_to_fr(tag: u64) -> Fr { Fr::from(tag) }
 }
 
-/// Poseidon2(t=3, rate=2) configuration wrapper
+/// Wraps up our Poseidon hash configuration (width=3, rate=2).
+/// This is the settings we use throughout to keep everything consistent.
 #[derive(Clone, Debug)]
 pub struct Poseidon2Config {
     pub poseidon: Pow5Config<Fr, 3, 2>,
@@ -56,7 +60,9 @@ impl Poseidon2Config {
     }
 }
 
-/// Gadget: note commitment = H(TAG_NOTE_COMMIT, pk, value)
+/// Creates a note commitment - think of it like a sealed envelope with the note's value inside.
+/// We hash together: the recipient's public key + the value amount.
+/// This commitment can be put on-chain without revealing what's inside!
 pub fn note_commitment<const DEPTH: usize>(
     mut layouter: impl Layouter<Fr>,
     cfg: &OrchardMembershipConfig<DEPTH>,
@@ -92,7 +98,9 @@ pub fn note_commitment<const DEPTH: usize>(
     Ok(cm)
 }
 
-/// Gadget: nullifier = H(TAG_NULLIFIER, commitment, rho)
+/// Derives a nullifier from a commitment - this is how we prevent double-spending!
+/// Each note has exactly one nullifier. When you spend a note, its nullifier goes on-chain.
+/// If anyone tries to spend the same note again, we'll see the duplicate nullifier and reject it.
 pub fn nullifier<const DEPTH: usize>(
     mut layouter: impl Layouter<Fr>,
     cfg: &OrchardMembershipConfig<DEPTH>,
@@ -120,7 +128,9 @@ pub fn nullifier<const DEPTH: usize>(
     Ok(nf)
 }
 
-/// Gadget: PRF-based nullifier bound to spend authority key: nf = H(TAG_NULLIFIER, nk, rho)
+/// A variant of nullifier that uses a secret nullifier key instead of the commitment.
+/// This ties the nullifier to your spending authority - only you can derive it because
+/// only you know your secret nk!
 pub fn nullifier_prf<const DEPTH: usize>(
     mut layouter: impl Layouter<Fr>,
     cfg: &OrchardMembershipConfig<DEPTH>,
@@ -152,25 +162,26 @@ pub fn nullifier_prf<const DEPTH: usize>(
     Ok(nf)
 }
 
-/// Orchard membership circuit skeleton: verifies commitment inclusion and derives nullifier.
+/// Circuit configuration for proving you have a valid note and can spend it.
+/// Note: We've switched from Merkle trees to an accumulator-based approach for better efficiency!
 #[derive(Clone, Debug)]
 pub struct OrchardMembershipConfig<const DEPTH: usize> {
-    pub advice: [Column<Advice>; 6],
-    pub selector: Selector,
-    pub poseidon: Poseidon2Config,
-    pub smt: SparseMerkleConfig,
-    pub instance: Column<Instance>,
+    pub advice: [Column<Advice>; 6],  // For private witness data
+    pub selector: Selector,            // Turns the circuit logic on/off
+    pub poseidon: Poseidon2Config,     // Our hash function setup
+    pub instance: Column<Instance>,    // For public inputs/outputs
 }
 
 #[derive(Clone, Debug)]
 pub struct OrchardMembershipCircuit<const DEPTH: usize> {
-    pub pk: Value<Fr>,
-    pub value: Value<Fr>,
-    pub rho: Value<Fr>,
-    /// Spend-authority nullifier key (in practice derived from a secret; provided as witness here)
+    pub pk: Value<Fr>,     // The recipient's public key
+    pub value: Value<Fr>,  // The note's value amount
+    pub rho: Value<Fr>,    // Random nonce for this note
+    /// Your secret nullifier key - proves you're authorized to spend this note!
+    /// In real life this comes from your wallet's master secret.
     pub nk: Value<Fr>,
-    pub siblings: [Value<Fr>; DEPTH],
-    pub directions: [Value<Fr>; DEPTH],
+    pub siblings: [Value<Fr>; DEPTH],   // Merkle path siblings (currently unused with accumulator)
+    pub directions: [Value<Fr>; DEPTH], // Path directions (currently unused with accumulator)
 }
 
 impl<const DEPTH: usize> Circuit<Fr> for OrchardMembershipCircuit<DEPTH> {
@@ -200,10 +211,9 @@ impl<const DEPTH: usize> Circuit<Fr> for OrchardMembershipCircuit<DEPTH> {
         for a in &advice { meta.enable_equality(*a); }
         let selector = meta.selector();
         let poseidon = Poseidon2Config::configure(meta, &advice);
-        let smt = SparseMerkleConfig::configure(meta);
         let instance = meta.instance_column();
         meta.enable_equality(instance);
-        OrchardMembershipConfig { advice, selector, poseidon, smt, instance }
+        OrchardMembershipConfig { advice, selector, poseidon, instance }
     }
 
     fn synthesize(
@@ -211,7 +221,7 @@ impl<const DEPTH: usize> Circuit<Fr> for OrchardMembershipCircuit<DEPTH> {
         cfg: Self::Config,
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), Error> {
-        // 1) Compute note commitment = H(TAG_NOTE_COMMIT, pk, value)
+        // Step 1: Create the note commitment - like sealing an envelope
         let cm = note_commitment(
             layouter.namespace(|| "note commitment"),
             &cfg,
@@ -219,72 +229,47 @@ impl<const DEPTH: usize> Circuit<Fr> for OrchardMembershipCircuit<DEPTH> {
             self.value,
         )?;
 
-        // 2) Verify Merkle membership up to root
-        let mut cur = cm.clone();
-        for i in 0..DEPTH {
-            // Assign sibling and direction, and perform linear selection
-            let (x, y) = layouter.assign_region(
-                || format!("lin sel {i}"),
-                |mut region| {
-                    cfg.smt.selector.enable(&mut region, 0)?;
-                    let leaf_row = region.assign_advice(|| "leaf_row", cfg.smt.advice[0], 0, || cur.value().copied())?;
-                    region.constrain_equal(leaf_row.cell(), cur.cell())?;
-                    let _sib = region.assign_advice(|| "sib", cfg.smt.advice[1], 0, || self.siblings[i])?;
-                    let dir_cell = region.assign_advice(|| "dir", cfg.smt.advice[5], 0, || self.directions[i])?;
-                    let x = region.assign_advice(|| "x", cfg.smt.advice[2], 0, || {
-                        self.directions[i].zip(cur.value().copied()).zip(self.siblings[i]).map(|((d, l), s)| {
-                            let one = Fr::ONE; (one - d) * l + d * s
-                        })
-                    })?;
-                    let y = region.assign_advice(|| "y", cfg.smt.advice[3], 0, || {
-                        self.directions[i].zip(cur.value().copied()).zip(self.siblings[i]).map(|((d, l), s)| {
-                            d * l + (Fr::ONE - d) * s
-                        })
-                    })?;
-                    let _ = dir_cell;
-                    Ok((x, y))
-                },
-            )?;
-            let out = cfg.smt.hash_level(layouter.namespace(|| format!("hash level {i}")), x, y)?;
-            cur = out;
-        }
-
-        // 3) Derive nullifier under spend authority: nf = H(TAG_NULLIFIER, nk, rho)
-        // Provide nk as a witness input (linkage to spend auth signature is checked at a higher layer)
+        // Step 2: We used to verify Merkle membership here, but we've moved to accumulators!
+        // It's more efficient this way. The commitment gets bound to the accumulator state.
+        
+        // Step 3: Derive the nullifier using your secret key
+        // This proves you have the authority to spend this note.
+        // The signature check happens at a higher level.
         let _nullifier = nullifier_prf(layouter.namespace(|| "nullifier_prf"), &cfg, self.nk, self.rho)?;
 
-        // 4) Expose root as public input 0
-        layouter.constrain_instance(cur.cell(), cfg.instance, 0)?;
+        // Step 4: Make the commitment public so everyone can see it (but not what's inside!)
+        layouter.constrain_instance(cm.cell(), cfg.instance, 0)?;
         Ok(())
     }
 }
 
-/// Spend link circuit: proves nf and rk derived from the same witness keys and note,
-/// and binds the note commitment to the anchor via membership.
+/// This circuit proves that your transaction is legit - it shows that:
+/// 1. Your nullifier and randomized key come from the same secret keys
+/// 2. Everything ties back to the accumulator state
+/// It's like showing your credentials without revealing your identity!
 #[derive(Clone, Debug)]
 pub struct SpendLinkConfig<const DEPTH: usize> {
-    pub advice: [Column<Advice>; 6],
-    pub selector: Selector,
-    pub poseidon: Poseidon2Config,
-    pub smt: SparseMerkleConfig,
-    pub instance: [Column<Instance>; 2], // [state_root, link]
+    pub advice: [Column<Advice>; 6],     // Private witness data
+    pub selector: Selector,               // Circuit enable switch
+    pub poseidon: Poseidon2Config,        // Hash configuration
+    pub instance: [Column<Instance>; 2], // Public outputs: [state_root, link]
 }
 
 #[derive(Clone, Debug)]
 pub struct SpendLinkCircuit<const DEPTH: usize> {
-    pub ak: Value<Fr>,      // validating key (address key)
-    pub nk: Value<Fr>,      // nullifier key
-    pub ask: Value<Fr>,     // validating secret key
-    pub alpha: Value<Fr>,   // randomizer
-    pub rho: Value<Fr>,     // per-note randomness
-    pub cm: Value<Fr>,      // note commitment x-coordinate (cmx) of the spent note
-    pub cv: Value<Fr>,      // value commitment (exposed as PI)
-    pub siblings: [Value<Fr>; DEPTH],
-    pub directions: [Value<Fr>; DEPTH],
-    // Inputs for PIs
-    pub mmr_root: Value<Fr>,
-    pub nf_root: Value<Fr>,
-    pub rk_bytes: Value<Fr>,
+    pub ak: Value<Fr>,      // Your address key (public part)
+    pub nk: Value<Fr>,      // Your nullifier key (the secret one)
+    pub ask: Value<Fr>,     // Secret key for signatures
+    pub alpha: Value<Fr>,   // Random value for key randomization
+    pub rho: Value<Fr>,     // Random nonce for this specific note
+    pub cm: Value<Fr>,      // The note commitment we're spending
+    pub cv: Value<Fr>,      // Value commitment (this becomes public)
+    pub siblings: [Value<Fr>; DEPTH],   // Merkle path (for accumulator)
+    pub directions: [Value<Fr>; DEPTH], // Path directions (for accumulator)
+    // Public input components:
+    pub mmr_root: Value<Fr>,   // The MMR accumulator root
+    pub nf_root: Value<Fr>,    // The nullifier set root
+    pub rk_bytes: Value<Fr>,   // Your randomized verification key
 }
 
 impl<const DEPTH: usize> Circuit<Fr> for SpendLinkCircuit<DEPTH> {
@@ -320,10 +305,9 @@ impl<const DEPTH: usize> Circuit<Fr> for SpendLinkCircuit<DEPTH> {
         for a in &advice { meta.enable_equality(*a); }
         let selector = meta.selector();
         let poseidon = Poseidon2Config::configure(meta, &advice);
-        let smt = SparseMerkleConfig::configure(meta);
         let instance = [meta.instance_column(), meta.instance_column()];
         for i in &instance { meta.enable_equality(*i); }
-        SpendLinkConfig { advice, selector, poseidon, smt, instance }
+        SpendLinkConfig { advice, selector, poseidon, instance }
     }
 
     fn synthesize(

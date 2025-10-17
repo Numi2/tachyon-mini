@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 pub mod error;
-// # node_ext
-// Numan Thabit
-// Validator / Node extension implementation for Tachyon.
-// Verifies PCD proofs, nullifier checks, and maintains minimal state for validation.
+//! # node_ext
+//! Numan Thabit
+//!
+//! The validator node that keeps the network honest!
+//! 
+//! This is where transactions get verified - we check PCD proofs, make sure nobody's
+//! double-spending (nullifier checks), and keep track of just enough state to validate
+//! everything. Lean and mean validation for maximum throughput.
 
 use accum_mmr::{MmrAccumulator, MmrWitness, SerializableHash, MmrDelta, TachygramAccumulator};
 use accum_set::{Smt16Accumulator, Smt16NonMembershipProof, Smt16Delta};

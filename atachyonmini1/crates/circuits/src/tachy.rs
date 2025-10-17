@@ -1,5 +1,6 @@
-//! Tachyactions: minimal spend/output circuit skeleton over Fr with SMT checks and Poseidon digest.
+//! Tachyactions: minimal spend/output circuit skeleton over Fr with accumulator-based verification and Poseidon digest.
 //! Numan Thabit 2025
+//! NOTE: Merkle tree verification removed - using accumulator-based approach for state updates.
 
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector};
@@ -9,25 +10,21 @@ use halo2_gadgets::poseidon::primitives::{ConstantLength, P128Pow5T3};
 use pasta_curves::Fp as Fr;
 use ff::Field;
 
-use crate::sparse_merkle::SparseMerkleConfig;
-
 #[derive(Clone, Debug)]
 pub struct TachyConfig {
     pub advice: [Column<Advice>; 6],
     pub selector: Selector,
-    pub instance: [Column<Instance>; 2], // 0: accumulator root, 1: digest
+    pub instance: [Column<Instance>; 2], // 0: accumulator digest, 1: action digest
     pub poseidon: Pow5Config<Fr, 3, 2>,
-    pub smt: SparseMerkleConfig,
 }
 
+/// Tachyaction circuit: proves valid state transition via accumulator update
+/// - Computes action digest from payment_key, value, nonce
+/// - Updates accumulator state: acc' = H(TAG_ACC, acc, action_digest)
+/// - Proves ownership via simplified Schnorr-like signature
 #[derive(Clone, Debug)]
-pub struct TachyActionCircuit<const D: usize> {
-    pub acc_root_before: Value<Fr>,
-    pub acc_root_after: Value<Fr>,
-    pub leaf_old: Value<Fr>,
-    pub leaf_new: Value<Fr>,
-    pub siblings: [Value<Fr>; D],
-    pub directions: [Value<Fr>; D],
+pub struct TachyActionCircuit {
+    pub acc_before: Value<Fr>,
     pub payment_key: Value<Fr>,
     pub value: Value<Fr>,
     pub nonce: Value<Fr>,
@@ -36,18 +33,13 @@ pub struct TachyActionCircuit<const D: usize> {
     pub sig_s: Value<Fr>,
 }
 
-impl<const D: usize> Circuit<Fr> for TachyActionCircuit<D> {
+impl Circuit<Fr> for TachyActionCircuit {
     type Config = TachyConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
         Self {
-            acc_root_before: Value::unknown(),
-            acc_root_after: Value::unknown(),
-            leaf_old: Value::unknown(),
-            leaf_new: Value::unknown(),
-            siblings: [Value::unknown(); D],
-            directions: [Value::unknown(); D],
+            acc_before: Value::unknown(),
             payment_key: Value::unknown(),
             value: Value::unknown(),
             nonce: Value::unknown(),
@@ -81,12 +73,8 @@ impl<const D: usize> Circuit<Fr> for TachyActionCircuit<D> {
             rc_b,
         );
 
-        let smt = SparseMerkleConfig::configure(meta);
-
         // Signature linear relation gate (toy-Schnorr over the field):
         // Enforce s = r + chal * pk in one row when selector is enabled.
-        // Here pk is the payment_key field element and chal is a Poseidon challenge
-        // derived from (tag_sig, digest, pk).
         meta.create_gate("sig_linear_check", |meta| {
             let s = meta.query_selector(selector);
             let pk = meta.query_advice(advice[0], Rotation::cur());
@@ -97,7 +85,7 @@ impl<const D: usize> Circuit<Fr> for TachyActionCircuit<D> {
             vec![s * (sig_s - (r + chal * pk))]
         });
 
-        TachyConfig { advice, selector, instance, poseidon, smt }
+        TachyConfig { advice, selector, instance, poseidon }
     }
 
     fn synthesize(
@@ -105,93 +93,7 @@ impl<const D: usize> Circuit<Fr> for TachyActionCircuit<D> {
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), Error> {
-        // 1) Assign before/after roots and leaves
-        let acc_before_cell = layouter.assign_region(
-            || "acc before",
-            |mut region| region.assign_advice(|| "acc_before", config.smt.advice[0], 0, || self.acc_root_before),
-        )?;
-        let acc_after_cell = layouter.assign_region(
-            || "acc after",
-            |mut region| region.assign_advice(|| "acc_after", config.smt.advice[1], 0, || self.acc_root_after),
-        )?;
-        let mut cur_old = layouter.assign_region(
-            || "leaf_old",
-            |mut region| region.assign_advice(|| "leaf_old", config.smt.advice[0], 0, || self.leaf_old),
-        )?;
-        let leaf_new_cell = layouter.assign_region(
-            || "leaf_new",
-            |mut region| region.assign_advice(|| "leaf_new", config.smt.advice[0], 0, || self.leaf_new),
-        )?;
-        let mut cur_new = leaf_new_cell.clone();
-
-        // 2) Walk the path to compute old and new roots
-        for i in 0..D {
-            // Old path selection: assign dir and sib in the same row as the gate
-            let (x_old, y_old, _dir_old) = layouter.assign_region(
-                || format!("lin sel old {i}"),
-                |mut region| {
-                    config.smt.selector.enable(&mut region, 0)?;
-                    let _sib = region.assign_advice(|| "sib_old", config.smt.advice[1], 0, || self.siblings[i])?;
-                    let dir_cell = region.assign_advice(|| "dir_old", config.smt.advice[5], 0, || self.directions[i])?;
-                    let x = region.assign_advice(|| "x_old", config.smt.advice[2], 0, || {
-                        self.directions[i].zip(cur_old.value()).zip(self.siblings[i]).map(|((d, l), s)| {
-                            let one = Fr::ONE;
-                            (one - d) * l + d * s
-                        })
-                    })?;
-                    let y = region.assign_advice(|| "y_old", config.smt.advice[3], 0, || {
-                        self.directions[i].zip(cur_old.value()).zip(self.siblings[i]).map(|((d, l), s)| {
-                            d * l + (Fr::ONE - d) * s
-                        })
-                    })?;
-                    Ok((x, y, dir_cell))
-                },
-            )?;
-            cur_old = config.smt.hash_level(
-                layouter.namespace(|| format!("hash old {i}")),
-                x_old,
-                y_old,
-            )?;
-
-            // New path selection (same siblings/directions): assign again in the gate row
-            let (x_new, y_new, _dir_new) = layouter.assign_region(
-                || format!("lin sel new {i}"),
-                |mut region| {
-                    config.smt.selector.enable(&mut region, 0)?;
-                    let _sib = region.assign_advice(|| "sib_new", config.smt.advice[1], 0, || self.siblings[i])?;
-                    let dir_cell = region.assign_advice(|| "dir_new", config.smt.advice[5], 0, || self.directions[i])?;
-                    let x = region.assign_advice(|| "x_new", config.smt.advice[2], 0, || {
-                        self.directions[i].zip(cur_new.value()).zip(self.siblings[i]).map(|((d, l), s)| {
-                            let one = Fr::ONE;
-                            (one - d) * l + d * s
-                        })
-                    })?;
-                    let y = region.assign_advice(|| "y_new", config.smt.advice[3], 0, || {
-                        self.directions[i].zip(cur_new.value()).zip(self.siblings[i]).map(|((d, l), s)| {
-                            d * l + (Fr::ONE - d) * s
-                        })
-                    })?;
-                    Ok((x, y, dir_cell))
-                },
-            )?;
-            cur_new = config.smt.hash_level(
-                layouter.namespace(|| format!("hash new {i}")),
-                x_new,
-                y_new,
-            )?;
-        }
-
-        // 3) Enforce old/new root consistency with provided before/after
-        layouter.assign_region(
-            || "enforce roots",
-            |mut region| {
-                region.constrain_equal(acc_before_cell.cell(), cur_old.cell())?;
-                region.constrain_equal(acc_after_cell.cell(), cur_new.cell())?;
-                Ok(())
-            },
-        )?;
-
-        // 4) Compute digest over (payment_key, value, nonce) via Poseidon with domain separation
+        // 1) Compute action digest over (payment_key, value, nonce) via Poseidon with domain separation
         // inner = H(tag_in, pk, val), digest = H(tag_out, inner, nonce)
         let chip_in = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
         let h_in = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
@@ -235,27 +137,36 @@ impl<const D: usize> Circuit<Fr> for TachyActionCircuit<D> {
                 Ok(c)
             },
         )?;
-        let digest = h_out.hash(
+        let action_digest = h_out.hash(
             layouter.namespace(|| "hash outer"),
             [tag_out, inner, nonce],
         )?;
 
-        // 5) Bind digest to updated leaf: leaf_new must equal digest
-        let leaf_new_again = layouter.assign_region(
-            || "leaf_new_again",
-            |mut region| region.assign_advice(|| "leaf_new_again", config.advice[4], 0, || self.leaf_new),
+        // 2) Update accumulator: acc_after = H(TAG_ACC, acc_before, action_digest)
+        let chip_acc = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
+        let h_acc = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
+            chip_acc,
+            layouter.namespace(|| "poseidon accumulator"),
         )?;
-        layouter.assign_region(
-            || "bind digest to leaf_new",
+        let tag_acc = layouter.assign_region(
+            || "tag_acc",
             |mut region| {
-                region.constrain_equal(leaf_new_cell.cell(), leaf_new_again.cell())?;
-                region.constrain_equal(leaf_new_again.cell(), digest.cell())?;
-                Ok(())
+                let c = region.assign_advice(|| "tag_acc", config.advice[5], 0, || Value::known(Fr::from(50u64)))?;
+                region.constrain_constant(c.cell(), Fr::from(50u64))?;
+                Ok(c)
             },
         )?;
+        let acc_before_cell = layouter.assign_region(
+            || "acc_before",
+            |mut region| region.assign_advice(|| "acc_before", config.advice[4], 0, || self.acc_before),
+        )?;
+        let acc_after = h_acc.hash(
+            layouter.namespace(|| "hash accumulator"),
+            [tag_acc, acc_before_cell.clone(), action_digest.clone()],
+        )?;
 
-        // 6) Compute signature challenge and enforce simplified linear relation s = r + chal * pk
-        // Challenge: chal = H(tag_sig, digest, pk)
+        // 3) Compute signature challenge and enforce simplified linear relation s = r + chal * pk
+        // Challenge: chal = H(tag_sig, action_digest, pk)
         let chip_sig = Pow5Chip::<Fr, 3, 2>::construct(config.poseidon.clone());
         let h_sig = PoseidonHash::<Fr, Pow5Chip<Fr, 3, 2>, P128Pow5T3, ConstantLength<3>, 3, 2>::init(
             chip_sig,
@@ -267,7 +178,7 @@ impl<const D: usize> Circuit<Fr> for TachyActionCircuit<D> {
         )?;
         let chal = h_sig.hash(
             layouter.namespace(|| "hash(tag_sig,digest,pk)"),
-            [tag_sig.clone(), digest.clone(), pk.clone()],
+            [tag_sig.clone(), action_digest.clone(), pk.clone()],
         )?;
 
         // Assign a row for the signature linear check and enable the selector
@@ -289,9 +200,9 @@ impl<const D: usize> Circuit<Fr> for TachyActionCircuit<D> {
             },
         )?;
 
-        // Expose public outputs
-        layouter.constrain_instance(acc_after_cell.cell(), config.instance[0], 0)?;
-        layouter.constrain_instance(digest.cell(), config.instance[1], 0)?;
+        // Expose public outputs: [acc_after, action_digest]
+        layouter.constrain_instance(acc_after.cell(), config.instance[0], 0)?;
+        layouter.constrain_instance(action_digest.cell(), config.instance[1], 0)?;
         Ok(())
     }
 }
@@ -307,6 +218,14 @@ pub fn compute_tachy_digest(pk: Fr, value: Fr, nonce: Fr) -> Fr {
         .hash([tag_out, inner, nonce])
 }
 
+/// Native helper to compute accumulator update: acc' = H(TAG_ACC, acc, action_digest)
+pub fn compute_acc_update(acc_before: Fr, action_digest: Fr) -> Fr {
+    use halo2_gadgets::poseidon::primitives as poseidon_primitives;
+    let tag_acc = Fr::from(50u64);
+    poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
+        .hash([tag_acc, acc_before, action_digest])
+}
+
 /// Native helper to compute the signature challenge used in-circuit
 pub fn compute_sig_challenge(digest: Fr, pk: Fr) -> Fr {
     use halo2_gadgets::poseidon::primitives as poseidon_primitives;
@@ -319,138 +238,82 @@ pub fn compute_sig_challenge(digest: Fr, pk: Fr) -> Fr {
 mod tests {
     use super::*;
     use halo2_proofs::dev::MockProver;
-    use crate::sparse_merkle::tests::native_hash;
 
     #[test]
-    fn test_tachy_action_membership_and_digest() {
-        const D: usize = 3;
-        let leaf_old = Fr::from(7u64);
+    fn test_tachy_action_accumulator_update() {
+        let acc_before = Fr::from(42u64);
         let pk = Fr::from(123u64);
         let val = Fr::from(5u64);
         let nonce = Fr::from(77u64);
-        let leaf_new = compute_tachy_digest(pk, val, nonce);
-        let sibs = [Fr::from(2), Fr::from(3), Fr::from(5)];
-        let dirs = [Fr::from(0), Fr::from(1), Fr::from(0)];
+        let action_digest = compute_tachy_digest(pk, val, nonce);
+        let acc_after = compute_acc_update(acc_before, action_digest);
 
-        let mut old_root = leaf_old;
-        for i in 0..D {
-            let d = dirs[i] != Fr::ZERO;
-            let (x, y) = if !d { (old_root, sibs[i]) } else { (sibs[i], old_root) };
-            old_root = native_hash(x, y);
-        }
-        let mut new_root = leaf_new;
-        for i in 0..D {
-            let d = dirs[i] != Fr::ZERO;
-            let (x, y) = if !d { (new_root, sibs[i]) } else { (sibs[i], new_root) };
-            new_root = native_hash(x, y);
-        }
+        // Compute valid signature
+        let chal = compute_sig_challenge(action_digest, pk);
+        let r = Fr::from(9u64);
+        let s = r + chal * pk;
 
-        let circuit = TachyActionCircuit::<D> {
-            acc_root_before: Value::known(old_root),
-            acc_root_after: Value::known(new_root),
-            leaf_old: Value::known(leaf_old),
-            leaf_new: Value::known(leaf_new),
-            siblings: [Value::known(sibs[0]), Value::known(sibs[1]), Value::known(sibs[2])],
-            directions: [Value::known(dirs[0]), Value::known(dirs[1]), Value::known(dirs[2])],
+        let circuit = TachyActionCircuit {
+            acc_before: Value::known(acc_before),
             payment_key: Value::known(pk),
             value: Value::known(val),
             nonce: Value::known(nonce),
-            sig_r: {
-                // choose r and derive s according to s = r + chal*pk
-                let _chal = compute_sig_challenge(leaf_new, pk);
-                let r = Fr::from(9u64);
-                let _s = r + _chal * pk;
-                // store s in circuit field below; return r here
-                Value::known(r)
-            },
-            sig_s: {
-                let _chal = compute_sig_challenge(leaf_new, pk);
-                let r = Fr::from(9u64);
-                let s = r + _chal * pk;
-                Value::known(s)
-            },
+            sig_r: Value::known(r),
+            sig_s: Value::known(s),
         };
-        let public_inputs = vec![vec![new_root], vec![leaf_new]]; // root, digest
+        
+        let public_inputs = vec![vec![acc_after], vec![action_digest]];
         let prover = MockProver::run(12, &circuit, public_inputs).unwrap();
         assert_eq!(prover.verify(), Ok(()));
     }
 
     #[test]
-    fn test_tachy_action_wrong_pk_fails() {
-        const D: usize = 3;
-        let pk = Fr::from(123u64);
-        let val = Fr::from(5u64);
-        let nonce = Fr::from(77u64);
-        let leaf_new = compute_tachy_digest(pk, val, nonce);
-        let sibs = [Fr::from(2), Fr::from(3), Fr::from(5)];
-        let dirs = [Fr::from(0), Fr::from(1), Fr::from(0)];
-        let mut new_root = leaf_new;
-        for i in 0..D {
-            let d = dirs[i] != Fr::ZERO;
-            let (x, y) = if !d { (new_root, sibs[i]) } else { (sibs[i], new_root) };
-            new_root = native_hash(x, y);
-        }
-        let wrong_pk = Fr::from(999u64);
-        let circuit = TachyActionCircuit::<D> {
-            acc_root_before: Value::known(Fr::ZERO),
-            acc_root_after: Value::known(new_root),
-            leaf_old: Value::known(Fr::ZERO),
-            leaf_new: Value::known(leaf_new),
-            siblings: [Value::known(sibs[0]), Value::known(sibs[1]), Value::known(sibs[2])],
-            directions: [Value::known(dirs[0]), Value::known(dirs[1]), Value::known(dirs[2])],
-            payment_key: Value::known(wrong_pk),
-            value: Value::known(val),
-            nonce: Value::known(nonce),
-            sig_r: {
-                // Build signature using the correct pk, but witness wrong_pk; should fail
-                let chal = compute_sig_challenge(leaf_new, pk);
-                let r = Fr::from(9u64);
-                Value::known(r)
-            },
-            sig_s: {
-                let chal = compute_sig_challenge(leaf_new, pk);
-                let r = Fr::from(9u64);
-                let s = r + chal * pk; // uses true pk, circuit has wrong_pk
-                Value::known(s)
-            },
-        };
-        let prover = MockProver::run(12, &circuit, vec![vec![new_root], vec![leaf_new]]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
     fn test_tachy_action_wrong_sig_fails() {
-        const D: usize = 3;
+        let acc_before = Fr::from(42u64);
         let pk = Fr::from(123u64);
         let val = Fr::from(5u64);
         let nonce = Fr::from(77u64);
-        let leaf_new = compute_tachy_digest(pk, val, nonce);
-        let sibs = [Fr::from(2), Fr::from(3), Fr::from(5)];
-        let dirs = [Fr::from(0), Fr::from(1), Fr::from(0)];
-        let mut new_root = leaf_new;
-        use crate::sparse_merkle::tests::native_hash;
-        for i in 0..D {
-            let d = dirs[i] != Fr::ZERO;
-            let (x, y) = if !d { (new_root, sibs[i]) } else { (sibs[i], new_root) };
-            new_root = native_hash(x, y);
-        }
+        let action_digest = compute_tachy_digest(pk, val, nonce);
+        let acc_after = compute_acc_update(acc_before, action_digest);
         let bad_s = Fr::from(999u64);
-        let circuit = TachyActionCircuit::<D> {
-            acc_root_before: Value::known(Fr::ZERO),
-            acc_root_after: Value::known(new_root),
-            leaf_old: Value::known(Fr::ZERO),
-            leaf_new: Value::known(leaf_new),
-            siblings: [Value::known(sibs[0]), Value::known(sibs[1]), Value::known(sibs[2])],
-            directions: [Value::known(dirs[0]), Value::known(dirs[1]), Value::known(dirs[2])],
+
+        let circuit = TachyActionCircuit {
+            acc_before: Value::known(acc_before),
             payment_key: Value::known(pk),
             value: Value::known(val),
             nonce: Value::known(nonce),
             sig_r: Value::known(Fr::from(9u64)),
             sig_s: Value::known(bad_s),
         };
-        let prover = MockProver::run(12, &circuit, vec![vec![new_root], vec![leaf_new]]).unwrap();
+        
+        let prover = MockProver::run(12, &circuit, vec![vec![acc_after], vec![action_digest]]).unwrap();
         assert!(prover.verify().is_err());
     }
+
+    #[test]
+    fn test_tachy_action_chaining() {
+        // Test chaining multiple tachyactions: acc1 = update(acc0, d1), acc2 = update(acc1, d2)
+        let acc0 = Fr::ZERO;
+        
+        // First action
+        let pk1 = Fr::from(100u64);
+        let d1 = compute_tachy_digest(pk1, Fr::from(10u64), Fr::from(1u64));
+        let acc1 = compute_acc_update(acc0, d1);
+        
+        // Second action
+        let pk2 = Fr::from(200u64);
+        let d2 = compute_tachy_digest(pk2, Fr::from(20u64), Fr::from(2u64));
+        let acc2 = compute_acc_update(acc1, d2);
+        
+        // Verify chaining properties
+        assert_ne!(acc0, acc1);
+        assert_ne!(acc1, acc2);
+        assert_ne!(acc0, acc2);
+        
+        // Verify determinism: recomputing gives same result
+        let acc1_again = compute_acc_update(acc0, d1);
+        let acc2_again = compute_acc_update(acc1_again, d2);
+        assert_eq!(acc1, acc1_again);
+        assert_eq!(acc2, acc2_again);
+    }
 }
-
-

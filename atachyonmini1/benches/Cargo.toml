@@ -1,0 +1,24 @@
+[package]
+name = "tachyon-benches"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+circuits = { path = "../crates/circuits" }
+criterion = { workspace = true }
+pasta_curves = { workspace = true }
+ff = { workspace = true }
+
+[[bench]]
+name = "poseidon_bench"
+harness = false
+
+[[bench]]
+name = "circuit_proving"
+harness = false
+
+[[bench]]
+name = "tachygram_ops"
+harness = false
+

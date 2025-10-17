@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 //! # wallet
 //!
-//! Tachyon wallet implementation providing secure note management,
-//! PCD state synchronization, and transaction construction.
+//! Your Tachyon wallet - this is where your notes live and transactions happen!
+//! 
+//! We handle everything securely: encrypting your notes, syncing with the network,
+//! and building transactions. Think of it as your personal vault that can talk
+//! to the blockchain without revealing your secrets.
 
 use anyhow::{anyhow, Result};
 #[cfg(feature = "pcd")]
@@ -48,16 +51,16 @@ use tachyon_zk::orchard::prove_spend_link;
 #[cfg(feature = "zcash")]
 mod zcash;
 
-/// Wallet configuration
+/// All the settings your wallet needs to get started!
 #[derive(Clone)]
 pub struct WalletConfig {
-    /// Database path for encrypted storage
+    /// Where to store your encrypted wallet database on disk
     pub db_path: String,
-    /// Master password for database encryption
+    /// The master password that protects everything (keep this safe!)
     pub master_password: String,
-    /// Network configuration (iroh node ID, etc.)
+    /// How to connect to the Tachyon network (peer discovery, etc.)
     pub network_config: NetworkConfig,
-    /// Sync configuration
+    /// How often to sync and how much data to fetch at once
     pub sync_config: SyncConfig,
 }
 

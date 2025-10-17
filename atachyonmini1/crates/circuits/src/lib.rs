@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 //! # circuits
 //! Numan Thabit 2025
-//! Zero-knowledge proof circuits for Tachyon-mini PCD system.
-//! Implements transition circuits and aggregation for proof-carrying data.
+//!
+//! Hey there! This module contains all the zero-knowledge proof magic for the Tachyon-mini system.
+//! We're building circuits that let you prove state transitions and aggregate proofs together,
+//! all while keeping things private and secure. Pretty cool stuff!
 
 use anyhow::Result;
 use blake3::Hasher as Blake3Hasher;
@@ -31,25 +33,30 @@ use ragu::circuit as ragu_circuit;
 use ragu::circuit::Sink;
 use ragu::drivers::compute_public_inputs;
 use ragu::maybe as ragu_maybe;
-mod sparse_merkle;
 pub mod tachy;
+pub mod tachygram;
 pub mod orchard;
 pub mod recursion;
 pub mod unified_block;
 pub mod pcs;
 pub mod wallet_step;
+pub mod metrics;
+pub mod proof_cache;
 
-// Re-export selected helpers for external consumers (e.g., CLI)
+// Making this available for the CLI and other modules that need it
 pub use crate::tachy::compute_tachy_digest;
 
-/// Poseidon-based transition hash (native) mirroring the in-circuit composition.
+/// This computes a transition hash using Poseidon (a ZK-friendly hash function).
+/// Think of it like a fingerprint that proves one state validly transitions to another.
 ///
-/// Composition with domain separation (width 3, rate 2):
-///   d1 = H(TAG_D1, prev_state, mmr_root)
-///   d2 = H(TAG_D2, nullifier_root, anchor_height)
-///   digest = H(TAG_D3, d1, d2)
+/// Here's how it works - we hash things in stages to keep them organized:
+///   First round: d1 = Hash(prev_state + mmr_root)
+///   Second round: d2 = Hash(nullifier_root + anchor_height)
+///   Final digest: Hash(d1 + d2)
+/// Each stage uses a unique tag to prevent mixing up different types of data.
 fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr, anchor_height: Fr) -> Fr {
-    // Use the same Poseidon spec the circuit is configured with (P128Pow5T3, t=3, rate=2)
+    // We're using Poseidon configured with specific parameters (P128Pow5T3, width=3, rate=2)
+    // These tags help us separate different hash contexts - like using different salt for different dishes!
     let tag_d1 = Fr::from(1u64);
     let tag_d2 = Fr::from(2u64);
     let tag_d3 = Fr::from(3u64);
@@ -62,20 +69,21 @@ fn compute_transition_poseidon(prev_state: Fr, mmr_root: Fr, nullifier_root: Fr,
         .hash([tag_d3, d1, d2])
 }
 
-/// Poseidon-based Fiat–Shamir challenge (native) for recursion chaining with context binding.
-/// Uses width-3, rate-2 Poseidon (same spec as transition) with a context "tag" value derived from
-/// a transcript-like binding (vk/circuit id). Callers should pass a stable context element.
+/// This generates a cryptographic challenge for proof aggregation using Fiat-Shamir.
+/// It's like creating a random number that's verifiable and depends on everything that came before.
+/// We use the same Poseidon hash settings as elsewhere to keep things consistent.
+/// The context parameter helps tie this challenge to a specific circuit or verification key.
 fn compute_fs_challenge_poseidon_ctx(ctx: Fr, prev: Fr, cur: Fr) -> Fr {
     poseidon_primitives::Hash::<Fr, P128Pow5T3, ConstantLength<3>, 3, 2>::init()
         .hash([ctx, prev, cur])
 }
 
 // -----------------------------
-// ragu integration
+// Integration with the ragu framework
 // -----------------------------
 
-// Use ragu's concrete production driver for public input extraction
-// Using ragu's production drivers via `compute_public_inputs`
+// Ragu is our underlying proof system framework - think of it as the engine that powers our circuits.
+// We're using its production-ready drivers to handle public inputs and witness data.
 
 #[derive(Clone, Copy)]
 struct TransitionInput {
@@ -152,14 +160,15 @@ fn ragu_compute_transition_public_inputs(prev: Fr, mmr: Fr, nul: Fr, anchor: Fr)
     Ok([vals[0], vals[1], vals[2], vals[3], vals[4]])
 }
 
-/// Compute the transition Poseidon digest and return canonical 32-byte encoding
+/// Takes your state data and computes a transition digest, returning it as a 32-byte array.
+/// This is the public-facing version that works with raw bytes instead of field elements.
 pub fn compute_transition_digest_bytes(
     prev_state: &[u8; 32],
     mmr_root: &[u8; 32],
     nullifier_root: &[u8; 32],
     anchor_height: u64,
 ) -> [u8; 32] {
-    // Map arbitrary 32 bytes into a field element using uniform bytes derivation
+    // We need to convert raw bytes into field elements first (numbers our math can work with)
     fn to_fr(bytes: &[u8; 32]) -> Fr {
         use blake3::Hasher;
         use std::io::Read as _;
@@ -168,7 +177,7 @@ pub fn compute_transition_digest_bytes(
         hasher.update(bytes);
         let mut xof = hasher.finalize_xof();
         let mut wide = [0u8; 64];
-        // XOF read from BLAKE3 with a fixed-size buffer is infallible
+        // This read is safe - BLAKE3's extendable output always gives us what we need
         let _ = xof.read_exact(&mut wide);
         Fr::from_uniform_bytes(&wide)
     }
@@ -182,18 +191,20 @@ pub fn compute_transition_digest_bytes(
     out
 }
 
-/// Wallet domain tags (v1) for state_root and link
+/// These are special numbers we use to keep different wallet operations separate.
+/// Think of them as different channels - each one has its own tag so we don't mix things up!
 pub mod wallet_tags {
-    pub const TAG_STATE_V1: u64 = 201;
-    pub const TAG_LINK_V1: u64 = 202;
-    pub const TAG_INIT_V1: u64 = 301;
-    pub const TAG_STEP_V1: u64 = 302;
-    pub const TAG_FOLD_V1: u64 = 303;
+    pub const TAG_STATE_V1: u64 = 201;  // For wallet state roots
+    pub const TAG_LINK_V1: u64 = 202;   // For linking transactions
+    pub const TAG_INIT_V1: u64 = 301;   // Starting a new aggregation
+    pub const TAG_STEP_V1: u64 = 302;   // Each step in the aggregation
+    pub const TAG_FOLD_V1: u64 = 303;   // Folding steps together
 }
 
-/// Compute wallet state_root bytes: Poseidon(TAG_STATE_V1, mmr_root, nf_root)
+/// Creates a compact fingerprint of your wallet state by hashing the MMR and nullifier roots together.
+/// This gives us a single value we can use to verify the wallet's current state.
 pub fn compute_wallet_state_root_bytes(mmr_root: &[u8; 32], nf_root: &[u8; 32]) -> [u8; 32] {
-    // Convert 32-byte encodings to field elements; canonical-only
+    // Converting bytes to field elements - we only accept properly formatted values
     fn to_fr(bytes: &[u8; 32]) -> Option<Fr> { Option::<Fr>::from(Fr::from_repr(*bytes)) }
     let tag = Fr::from(wallet_tags::TAG_STATE_V1);
     let mmr = match to_fr(mmr_root) { Some(x) => x, None => return [0u8; 32] };
@@ -202,11 +213,13 @@ pub fn compute_wallet_state_root_bytes(mmr_root: &[u8; 32], nf_root: &[u8; 32]) 
     let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); out
 }
 
-/// Compute wallet link bytes: Poseidon(TAG_LINK_V1, rk_bytes, nf, cmx, cv)
+/// Creates a unique identifier that links together a transaction's key components.
+/// This proves that all these pieces (randomized key, nullifier, commitment, value) belong together.
 pub fn compute_wallet_link_bytes(rk_bytes: &[u8; 32], nf: &[u8; 32], cmx: &[u8; 32], cv: &[u8; 32]) -> [u8; 32] {
     fn to_fr(bytes: &[u8; 32]) -> Option<Fr> { Option::<Fr>::from(Fr::from_repr(*bytes)) }
     let tag = Fr::from(wallet_tags::TAG_LINK_V1);
-    // Compose in two rounds with t=3 rate=2 sponge: ((tag, rk, nf) -> d1), then (d1, cmx, cv) -> out
+    // We hash this in two rounds since we have more data than fits in one go
+    // Round 1: combine tag + randomized key + nullifier, then Round 2: add commitment + value
     let rkf = match to_fr(rk_bytes) { Some(x) => x, None => return [0u8; 32] };
     let nff = match to_fr(nf) { Some(x) => x, None => return [0u8; 32] };
     let cmxf = match to_fr(cmx) { Some(x) => x, None => return [0u8; 32] };
@@ -218,7 +231,8 @@ pub fn compute_wallet_link_bytes(rk_bytes: &[u8; 32], nf: &[u8; 32], cmx: &[u8; 
     let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); out
 }
 
-/// Checked variant: returns None if any input is non-canonical field encoding
+/// Same as compute_wallet_state_root_bytes, but this version is more strict - it'll return None
+/// if your input data isn't properly formatted. Use this when you need to be extra careful!
 pub fn compute_wallet_state_root_bytes_checked(mmr_root: &[u8; 32], nf_root: &[u8; 32]) -> Option<[u8; 32]> {
     let tag = Fr::from(wallet_tags::TAG_STATE_V1);
     let mmr = Option::<Fr>::from(Fr::from_repr(*mmr_root))?;
@@ -227,7 +241,8 @@ pub fn compute_wallet_state_root_bytes_checked(mmr_root: &[u8; 32], nf_root: &[u
     let mut out = [0u8; 32]; out.copy_from_slice(out_fr.to_repr().as_ref()); Some(out)
 }
 
-/// Checked variant: returns None if any input is non-canonical field encoding
+/// The safety-first version of compute_wallet_link_bytes - returns None if anything looks fishy.
+/// Perfect for when you're validating untrusted input data.
 pub fn compute_wallet_link_bytes_checked(rk_bytes: &[u8; 32], nf: &[u8; 32], cmx: &[u8; 32], cv: &[u8; 32]) -> Option<[u8; 32]> {
     let tag = Fr::from(wallet_tags::TAG_LINK_V1);
     let rkf = Option::<Fr>::from(Fr::from_repr(*rk_bytes))?;
@@ -269,55 +284,58 @@ pub fn compute_wallet_agg_final_bytes_checked(pairs: &[( [u8; 32], [u8; 32] )]) 
     let mut out = [0u8; 32]; out.copy_from_slice(acc.to_repr().as_ref()); Some(out)
 }
 
-/// PCD transition circuit configuration
+/// This holds all the configuration for our PCD transition circuit.
+/// Think of it as the blueprint that tells the prover how to arrange all the pieces.
 #[derive(Clone, Debug)]
 pub struct PcdTransitionConfig {
-    /// Advice columns for witness data
+    /// Where we put our secret witness data (the private stuff)
     pub advice: [Column<Advice>; 6],
-    /// Instance columns for public inputs/outputs (prev, new, mmr, nul, anchor)
+    /// Where we put our public inputs/outputs that everyone can see
     pub instance: [Column<Instance>; 6],
-    /// Fixed columns for constants
+    /// Columns for fixed constants that never change
     pub fixed: [Column<Fixed>; 2],
-    /// Selector for the transition logic
+    /// A switch that turns on our transition logic when needed
     pub selector: Selector,
-    /// Poseidon configuration (t=3, rate=2)
+    /// Our Poseidon hash configuration (using width=3, rate=2)
     pub poseidon: Pow5Config<Fr, 3, 2>,
 }
 
-/// PCD transition circuit
+/// The actual PCD transition circuit - this is where the magic happens!
+/// It proves that you can validly move from one state to another.
 #[derive(Clone, Debug)]
 pub struct PcdTransitionCircuit {
-    /// Previous state commitment
+    /// What state we're starting from
     pub prev_state: Value<Fr>,
-    /// New state commitment
+    /// What state we're moving to
     pub new_state: Value<Fr>,
-    /// MMR root commitment
+    /// The MMR (Merkle Mountain Range) root - like a checkpoint of all commitments
     pub mmr_root: Value<Fr>,
-    /// Nullifier set root (for double-spend prevention)
+    /// The nullifier root - helps us prevent double-spending
     pub nullifier_root: Value<Fr>,
-    /// Anchor height
+    /// Which block height we're anchoring to
     pub anchor_height: Value<Fr>,
-    /// Delta commitments (commitment and nullifier deltas)
+    /// Any changes we're making (commitments and nullifiers we're adding/removing)
     pub delta_commitments: Vec<Value<Fr>>,
 }
 
-/// Compute state commitment using BLAKE3 reduced modulo field order (structured hashing).
+/// Creates a commitment to a complete state by hashing all its components together.
+/// We use BLAKE3 because it's super fast and cryptographically solid.
 pub fn compute_state_commitment(components: &[Fr]) -> Fr {
     let mut hasher = Blake3Hasher::new();
-    // Domain separation and layout versioning
+    // Adding a version tag so we can update this in the future if needed
     hasher.update(b"pcd_state:v1");
-    // Length-prefix each component to avoid ambiguity
+    // We carefully prefix each piece with its length to keep everything unambiguous
     let num = components.len() as u64;
     hasher.update(&num.to_le_bytes());
     for c in components {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(c.to_repr().as_ref());
-        // Prefix length (always 32) before the bytes
+        // Every field element is 32 bytes, we note that before adding the data
         hasher.update(&(32u64.to_le_bytes()));
         hasher.update(&bytes);
     }
     let digest = hasher.finalize();
-    // Map into the field uniformly to avoid bias/collisions
+    // Now we map this hash into a field element in a way that's fair and unbiased
     {
         use blake3::Hasher;
         use std::io::Read as _;
@@ -332,7 +350,7 @@ pub fn compute_state_commitment(components: &[Fr]) -> Fr {
     }
 }
 
-// Removed obsolete external verifier helper (superseded by on-circuit Poseidon relation)
+// We removed the old external verifier - now everything happens inside the circuit itself!
 
 impl Circuit<Fr> for PcdTransitionCircuit {
     type Config = PcdTransitionConfig;
@@ -371,7 +389,9 @@ impl Circuit<Fr> for PcdTransitionCircuit {
         let fixed = [meta.fixed_column(), meta.fixed_column()];
         let selector = meta.selector();
 
-        // Enable equality where needed for public input exposure and copy constraints
+        // We need to enable equality checking on these columns so we can:
+        // 1. Expose public inputs correctly
+        // 2. Copy values between different parts of the circuit
         for a in &advice {
             meta.enable_equality(*a);
         }
@@ -379,11 +399,13 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             meta.enable_equality(*i);
         }
 
-        // Configure Poseidon (t=3, rate=2) using the first 3 advice columns for state,
-        // the 4th for partial s-box, and dedicated fixed columns for round constants.
+        // Setting up Poseidon hash (width=3, rate=2):
+        // - First 3 advice columns hold the state
+        // - 4th column handles the partial S-box layer
+        // - Fixed columns store the round constants
         let rc_a = [meta.fixed_column(), meta.fixed_column(), meta.fixed_column()];
         let rc_b = [meta.fixed_column(), meta.fixed_column(), meta.fixed_column()];
-        // Enable one fixed column for global constants as required by the floor planner
+        // The floor planner needs at least one column for constants - we'll use this one
         meta.enable_constant(rc_b[0]);
         let poseidon = Pow5Chip::<Fr, 3, 2>::configure::<P128Pow5T3>(
             meta,
@@ -393,7 +415,7 @@ impl Circuit<Fr> for PcdTransitionCircuit {
             rc_b,
         );
 
-        // No extra gates required for public inputs beyond instance exposure.
+        // That's all we need for configuration! The instance columns handle public I/O automatically.
 
         PcdTransitionConfig {
             advice,
@@ -854,22 +876,24 @@ impl Circuit<Fr> for FsRecursionCircuit {
     }
 }
 
-/// PCD core functionality
+/// The main PCD engine - this is what you'll use to create and verify proofs!
+/// It holds all the cryptographic setup and keys needed for the system.
 pub struct PcdCore {
-    /// Basic state for now
+    /// Just a flag to track if we're ready to go
     pub initialized: bool,
-    /// Circuit size parameter (security level), e.g., 12..=20 typically
+    /// How big our circuits are (bigger = more secure but slower, typically 12-20)
     pub proving_k: u32,
-    /// IPA parameters (Pasta/Vesta)
+    /// Cryptographic parameters for our proof system (using IPA on Pasta curves)
     pub params: ParamsIPA<G1Affine>,
-    /// Verifying key for transition circuit
+    /// The verification key - like a public key that anyone can use to check proofs
     pub vk: VerifyingKey<G1Affine>,
-    /// Proving key for transition circuit
+    /// The proving key - the secret sauce needed to create proofs
     pub pk: ProvingKey<G1Affine>,
 }
 
 impl PcdCore {
-    /// Create a new PCD core instance
+    /// Creates a brand new PCD system with reasonable default settings.
+    /// This sets up all the keys and parameters you need to start proving!
     pub fn new() -> Result<Self> {
         let proving_k = 12;
         let params = ParamsIPA::<G1Affine>::new(proving_k);
@@ -892,7 +916,8 @@ impl PcdCore {
         })
     }
 
-    /// Create a new PCD core instance with explicit circuit parameter k
+    /// Just like new(), but you get to choose the security parameter k yourself.
+    /// Higher k = more secure but slower. Pick what works for your use case!
     pub fn with_k(k: u32) -> Result<Self> {
         let params = ParamsIPA::<G1Affine>::new(k);
         let empty = PcdTransitionCircuit {
@@ -926,7 +951,8 @@ impl PcdCore {
         Ok(())
     }
 
-    /// Prove a PCD transition using Halo2 PLONK with IPA commitments (Pasta)
+    /// This is where the magic happens - creates a proof that you're validly transitioning
+    /// from one state to another! Feed it your state data and it'll give you a proof.
     pub fn prove_transition(
         &self,
         prev_state: &[u8; 32],
@@ -935,8 +961,7 @@ impl PcdCore {
         nullifier_root: &[u8; 32],
         anchor_height: u64,
     ) -> Result<Vec<u8>> {
-        // Convert inputs into field elements (mod-order mapping for 32-byte digests)
-        // Map 32 bytes into field via uniform bytes
+        // First step: convert all our byte arrays into field elements our math can work with
         fn to_fr(bytes: &[u8; 32]) -> Fr {
             use blake3::Hasher;
             use std::io::Read as _;
@@ -945,7 +970,7 @@ impl PcdCore {
             hasher.update(bytes);
             let mut xof = hasher.finalize_xof();
             let mut wide = [0u8; 64];
-            // XOF read from BLAKE3 with a fixed-size buffer is infallible
+            // This read is totally safe - BLAKE3 always delivers
             let _ = xof.read_exact(&mut wide);
             Fr::from_uniform_bytes(&wide)
         }
@@ -954,15 +979,15 @@ impl PcdCore {
         let mmr_fr = to_fr(mmr_root);
         let nul_fr = to_fr(nullifier_root);
         let anchor_fr = Fr::from(anchor_height);
-        // Interpret new_state as canonical field encoding if possible; otherwise map uniformly
+        // Try to read new_state directly, or convert it if needed
         let provided_new_fr = Fr::from_repr(*new_state).unwrap_or_else(|| to_fr(new_state));
 
-        // Compute the expected Poseidon digest via ragu path (matches circuit logic)
+        // Calculate what the new state SHOULD be based on the transition
         let [_, expected_new_fr, _, _, _] = ragu_compute_transition_public_inputs(prev_fr, mmr_fr, nul_fr, anchor_fr)?;
 
-        // Optional consistency check: provided new_state must match expected
+        // Safety check: make sure the provided new_state actually matches what we computed
         if provided_new_fr != expected_new_fr {
-            return Err(anyhow::anyhow!("new_state does not match Poseidon transition digest"));
+            return Err(anyhow::anyhow!("new_state doesn't match the transition digest - something's wrong!"));
         }
 
         let circuit = PcdTransitionCircuit {
@@ -996,7 +1021,8 @@ impl PcdCore {
         Ok(transcript.finalize())
     }
 
-    /// Verify a PCD transition proof
+    /// Checks if a proof is valid - like verifying a signature but way cooler!
+    /// Returns true if the proof is legit, false otherwise.
     pub fn verify_transition_proof(
         &self,
         proof: &[u8],

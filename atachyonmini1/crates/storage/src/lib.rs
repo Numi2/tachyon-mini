@@ -1,7 +1,10 @@
 //! # storage
 //!
-//! Encrypted storage layer for Tachyon wallet.
-//! Provides secure note database with encryption at rest and in-memory caching.
+//! The secure vault where your wallet stores everything!
+//! 
+//! All your notes are encrypted at rest - even if someone gets your database file,
+//! they can't read it without your master password. We also cache things in memory
+//! for speed, but always encrypted. Safety first!
 
 pub mod error;
 
@@ -28,20 +31,20 @@ pub const DB_MASTER_KEY_SIZE: usize = 32;
 /// Note commitment hash size (BLAKE3 hash)
 pub const NOTE_COMMITMENT_SIZE: usize = 32;
 
-/// Encrypted note record in the database
+/// A note as it's stored in your database - all encrypted and secure!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedNote {
-    /// Encrypted note data (commitment + metadata + witness data)
+    /// The actual note data, locked up tight with AES encryption
     pub encrypted_data: Vec<u8>,
-    /// Nonce used for encryption
+    /// A random nonce we used for encryption (needed for decryption later)
     pub nonce: [u8; AES_NONCE_SIZE],
-    /// Position in the MMR accumulator
+    /// Where this note sits in the accumulator tree
     pub position: u64,
-    /// Block height when note was created
+    /// Which block this note was created in
     pub block_height: u64,
-    /// Whether this note has been spent
+    /// Have we spent this note yet? (prevents double-spending)
     pub is_spent: bool,
-    /// Timestamp when note was added to wallet
+    /// When you first added this to your wallet (Unix timestamp)
     pub created_at: u64,
 }
 

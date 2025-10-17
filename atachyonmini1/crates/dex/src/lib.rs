@@ -1305,28 +1305,59 @@ impl Default for DexService {
     fn default() -> Self { Self::new() }
 }
 
-/// Sled-backed persistent engine implementing OrderBookEngine
+/// Redb-backed persistent engine implementing OrderBookEngine
+/// Redb provides async-compatible, zero-copy access with MVCC transactions
 pub struct SledEngine {
-    db: sled::Db,
+    db: Arc<redb::Database>,
     book: Arc<RwLock<OrderBook>>,
     analytics: Arc<RwLock<MarketAnalytics>>,
 }
 
-const SLED_KEY_BOOK: &str = "book";
-const SLED_KEY_ANALYTICS: &str = "analytics";
+// Define typed table for redb (more efficient than raw key-value)
+const TABLE_BOOK: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("orderbook");
+const TABLE_ANALYTICS: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("analytics");
+const KEY_BOOK: &str = "book";
+const KEY_ANALYTICS: &str = "analytics";
 
 impl SledEngine {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() { let _ = fs::create_dir_all(dir); }
-        let db = sled::open(path).map_err(|e| anyhow!("sled open: {}", e))?;
-        let book = if let Ok(Some(val)) = db.get(SLED_KEY_BOOK) {
-            bincode::deserialize::<OrderBook>(&val).unwrap_or_else(|_| OrderBook::new())
-        } else { OrderBook::new() };
-        let analytics = if let Ok(Some(val)) = db.get(SLED_KEY_ANALYTICS) {
-            bincode::deserialize::<MarketAnalytics>(&val).unwrap_or_else(|_| MarketAnalytics::default())
-        } else { MarketAnalytics::default() };
+        
+        // Open redb database with write-ahead logging enabled
+        let db = redb::Database::create(path)
+            .map_err(|e| anyhow!("redb create: {}", e))?;
+        
+        // Load existing data in a read transaction
+        let book = {
+            let read_txn = db.begin_read().map_err(|e| anyhow!("redb begin read: {}", e))?;
+            if let Ok(table) = read_txn.open_table(TABLE_BOOK) {
+                if let Ok(Some(val)) = table.get(KEY_BOOK) {
+                    let bytes = val.value();
+                    bincode::deserialize::<OrderBook>(bytes).unwrap_or_else(|_| OrderBook::new())
+                } else {
+                    OrderBook::new()
+                }
+            } else {
+                OrderBook::new()
+            }
+        };
+        
+        let analytics = {
+            let read_txn = db.begin_read().map_err(|e| anyhow!("redb begin read: {}", e))?;
+            if let Ok(table) = read_txn.open_table(TABLE_ANALYTICS) {
+                if let Ok(Some(val)) = table.get(KEY_ANALYTICS) {
+                    let bytes = val.value();
+                    bincode::deserialize::<MarketAnalytics>(bytes).unwrap_or_else(|_| MarketAnalytics::default())
+                } else {
+                    MarketAnalytics::default()
+                }
+            } else {
+                MarketAnalytics::default()
+            }
+        };
+        
         Ok(Self {
-            db,
+            db: Arc::new(db),
             book: Arc::new(RwLock::new(book)),
             analytics: Arc::new(RwLock::new(analytics)),
         })
@@ -1337,9 +1368,18 @@ impl SledEngine {
         let analytics = self.analytics.read();
         let book_bytes = bincode::serialize(&*book).map_err(|e| anyhow!("serialize book: {}", e))?;
         let analytics_bytes = bincode::serialize(&*analytics).map_err(|e| anyhow!("serialize analytics: {}", e))?;
-        self.db.insert(SLED_KEY_BOOK, book_bytes).map_err(|e| anyhow!("sled put book: {}", e))?;
-        self.db.insert(SLED_KEY_ANALYTICS, analytics_bytes).map_err(|e| anyhow!("sled put analytics: {}", e))?;
-        self.db.flush().map_err(|e| anyhow!("sled flush: {}", e))?;
+        
+        // Use write transaction for atomic updates
+        let write_txn = self.db.begin_write().map_err(|e| anyhow!("redb begin write: {}", e))?;
+        {
+            let mut table = write_txn.open_table(TABLE_BOOK).map_err(|e| anyhow!("redb open table: {}", e))?;
+            table.insert(KEY_BOOK, book_bytes.as_slice()).map_err(|e| anyhow!("redb insert book: {}", e))?;
+        }
+        {
+            let mut table = write_txn.open_table(TABLE_ANALYTICS).map_err(|e| anyhow!("redb open table: {}", e))?;
+            table.insert(KEY_ANALYTICS, analytics_bytes.as_slice()).map_err(|e| anyhow!("redb insert analytics: {}", e))?;
+        }
+        write_txn.commit().map_err(|e| anyhow!("redb commit: {}", e))?;
         Ok(())
     }
 }
