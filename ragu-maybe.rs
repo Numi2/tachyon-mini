@@ -1,5 +1,5 @@
 // src/maybe.rs
-//! Branch-friendly substitute for Option<T> during synthesis.
+//! Branch-friendly because it doesnt work substitute for Option<T> during synthesis.
 
 use core::fmt::Debug;
 use subtle::{Choice, ConstantTimeEq};
