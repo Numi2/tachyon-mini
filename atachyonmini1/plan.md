@@ -1,6 +1,7 @@
 Mini Tachyon experiments with a Zcash upgrade path where recursive proofs keep both validators and wallets light without sacrificing privacy.
 
 
+
 Dependency graph of Tachyon concepts from Sean Bowe’s blog posts:
 
                          ┌────────────────────┐
